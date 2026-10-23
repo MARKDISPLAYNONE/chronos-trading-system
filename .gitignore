@@ -19,3 +19,10 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Phase 1 generated artefacts (regenerable from data/ + code)
+bot/historical_validation/output/*.sqlite
+
+# Local virtualenvs / test caches
+.pytest_cache/
+.ruff_cache/

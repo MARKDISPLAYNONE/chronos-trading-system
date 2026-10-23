@@ -1,0 +1,14 @@
+# Project Chronos — Phase 1 bot requirements
+#
+# Phase 1 (historical logic validation) runs on the Python standard library
+# ONLY — no third-party runtime dependency, no network, no credentials.
+#
+# `pytest` is listed because it is the conventional way to run the suite, but
+# the tests are written against `unittest` and run with pytest absent:
+#
+#     cd bot && python3 -m unittest discover -s tests
+#     # or, if pytest is installed:
+#     cd bot && python3 -m pytest tests -q
+#
+# Everything below is free / open-source. No paid services are required.
+pytest>=8.0  # test runner only; not imported by the bot engine
