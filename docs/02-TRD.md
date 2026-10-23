@@ -98,39 +98,39 @@ configuration — it is a hard OS dependency.
   migration happens only AFTER core logic is validated locally (see
   `07-PHASE-PLAN.md`) — do not attempt this prematurely.
 
-### 4.1.1 Timezone Handling (Critical — Amendment, Session 2)
+### 4.1.1 Timezone Handling (Critical — Confirmed, Session 3)
 
-MT5's `copy_rates_*` functions return timestamps in **broker server time**,
-NOT UTC, despite official documentation claiming otherwise (confirmed via
-direct consultation with an MQL5/MT5 specialist developer, cross-referenced
-against community-reported discrepancies). This must be handled as follows:
+MT5's `copy_rates_*` functions return raw Unix epoch timestamps
+(timezone-agnostic by nature). The MT5 **terminal display** shows these
+interpreted in the broker's server time, which is NOT UTC and NOT the
+Handler's local time — this was empirically confirmed and then precisely
+identified as follows:
 
-1. **Never hardcode a fixed hour offset** between broker time and NY time.
-   Both zones may independently observe DST, on different calendar dates,
-   which breaks any fixed-offset assumption at least twice a year.
-2. **Empirically determine the broker's actual timezone** (not assumed from
-   the Handler's own geographic location) using a one-time diagnostic
-   script (see `bot/historical_validation/verify_broker_timezone.py`,
-   to be created in Implementation Step 3) that compares a known bar's raw
-   epoch timestamp against real-world UTC and NY time.
-3. Represent the broker's timezone as a proper DST-aware zone object
-   (e.g., `zoneinfo.ZoneInfo("Europe/Athens")` if confirmed as EET), not a
-   fixed offset like `UTC+2` or `UTC+3`.
-4. Represent NY time as `zoneinfo.ZoneInfo("America/New_York")` — DST
-   handled automatically.
-5. All window-boundary logic (`time_windows.py`) operates in NY time only.
-   Broker timestamps are converted to NY time at the point of ingestion,
-   never the reverse.
-6. A verification test must be run and documented BEFORE Phase 1 exit,
-   confirming correct conversion across a known session boundary (e.g.,
-   confirming a 16:00 NY bar maps to the correct UTC equivalent for the
-   current DST state, per the dev's Step 4 methodology).
+**Confirmed finding:** Forex.com (GAIN Capital) runs demo/live servers on
+a convention known as **"NY+7"** — the broker server clock is always
+exactly 7 hours ahead of New York LOCAL time, and critically, it follows
+**US DST transition dates** (2nd Sunday of March → 1st Sunday of
+November), NOT EU DST dates. This means:
+- During US DST (EDT, UTC−4): broker server = UTC+3
+- During US standard time (EST, UTC−5): broker server = UTC+2
+- The broker's offset SHIFTS on US DST change dates, which do NOT align
+  with EU DST change dates — this was the original risk this section
+  flagged, now fully resolved with a confirmed, named convention rather
+  than an assumption
 
-**Library choice:** Python's built-in `zoneinfo` (3.9+, no extra
-dependency) is preferred over `pytz` for new code, functionally
-equivalent for this purpose — use whichever the Agent finds better
-documented/supported at implementation time, consistency within the
-codebase matters more than which specific library.
+**Practical implication for code — this is actually simpler than
+initially anticipated:** Since broker timestamps are raw epoch (UTC-
+equivalent) values, the conversion pipeline never needs to know or care
+about the broker's display convention at all for strategy logic:
+
+```python
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+# This is correct, year-round, with ZERO changes needed across any DST
+# transition (US or EU) — this is the ONLY conversion strategy logic uses:
+utc = datetime.fromtimestamp(raw_epoch, tz=ZoneInfo("UTC"))
+ny_time = utc.astimezone(ZoneInfo("America/New_York"))
 
 ### 4.2 Database & Backend
 | Component | Choice | Why |

@@ -52,8 +52,8 @@ Handler must explicitly confirm both open items above are resolved. Only then is
 ## Phase 1 — Logic Validation (Historical Backtesting)
 
 ### Entry Criteria
-- Phase 0 formally closed (Handler sign-off obtained).
-- Historical data source selected and accessible.
+- Phase 0 formally closed (Handler sign-off obtained). ✅
+- Historical data source: MT5 native export from the Forex.com Global demo account, primary source. If MT5's available history depth is insufficient for a statistically meaningful sample, Dukascopy may be used as fallback, with any resulting backtest output explicitly tagged `cross_feed_directional_only`.
 - `verify_broker_timezone.py` run successfully with correct NY-time conversion confirmed against known reference bars.
 
 ### Objectives
@@ -163,7 +163,6 @@ Not applicable in the traditional phase-gate sense beyond the entry gate — how
 6. **No real secrets in any commit, chat, or code, at any phase.**
 
 ---
-
 ## Appendix A — Phase 0 Closure Checklist (Live Status)
 
 | Item | Status |
@@ -172,7 +171,8 @@ Not applicable in the traditional phase-gate sense beyond the entry gate — how
 | Repo structure established on GitHub | ✅ Done |
 | Broker timezone architecture resolved (NY+7, US DST) | ✅ Done |
 | NAS100 instrument spec confirmed | ✅ Done |
-| "10 contracts" = MT5 volume `10.0` confirmation | ⬜ Open — awaiting Handler yes/no |
-| Historical data source decision (Dukascopy vs MT5 export) | ⬜ Open — awaiting decision |
+| "10 contracts" = MT5 volume `10.0` confirmation | ✅ Done |
+| Partial-exit trigger unit bug (handle/tick) resolved | ✅ Done |
+| Historical data source decision | ✅ Done — MT5 native export (primary), Dukascopy (fallback, flagged `cross_feed_directional_only`) |
 
-Phase 0 is **not** formally closed until both open items above are checked off.
+**Phase 0 is formally CLOSED.** Phase 1 (Logic Validation) begins now.
