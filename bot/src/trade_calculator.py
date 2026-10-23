@@ -1,6 +1,6 @@
 """
-Project Chronos — entry / SL / TP / partial trigger (PRD §6.6, §6.7, §6.8)
-==========================================================================
+Project Chronos — entry / SL / TP / partial trigger (PRD §6.6–§6.8, TRD §4.1.2)
+===============================================================================
 
 SHORT (PREMIUM, Candle B opened above Mid_A):
     entry = High_A - 1 tick
@@ -16,15 +16,26 @@ Partial-exit trigger — RAW PRICE DISTANCE, no unit conversion (PRD §6.8):
     long : trigger = entry + 0.80 * (TP - entry)
     short: trigger = entry - 0.80 * (entry - TP)
 
-"Handle" never appears in this module. It is a display unit equal to
-`1 / tick_size` ticks (10 for NAS100) and is derived at runtime if a report
-wants to show it. It is never stored (schema §4.1) and never an input.
+QUANTIZATION (Phase 1 correction — see pricing.py for the full rationale)
+------------------------------------------------------------------------
+`SL`, `TP` and `partial_trigger` are computed exactly, then snapped to the
+instrument's tick grid, directionally:
 
-R (risk unit) = |entry - SL|, i.e. 0.5 * Range + 1 tick on both sides.
-Note the TP distance is `0.5 * Range` = R - 1 tick, so a trade that runs
-straight to TP is worth slightly LESS than 1R. That is a property of the
-strategy as specified, not an arithmetic bug, and it is why the R-multiple
-helpers below never assume "TP == +1R".
+    SHORT -> floor,  LONG -> ceiling
+
+This moves every price in the direction that hurts us (tighter stop, further
+target, harder-to-reach partial) and never in our favour. `entry` is already
+on the grid (High_A / Low_A are traded prices, ± one tick), and `Mid_A` /
+`Range` are deliberately left UNQUANTIZED so context classification is exact.
+Roughly 49% of trades were affected; without this the engine emitted stops
+like 25420.75, which no broker can accept.
+
+`R = |entry - SL|` is measured AFTER quantization, because the stop that
+actually sits in the market is the real risk.
+
+"Handle" never appears in this module: it is a display unit equal to
+`1 / tick_size` ticks, derived at runtime, never stored (schema §4.1) and
+never an input to any of this.
 
 All calculations are verified against hand-computed fixtures in
 `bot/tests/test_trade_calculator.py`.
@@ -33,9 +44,10 @@ All calculations are verified against hand-computed fixtures in
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 
 from . import config
-from .pricing import round_price
+from .pricing import D, direction_for, quantize_to_tick, round_price
 
 LONG = "LONG"
 SHORT = "SHORT"
@@ -43,36 +55,58 @@ SHORT = "SHORT"
 
 @dataclass(frozen=True)
 class TradePlan:
-    """Everything decided at entry time. Prices are unrounded floats."""
+    """Everything decided at entry time. Prices are exact Decimals."""
 
     direction: str
-    entry: float
-    stop_loss: float
-    take_profit: float
-    partial_trigger: float
-    risk_per_unit: float  # R, in price points
-    high_a: float
-    low_a: float
-    mid_a: float
-    candle_a_range: float
+    entry: Decimal
+    stop_loss: Decimal
+    take_profit: Decimal
+    partial_trigger: Decimal
+    risk_per_unit: Decimal  # R, in price points, measured post-quantization
+    high_a: Decimal
+    low_a: Decimal
+    mid_a: Decimal
+    candle_a_range: Decimal
+
+    #: pre-quantization values, kept for the audit trail so a reviewer can see
+    #: exactly what the tick snap changed. Never used for execution or scoring.
+    raw_stop_loss: Decimal | None = None
+    raw_take_profit: Decimal | None = None
+    raw_partial_trigger: Decimal | None = None
 
     @property
-    def tp_distance(self) -> float:
+    def tp_distance(self) -> Decimal:
         return abs(self.take_profit - self.entry)
 
     @property
-    def partial_distance(self) -> float:
+    def partial_distance(self) -> Decimal:
         return abs(self.partial_trigger - self.entry)
 
-    def handle_distance(self, price: float) -> float:
-        """Display-only convenience: price distance expressed in handles.
+    @property
+    def quantization_direction(self) -> str:
+        return direction_for(self.direction)
+
+    @property
+    def quantized(self) -> bool:
+        """True when the tick snap actually moved any order price."""
+        if self.raw_stop_loss is None:
+            return False
+        return (
+            self.raw_stop_loss != self.stop_loss
+            or self.raw_take_profit != self.take_profit
+            or self.raw_partial_trigger != self.partial_trigger
+        )
+
+    def handle_distance(self, price) -> Decimal:
+        """Display-only convenience: price distance in handles.
 
         Derived from `tick_size` at call time, exactly as PRD §6.8 requires.
-        This value must never flow back into any trigger calculation.
+        Must never flow back into any trigger calculation.
         """
-        return abs(price - self.entry) / (config.handle_size_in_ticks() * config.TICK_SIZE)
+        unit = config.handle_size_in_ticks() * config.TICK_SIZE
+        return abs(D(price) - self.entry) / unit
 
-    def rounded(self) -> dict[str, float]:
+    def rounded(self) -> dict[str, Decimal]:
         return {
             "entry": round_price(self.entry),
             "stop_loss": round_price(self.stop_loss),
@@ -84,40 +118,65 @@ class TradePlan:
 
 def plan_trade(
     direction: str,
-    high_a: float,
-    low_a: float,
-    mid_a: float,
-    tick: float = config.TICK_SIZE,
+    high_a,
+    low_a,
+    mid_a,
+    tick=config.TICK_SIZE,
 ) -> TradePlan:
-    """Compute the full trade plan from Candle A. Raises on a degenerate candle."""
+    """Compute the full trade plan from Candle A, then snap it to the tick grid."""
+    high_a, low_a, mid_a, tick = D(high_a), D(low_a), D(mid_a), D(tick)
     candle_range = high_a - low_a
     if candle_range <= 0:
         raise ValueError(f"degenerate Candle A: high={high_a} low={low_a} (range must be > 0)")
 
     if direction == SHORT:
         entry = high_a - tick
-        stop_loss = high_a + config.SL_RANGE_MULTIPLE * candle_range
-        take_profit = mid_a - tick
-        partial_trigger = entry - config.PARTIAL_EXIT_FRACTION * (entry - take_profit)
+        raw_sl = high_a + config.SL_RANGE_MULTIPLE * candle_range
+        raw_tp = mid_a - tick
+        raw_partial = entry - config.PARTIAL_EXIT_FRACTION * (entry - raw_tp)
     elif direction == LONG:
         entry = low_a + tick
-        stop_loss = low_a - config.SL_RANGE_MULTIPLE * candle_range
-        take_profit = mid_a + tick
-        partial_trigger = entry + config.PARTIAL_EXIT_FRACTION * (take_profit - entry)
+        raw_sl = low_a - config.SL_RANGE_MULTIPLE * candle_range
+        raw_tp = mid_a + tick
+        raw_partial = entry + config.PARTIAL_EXIT_FRACTION * (raw_tp - entry)
     else:
         raise ValueError(f"unknown direction {direction!r}")
+
+    # ---- quantize the three order prices, pessimistically -------------------
+    qdir = direction_for(direction)
+    stop_loss = quantize_to_tick(raw_sl, tick, qdir)
+    take_profit = quantize_to_tick(raw_tp, tick, qdir)
+    partial_trigger = quantize_to_tick(raw_partial, tick, qdir)
+
+    # Quantization may push the partial past the target (possible when the
+    # TP distance is itself only a tick or two). In that case the partial can
+    # never fire before TP, so pin it to TP rather than leaving an
+    # out-of-range value. TP is checked before the partial in the simulator,
+    # so behaviour is identical either way — this just keeps the plan valid.
+    if direction == SHORT:
+        if partial_trigger < take_profit:
+            partial_trigger = take_profit
+        if partial_trigger > entry:
+            partial_trigger = entry
+    else:
+        if partial_trigger > take_profit:
+            partial_trigger = take_profit
+        if partial_trigger < entry:
+            partial_trigger = entry
 
     # Guard rails: a plan that points the wrong way is a logic bug, not a trade.
     if direction == SHORT:
         if not (stop_loss > entry > take_profit):
-            raise ValueError(f"SHORT plan misordered: SL={stop_loss} entry={entry} TP={take_profit}")
-        if not (entry >= partial_trigger >= take_profit):
-            raise ValueError(f"SHORT partial outside [TP, entry]: {partial_trigger}")
+            raise ValueError(
+                f"SHORT plan misordered after quantization: "
+                f"SL={stop_loss} entry={entry} TP={take_profit}"
+            )
     else:
         if not (stop_loss < entry < take_profit):
-            raise ValueError(f"LONG plan misordered: SL={stop_loss} entry={entry} TP={take_profit}")
-        if not (entry <= partial_trigger <= take_profit):
-            raise ValueError(f"LONG partial outside [entry, TP]: {partial_trigger}")
+            raise ValueError(
+                f"LONG plan misordered after quantization: "
+                f"SL={stop_loss} entry={entry} TP={take_profit}"
+            )
 
     risk = abs(entry - stop_loss)
     if risk <= 0:
@@ -134,25 +193,29 @@ def plan_trade(
         low_a=low_a,
         mid_a=mid_a,
         candle_a_range=candle_range,
+        raw_stop_loss=raw_sl,
+        raw_take_profit=raw_tp,
+        raw_partial_trigger=raw_partial,
     )
 
 
 # ---------------------------------------------------------------------------
 # R-multiple (Senior Dev, Q9 — binding formula)
 # ---------------------------------------------------------------------------
-def signed_move(direction: str, entry: float, price: float) -> float:
+def signed_move(direction: str, entry, price) -> Decimal:
     """Direction-signed price move: positive means favourable."""
-    return (price - entry) if direction == LONG else (entry - price)
+    e, p = D(entry), D(price)
+    return (p - e) if direction == LONG else (e - p)
 
 
 def r_multiple(
     direction: str,
-    entry: float,
-    risk: float,
-    final_exit: float,
+    entry,
+    risk,
+    final_exit,
     *,
-    partial_exit_price: float | None = None,
-) -> float:
+    partial_exit_price=None,
+) -> Decimal:
     """Realised R for the whole position.
 
     No partial:
@@ -162,18 +225,19 @@ def r_multiple(
         runner_R  = 0.1 * (final_exit - entry) / R
         total_R   = partial_R + runner_R
     """
+    entry, risk = D(entry), D(risk)
     if partial_exit_price is None:
         return signed_move(direction, entry, final_exit) / risk
 
     partial_r = (
-        config.CONTRACTS_PARTIAL_EXIT
-        / config.CONTRACTS_TOTAL
+        D(config.CONTRACTS_PARTIAL_EXIT)
+        / D(config.CONTRACTS_TOTAL)
         * signed_move(direction, entry, partial_exit_price)
         / risk
     )
     runner_r = (
-        config.CONTRACTS_RUNNER
-        / config.CONTRACTS_TOTAL
+        D(config.CONTRACTS_RUNNER)
+        / D(config.CONTRACTS_TOTAL)
         * signed_move(direction, entry, final_exit)
         / risk
     )

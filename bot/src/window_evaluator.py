@@ -162,7 +162,7 @@ def _classify_missing_data(series: BarSeries, start: dt.datetime, end: dt.dateti
     return REASON_MARKET_CLOSED if structural else REASON_MISSING_DATA
 
 
-def evaluate_window(series: BarSeries, window: Window, tick: float = config.TICK_SIZE) -> WindowEvaluation:
+def evaluate_window(series: BarSeries, window: Window, tick=config.TICK_SIZE) -> WindowEvaluation:
     """Evaluate one window end-to-end. Always returns exactly one record."""
     start = window.start
     end = window.end

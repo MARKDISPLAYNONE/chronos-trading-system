@@ -54,11 +54,13 @@ from __future__ import annotations
 import csv
 import datetime as dt
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from . import config
 from .bars import BarSeries, M1Bar
+from .pricing import is_on_tick_grid
 
 UTC = ZoneInfo(config.UTC_TZ)
 NY = ZoneInfo(config.NY_TZ)
@@ -296,9 +298,10 @@ def load_bars(
                 raise AdapterError(f"line {line_no}: expected 6 columns, found {len(row)}")
             try:
                 raw_naive, ts_format = _parse_timestamp(row[0])
-                o, h, l, c = (float(row[i]) for i in (1, 2, 3, 4))
+                # Decimal straight from the file's text: exact, never via float
+                o, h, l, c = (Decimal(row[i].strip()) for i in (1, 2, 3, 4))
                 volume = int(float(row[5]))
-            except (ValueError, TypeError) as exc:
+            except (ValueError, TypeError, InvalidOperation) as exc:
                 raise AdapterError(f"line {line_no}: unparseable row {row!r} ({exc})") from exc
 
             if first_raw is None:
@@ -322,10 +325,7 @@ def load_bars(
             if h < l or not (l <= o <= h) or not (l <= c <= h):
                 ohlc_violations += 1
                 continue
-            if any(
-                abs(round(price / config.TICK_SIZE) - price / config.TICK_SIZE) > 1e-6
-                for price in (o, h, l, c)
-            ):
+            if any(not is_on_tick_grid(price, config.TICK_SIZE) for price in (o, h, l, c)):
                 off_tick += 1
                 continue
 

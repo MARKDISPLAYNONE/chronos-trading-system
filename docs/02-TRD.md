@@ -186,6 +186,87 @@ verification on demand, against a live terminal or an exported CSV.
    that stores true UTC would need an explicit, different adapter — never a
    silent reinterpretation of the existing one.
 
+### 4.1.2 Price Quantization — Tick Grid (Added in Phase 1)
+
+#### The gap this closes
+
+PRD §6.7 and §6.8 define SL, TP and the partial trigger with exact arithmetic
+(`High_A + 0.5·Range`, `Mid_A − 1 tick`, `entry ± 0.80 × distance`). A NAS100
+order price can only be submitted on a multiple of `tick_size` = 0.1. The
+original spec never said what to do with a calculated price that lands between
+two grid lines. On real data this is the normal case, not the exception:
+
+| Field | Trades landing off the 0.1 grid (2,631 plans) |
+|---|---|
+| `SL` | 1,297 (49.3%) |
+| `TP` | 1,297 (49.3%) |
+| `partial_trigger` | 1,980 (75.3%) |
+
+Leaving them unquantized produces prices no broker could have filled, and
+quantizing in an arbitrary (round-half-up) direction would silently flatter the
+results. This was an **undocumented gap in the original specification, not an
+error introduced by the engine.**
+
+#### Rule (binding)
+
+1. **All price arithmetic is `decimal.Decimal`.** Every price entering the engine
+   is coerced with `Decimal(str(value))`; no binary float touches a comparison,
+   a stop distance or an R-multiple. `float` appears only in output formatting.
+2. **Exact values stay exact.** `Range = High_A − Low_A` and
+   `Mid_A = (High_A + Low_A) / 2` are **never** quantized (unchanged from Q6).
+   The entry trigger (`High_A − 1 tick` / `Low_A + 1 tick`) is already on the grid
+   by construction.
+3. **Order prices are quantized after calculation, pessimistically:**
+
+   | Field | SHORT | LONG |
+   |---|---|---|
+   | `SL` | `ROUND_FLOOR` | `ROUND_CEILING` |
+   | `TP` | `ROUND_FLOOR` | `ROUND_CEILING` |
+   | `partial_trigger` | `ROUND_FLOOR` | `ROUND_CEILING` |
+
+   One direction per trade — `floor` for a SHORT, `ceiling` for a LONG — so a
+   single plan never mixes directions. A value already on the grid is unchanged.
+4. **`R` is measured post-quantization:** `R = |entry − SL_quantized|`.
+   The partial trigger is clamped so it can never sit beyond the quantized TP; if
+   quantization would push it past the target, the target wins.
+
+#### Why floor-for-short / ceiling-for-long is the pessimistic side
+
+For a SHORT, entry is below the stop and above the target. Flooring moves the
+stop **down**, toward entry — a tighter stop — and moves the target **down**,
+further from entry. For a LONG the geometry mirrors: ceiling moves the stop **up**
+toward entry and the target **up** away from it. In both directions the trade
+gets less room and a more distant target, which can only cost fills, never grant
+them. The property is asserted directly in `bot/tests/test_quantization.py`
+(invariants over all 58 observed candle ranges, not just spot checks).
+
+#### Worked example (real rows from the Phase 1 run)
+
+| Direction | Entry | `SL` raw → quantized | `TP` raw → quantized |
+|---|---|---|---|
+| LONG | 25,425.7 | 25,420.75 → **25,420.8** | 25,430.55 → **25,430.6** |
+| SHORT | 25,408.6 | 25,418.55 → **25,418.5** | 25,398.75 → **25,398.7** |
+
+#### Consequences to keep in mind when reading results
+
+- A clean run to TP is now worth ≈1R instead of slightly less than 1R, because
+  the target is a tick further out while `R` is measured against a tighter stop.
+  774 clean-TP trades score 0.9677R–1.0000R, 370 of them exactly 1.0000R.
+- Quantization can flip a marginal outcome. Exactly **1 of 2,631** trades flipped
+  (WIN → LOSS, −1.983R): a LONG whose TP moved from 25,232.55 to 25,232.60; the
+  bar tagged 25,232.55 and rolled over into the stop. That is the rule working as
+  designed — it removes an assumed fill the market never offered.
+- The audit CSV keeps both values for every price
+  (`raw_stop_loss_price` / `stop_loss_price`, and the same for `TP` and the
+  partial), plus `prices_quantized` and `quantize_direction`, so any row can be
+  re-derived by hand.
+
+#### Where it lives
+
+`bot/src/pricing.py` (`quantize_to_tick`, `direction_for`, `is_on_tick_grid`),
+`bot/src/trade_calculator.py` (`plan_trade`, `TradePlan.raw_*`),
+`bot/src/outputs.py` (audit columns), `bot/tests/test_quantization.py`.
+
 ### 4.2 Database & Backend
 | Component | Choice | Why |
 |---|---|---|

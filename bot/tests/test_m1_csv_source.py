@@ -28,7 +28,9 @@ def write_csv(path, rows, header="timestamp_utc,open,high,low,close,volume"):
     for i, (ts, o, h, l, c, v) in enumerate(rows):
         if isinstance(ts, dt.datetime):
             ts = int(ts.replace(tzinfo=UTC).timestamp())
-        lines.append(f"{ts},{o},{h},{l},{c},{v}")
+        # 1dp on purpose: these prices must be exact tick-grid decimals, so no
+        # float artefact such as 20000.300000000000182 may leak into the file.
+        lines.append(f"{ts},{float(o):.1f},{float(h):.1f},{float(l):.1f},{float(c):.1f},{v}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -112,7 +114,12 @@ class TestLoading(unittest.TestCase):
             load_bars(self.path, convention=CONVENTION_BROKER, validate=False)
 
     def test_off_tick_price_is_rejected(self):
-        write_csv(self.path, [(dt.datetime(2026, 3, 2, 12), 100.05, 100.2, 100.0, 100.1, 5)])
+        # hand-written row, not via write_csv, because write_csv rounds to 1dp
+        self.path.write_text(
+            "timestamp_utc,open,high,low,close,volume\n"
+            "1772452800,100.05,100.2,100.0,100.1,5\n",
+            encoding="utf-8",
+        )
         with self.assertRaises(AdapterError):
             load_bars(self.path, convention=CONVENTION_BROKER, validate=False)
 

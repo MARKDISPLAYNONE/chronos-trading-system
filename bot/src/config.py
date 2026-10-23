@@ -14,24 +14,27 @@ invented. When Phase 2 adds `mt5_client.py` / `supabase_client.py`, their
 credentials come from `bot/.env` (git-ignored) — never from this file.
 """
 
+from decimal import Decimal
+
 # ---------------------------------------------------------------------------
 # Instrument (confirmed via live MT5 lookup — handover §4, do not re-derive)
 # ---------------------------------------------------------------------------
 INSTRUMENT_SYMBOL = "NAS100"
 
 #: Smallest price increment. The whole strategy is tick-driven: sweep and
-#: reversal thresholds are +/- 1 tick, TP is Mid_A +/- 1 tick.
-TICK_SIZE = 0.1
+#: reversal thresholds are +/- 1 tick, TP is Mid_A +/- 1 tick. Decimal, so
+#: that every price in the engine is exact (see src/pricing.py).
+TICK_SIZE = Decimal("0.1")
 
 #: USD value of one tick, per contract (lot). Confirmed: $0.1/tick/lot.
-TICK_VALUE_PER_LOT = 0.1
+TICK_VALUE_PER_LOT = Decimal("0.1")
 
 #: "1 handle = 10 ticks" is DERIVED, never stored (Q9 / schema §4.1 note).
 #: Kept as a property-style helper rather than a constant so it can never be
 #: hardcoded into a calculation by mistake.
-def handle_size_in_ticks() -> float:
+def handle_size_in_ticks() -> "Decimal":
     """Display/reporting unit only. NEVER an input to any trigger calculation."""
-    return 1.0 / TICK_SIZE
+    return Decimal(1) / TICK_SIZE
 
 
 # ---------------------------------------------------------------------------
@@ -43,12 +46,12 @@ CONTRACTS_RUNNER = 1
 
 #: Fraction of the entry->TP distance at which the 9-contract partial fires.
 #: Applied to RAW PRICE DISTANCE (PRD §6.8) — never to handles/ticks.
-PARTIAL_EXIT_FRACTION = 0.80
+PARTIAL_EXIT_FRACTION = Decimal("0.80")
 
 # ---------------------------------------------------------------------------
 # Stop loss (PRD §6.7) — fib multiple of Candle A's range
 # ---------------------------------------------------------------------------
-SL_RANGE_MULTIPLE = 0.5
+SL_RANGE_MULTIPLE = Decimal("0.5")
 
 # ---------------------------------------------------------------------------
 # Time

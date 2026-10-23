@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
+from decimal import Decimal
 
 from .bars import BarSeries, M1Bar
 
@@ -30,10 +31,10 @@ class Candle:
 
     start: dt.datetime
     end: dt.datetime
-    open: float
-    high: float
-    low: float
-    close: float
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
     n_bars: int
     expected_bars: int
     bars: tuple[M1Bar, ...]
@@ -43,12 +44,12 @@ class Candle:
         return self.n_bars == self.expected_bars
 
     @property
-    def mid(self) -> float:
+    def mid(self) -> Decimal:
         """`Mid_A` — pure arithmetic, NOT forced onto a tick (Senior Dev, Q6)."""
-        return (self.high + self.low) / 2.0
+        return (self.high + self.low) / 2
 
     @property
-    def range(self) -> float:
+    def range(self) -> Decimal:
         """`High_A - Low_A`, used for the fib-based stop loss (PRD §6.7)."""
         return self.high - self.low
 

@@ -4,6 +4,11 @@ import datetime as dt
 import pathlib
 import sys
 import unittest
+from decimal import Decimal
+
+
+def D(x):
+    return Decimal(str(x))
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -94,9 +99,9 @@ class TestDecisionPaths(unittest.TestCase):
         self.assertTrue(ev.trade.partial_triggered)
         self.assertEqual(ev.reason, "target hit after partial")
         self.assertEqual(ev.plan.direction, "SHORT")
-        self.assertAlmostEqual(ev.plan.entry, 99.9)
-        self.assertAlmostEqual(ev.plan.stop_loss, 100.5)
-        self.assertAlmostEqual(ev.plan.take_profit, 99.4)
+        self.assertEqual(ev.plan.entry, D('99.9'))
+        self.assertEqual(ev.plan.stop_loss, D('100.5'))
+        self.assertEqual(ev.plan.take_profit, D('99.4'))
 
     def test_full_stop_loss(self):
         bars = candle_a()
@@ -108,7 +113,7 @@ class TestDecisionPaths(unittest.TestCase):
         ev = evaluate_window(BarSeries(bars), W)
         self.assertEqual(ev.outcome, OUTCOME_LOSS)
         self.assertEqual(ev.reason, "stop loss hit")
-        self.assertAlmostEqual(ev.trade.result_r_multiple, -1.0)
+        self.assertAlmostEqual(float(ev.trade.result_r_multiple), -1.0)
 
     def test_every_evaluation_has_a_non_empty_reason(self):
         bars = candle_a()

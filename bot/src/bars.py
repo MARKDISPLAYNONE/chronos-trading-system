@@ -21,6 +21,7 @@ from __future__ import annotations
 import bisect
 import datetime as dt
 from dataclasses import dataclass
+from decimal import Decimal
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,13 +29,19 @@ class M1Bar:
     """One 1-minute OHLC bar. `time` is the bar's OPEN time, NY wall clock."""
 
     time: dt.datetime
-    open: float
-    high: float
-    low: float
-    close: float
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
     volume: int
 
     def __post_init__(self) -> None:
+        # Coerce at the single boundary so no price anywhere downstream is a
+        # float. Callers may pass strings/Decimals; nothing else is allowed.
+        for field_name in ("open", "high", "low", "close"):
+            value = getattr(self, field_name)
+            if not isinstance(value, Decimal):
+                object.__setattr__(self, field_name, Decimal(str(value)))
         # Cheap sanity: an inverted/NaN bar would silently corrupt every
         # downstream calculation, so refuse it at construction time.
         if self.high < self.low:

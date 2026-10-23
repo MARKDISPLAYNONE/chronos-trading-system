@@ -4,6 +4,11 @@ import datetime as dt
 import pathlib
 import sys
 import unittest
+from decimal import Decimal
+
+
+def D(x):
+    return Decimal(str(x))
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -37,15 +42,15 @@ class TestLongOutcomes(unittest.TestCase):
         self.assertTrue(out.resolved)
         self.assertEqual(out.final_outcome, "LOSS")
         self.assertEqual(out.reason, "stop loss hit")
-        self.assertAlmostEqual(out.final_exit_price, 98.5)
-        self.assertAlmostEqual(out.result_r_multiple, -1.0)
+        self.assertEqual(out.final_exit_price, D('98.5'))
+        self.assertAlmostEqual(float(out.result_r_multiple), -1.0)
 
     def test_straight_to_target(self):
         s = series((99.1, 99.7, 99.05, 99.65))
         out = simulate(self.plan, s, T0, MAX)
         self.assertEqual(out.final_outcome, "WIN")
         self.assertEqual(out.reason, "take profit hit")
-        self.assertAlmostEqual(out.result_r_multiple, 0.5 / 0.6)
+        self.assertAlmostEqual(float(out.result_r_multiple), 0.5 / 0.6)
 
     def test_partial_then_breakeven(self):
         s = series(
@@ -55,9 +60,9 @@ class TestLongOutcomes(unittest.TestCase):
         out = simulate(self.plan, s, T0, MAX)
         self.assertTrue(out.partial_triggered)
         self.assertEqual(out.reason, "breakeven stop hit after partial")
-        self.assertAlmostEqual(out.partial_exit_price, 99.5)
-        self.assertAlmostEqual(out.final_exit_price, 99.1)
-        self.assertAlmostEqual(out.result_r_multiple, 0.6)
+        self.assertEqual(out.partial_exit_price, D('99.5'))
+        self.assertEqual(out.final_exit_price, D('99.1'))
+        self.assertAlmostEqual(float(out.result_r_multiple), 0.6)
         self.assertEqual(out.final_outcome, "WIN")
 
     def test_partial_then_target(self):
@@ -68,7 +73,7 @@ class TestLongOutcomes(unittest.TestCase):
         out = simulate(self.plan, s, T0, MAX)
         self.assertTrue(out.partial_triggered)
         self.assertEqual(out.reason, "target hit after partial")
-        self.assertAlmostEqual(out.result_r_multiple, 0.6 + 0.5 / 6)
+        self.assertAlmostEqual(float(out.result_r_multiple), 0.6 + 0.5 / 6)
 
 
 class TestPessimisticOrdering(unittest.TestCase):
@@ -82,7 +87,7 @@ class TestPessimisticOrdering(unittest.TestCase):
         out = simulate(self.plan, s, T0, MAX)
         self.assertEqual(out.final_outcome, "LOSS")
         self.assertEqual(out.reason, "stop loss hit")
-        self.assertAlmostEqual(out.final_exit_price, 98.5)
+        self.assertEqual(out.final_exit_price, D('98.5'))
 
     def test_bar_spanning_partial_and_stop_is_a_loss_with_no_partial(self):
         s = series((99.1, 99.55, 98.4, 98.9))  # 80% trigger and SL in one bar
@@ -96,14 +101,14 @@ class TestPessimisticOrdering(unittest.TestCase):
         out = simulate(self.plan, s, T0, MAX)
         self.assertTrue(out.partial_triggered)
         self.assertTrue(out.runner_stopped_in_partial_bar)
-        self.assertEqual(out.final_exit_price, 99.1)
-        self.assertAlmostEqual(out.result_r_multiple, 0.6)
+        self.assertEqual(out.final_exit_price, D('99.1'))
+        self.assertAlmostEqual(float(out.result_r_multiple), 0.6)
 
     def test_no_fill_assumptions_are_optimistic(self):
         # entry is the plan's entry price, never a later bar's price
         s = series((99.1, 99.7, 99.05, 99.65))
         out = simulate(self.plan, s, T0, MAX)
-        self.assertEqual(out.final_exit_price, 99.6)  # exact TP, zero slippage
+        self.assertEqual(out.final_exit_price, D('99.6'))  # exact TP, zero slippage
 
 
 class TestShortOutcomes(unittest.TestCase):
@@ -114,8 +119,8 @@ class TestShortOutcomes(unittest.TestCase):
         s = series((99.9, 100.6, 99.85, 100.5))
         out = simulate(self.plan, s, T0, MAX)
         self.assertEqual(out.final_outcome, "LOSS")
-        self.assertAlmostEqual(out.final_exit_price, 100.5)
-        self.assertAlmostEqual(out.result_r_multiple, -1.0)
+        self.assertEqual(out.final_exit_price, D('100.5'))
+        self.assertAlmostEqual(float(out.result_r_multiple), -1.0)
 
     def test_short_partial_then_target(self):
         s = series(
@@ -125,8 +130,8 @@ class TestShortOutcomes(unittest.TestCase):
         out = simulate(self.plan, s, T0, MAX)
         self.assertTrue(out.partial_triggered)
         self.assertEqual(out.reason, "target hit after partial")
-        self.assertAlmostEqual(out.final_exit_price, 99.4)
-        self.assertGreater(out.result_r_multiple, 0)
+        self.assertEqual(out.final_exit_price, D('99.4'))
+        self.assertGreater(float(out.result_r_multiple), 0)
 
     def test_short_bar_spanning_partial_and_stop(self):
         s = series((99.9, 100.6, 99.45, 100.2))

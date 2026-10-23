@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections import Counter, defaultdict
+from decimal import Decimal
 from pathlib import Path
 
 from . import config
@@ -46,7 +47,7 @@ def regime_of(ev: WindowEvaluation) -> str:
     return REGIME_EDT if aware.utcoffset() == dt.timedelta(hours=-4) else REGIME_EST
 
 
-def _pct(num: float, den: float, dp: int = 1) -> str:
+def _pct(num, den, dp: int = 1) -> str:
     return "n/a" if den == 0 else f"{100.0 * num / den:.{dp}f}%"
 
 
@@ -67,7 +68,7 @@ def summarize(evaluations: list[WindowEvaluation]) -> dict:
 
     partials = [e for e in traded if e.trade.partial_triggered]
     exit_kinds = Counter(e.trade.exit_kind for e in traded)
-    by_direction = defaultdict(lambda: {"traded": 0, "wins": 0, "net_r": 0.0})
+    by_direction = defaultdict(lambda: {"traded": 0, "wins": 0, "net_r": Decimal("0")})
     for e in traded:
         d = by_direction[e.plan.direction]
         d["traded"] += 1
@@ -92,8 +93,8 @@ def summarize(evaluations: list[WindowEvaluation]) -> dict:
             "no_setup": sum(1 for e in rows if e.outcome == OUTCOME_NO_SETUP),
         }
 
-    monthly = defaultdict(lambda: {"rows": 0, "traded": 0, "wins": 0, "net_r": 0.0})
-    regime = defaultdict(lambda: {"rows": 0, "traded": 0, "wins": 0, "net_r": 0.0})
+    monthly = defaultdict(lambda: {"rows": 0, "traded": 0, "wins": 0, "net_r": Decimal("0")})
+    regime = defaultdict(lambda: {"rows": 0, "traded": 0, "wins": 0, "net_r": Decimal("0")})
     for e in evaluations:
         key = e.trading_date.strftime("%Y-%m")
         m = monthly[key]
@@ -131,7 +132,7 @@ def summarize(evaluations: list[WindowEvaluation]) -> dict:
         "net_r": net_r,
         "gross_win": gross_win,
         "gross_loss": gross_loss,
-        "avg_r": (net_r / len(traded)) if traded else 0.0,
+        "avg_r": (net_r / len(traded)) if traded else Decimal("0"),
         "partials": len(partials),
         "exit_kinds": exit_kinds,
         "by_direction": dict(by_direction),
@@ -302,14 +303,66 @@ def render(
     w("| 7 | Monday–Friday only, New York calendar. Sunday evening sessions in the "
       "data are not evaluated (PRD §6.1 as written). | PRD §6.1 / Q11 |")
     w("")
-    w("R is `|entry − SL| = 0.5·Range + 1 tick`. Note `TP − entry = 0.5·Range`, "
-      "i.e. **a clean run to TP is worth slightly less than 1R** — a property of "
-      "the spec, not an error. The realised values depend on how large Candle A's "
-      "range is relative to one tick: partial-then-breakeven is "
-      "`0.9 × 0.8 × Range / (0.5 × Range + 1 tick)`, which approaches +0.72R for "
-      "wide candles (~+0.70R at this dataset's median range) and +0.60R for a "
-      "1.0-point range. Full stop is exactly −1R; a clean TP run is "
-      "`0.5·Range / (0.5·Range + 1 tick)` (0.81–0.99R in this sample).")
+    # -- quantization accounting (computed, never hard-coded) ----------------
+    plans = [e.plan for e in evaluations if e.traded and e.plan is not None]
+    n_plans = len(plans)
+    n_quant = sum(1 for p in plans if p.quantized)
+    n_sl_moved = sum(1 for p in plans if p.raw_stop_loss != p.stop_loss)
+    n_tp_moved = sum(1 for p in plans if p.raw_take_profit != p.take_profit)
+    n_pt_moved = sum(1 for p in plans if p.raw_partial_trigger is not None
+                      and p.raw_partial_trigger != p.partial_trigger)
+    clean_tp = [e.trade.result_r_multiple for e in evaluations
+                if e.traded and e.trade.exit_kind == "tp"
+                and not e.trade.partial_triggered]
+    clean_exact = sum(1 for r in clean_tp if r == 1)
+
+    w("R is `|entry − SL|`, measured **after** the SL and TP have been quantized "
+      "onto the 0.1 tick grid (see §2.1). Full stop is exactly −1R by "
+      "construction. `TP − entry` is `0.5·Range` *before* quantization and is "
+      "rounded one further tick away from entry, so a clean run to TP lands at "
+      "≈1R rather than slightly below it: "
+      f"{len(clean_tp):,} clean TP trades score "
+      f"{min(clean_tp):.4f}R–{max(clean_tp):.4f}R, of which {clean_exact:,} are "
+      "exactly 1.0000R. Partial-then-breakeven is "
+      "`0.9 × 0.8 × Range / |entry − SL|`, approaching +0.72R for wide candles "
+      "(~+0.70R at this dataset's median range).")
+    w("")
+    w("### 2.1 Tick-grid quantization (post-calculation)")
+    w("")
+    w("The spec fixes `Range = High_A − Low_A` and `Mid_A` as **exact** values, "
+      "but a NAS100 order price can only sit on a 0.1 multiple. Phase 1 therefore "
+      "converts every price to `decimal.Decimal`, keeps `Mid_A` and `Range` "
+      "exact, and quantizes only the three order prices, **after** they are "
+      "calculated, in the direction that is pessimistic for the trade:")
+    w("")
+    w("| Field | SHORT | LONG | Why it is pessimistic |")
+    w("|---|---|---|---|")
+    w("| `SL` | `ROUND_FLOOR` | `ROUND_CEILING` | the stop moves one tick "
+      "**closer** to entry, so risk is never understated |")
+    w("| `TP` | `ROUND_FLOOR` | `ROUND_CEILING` | the target moves one tick "
+      "**further** from entry, so profit is never overstated |")
+    w("| `partial_trigger` | `ROUND_FLOOR` | `ROUND_CEILING` | the 80% level "
+      "moves further out, so the lock-in is never assumed early |")
+    w("")
+    w("One direction per trade (`floor` for SHORT, `ceiling` for LONG). Values "
+      "already on the grid are unchanged. `R` is then measured against the "
+      "*quantized* SL, so a tighter stop also scores slightly more R per unit of "
+      "price moved — both effects are visible in the numbers below.")
+    w("")
+    w(f"| Quantization fact | Value |")
+    w("|---|---|")
+    w(f"| Trade plans | {n_plans:,} |")
+    w(f"| Plans with at least one price off-grid | {n_quant:,} "
+      f"({_pct(n_quant, n_plans)}) |")
+    w(f"| `SL` moved by quantization | {n_sl_moved:,} ({_pct(n_sl_moved, n_plans)}) |")
+    w(f"| `TP` moved by quantization | {n_tp_moved:,} ({_pct(n_tp_moved, n_plans)}) |")
+    w(f"| `partial_trigger` moved | {n_pt_moved:,} ({_pct(n_pt_moved, n_plans)}) |")
+    w("")
+    w("This was an **undocumented gap in the original spec, not an engine error**: "
+      "the PRD required a 0.1 grid on all live prices but never said what to do "
+      "with a calculated price that lands off it. The rule above is now recorded "
+      "in PRD §6.7 / TRD §4.1.2 and the audit CSV keeps both the raw and the "
+      "quantized value of every price.")
     w("")
     w("---")
     w("")

@@ -18,6 +18,8 @@ Phase 1 code, tests and the validation report are committed. Every one of the 21
 
 ✅ **The Phase 1 timestamp finding is closed.** The historical CSV does not contain true UTC; the correction was instructed by the Senior Dev and applied to `docs/02-TRD.md` §4.1.1 and `verify_broker_timezone.py`. See **§12** for the reasoning (read it before changing any timestamp code).
 
+✅ **Tick-grid quantization is applied.** Every price is `Decimal`; `SL`, `TP` and the partial trigger are snapped to the 0.1 grid **after** calculation, pessimistically (SHORT floor, LONG ceiling), and `R` is measured against the quantized stop. Net R moved +575.135 → **+579.373** (one trade flipped, deliberately). See **§10 Session 11** and **TRD §4.1.2**; the rule is binding on Phases 2–5.
+
 ---
 
 ## 2. Phase 0 Closure Status — FINAL
@@ -96,13 +98,19 @@ Phase 0 required 6 items to close; all are now done (see Section 2). The final b
 - Python environment set up (Python 3.14, `MetaTrader5` 5.0.6231, `pytz` 2026.5), confirmed working against live MT5 demo terminal.
 - MT5 demo account (Forex.com Global) confirmed accessible, order/SL mechanics confirmed functional (mechanics test only).
 - **Phase 0 formally closed — all 7 checklist items done.**
+- **Tick-grid quantization applied (this session).** All price arithmetic is now
+  `decimal.Decimal`; `Mid_A`/`Range` stay exact (Q6) while `SL`, `TP` and the
+  partial trigger are snapped to 0.1 **after** calculation, pessimistically
+  (SHORT `ROUND_FLOOR`, LONG `ROUND_CEILING`). 87.6% of plans had at least one
+  price off-grid. Documented in **PRD §6.7** and **TRD §4.1.2** — it was an
+  undocumented gap in the original spec, not an engine error.
 - **Phase 1 delivered (this session).** Working, tested, reproducible:
   - `bot/src/` — `config`, `pricing`, `bars`, `time_windows`, `candle_tracker`,
     `context_classifier`, `sweep_detector`, `trade_calculator`,
     `trade_simulator`, `window_evaluator`, `m1_csv_source`, `outputs`, `report`.
   - `bot/historical_validation/validate_against_history.py` — the Phase 1 driver
     (adapter-driven, CLI, `--convention`, `--out-dir`, `--start/--end`).
-  - `bot/tests/` — **96 unit tests, all passing** (`python3 -m unittest discover -s tests`).
+  - `bot/tests/` — **128 unit tests, all passing** (`python3 -m unittest discover -s tests`).
   - `README.md`, `bot/requirements.txt` (stdlib runtime; pytest optional),
     `bot/.env.example` (names only, nothing needed in Phase 1).
   - Generated evidence in `bot/historical_validation/output/`:
@@ -117,10 +125,11 @@ zero-spread/zero-slippage logic test — **not** a P&L forecast):
 |---|---|
 | Bars consumed | 287,746 |
 | Trading dates × windows | 211 × 21 = **4,431** rows, exactly one per window |
-| WIN / LOSS / NO_SETUP | 1,718 / 913 / 1,800 |
+| WIN / LOSS / NO_SETUP | 1,717 / 914 / 1,800 |
 | Trades | 2,631 (win rate 65.3%) |
-| Net R | **+575.135** (avg +0.219 R/trade) |
+| Net R | **+579.373** (avg +0.220 R/trade) |
 | Partial exits fired | 943 (35.8% of trades) |
+| Prices off the 0.1 tick grid (SL/TP/partial/entry) | **0** — all quantized post-calculation (TRD §4.1.2) |
 | Most common non-trade reasons | `no sweep` 1,051 · `ambiguous_same_bar_insufficient_granularity` 342 · `market_closed_no_data` 292 · `invalid open location` 103 |
 | Data-integrity anomalies | 6 feed holes (`missing_market_data`), 6 file-boundary windows (`outside_data_range`), 3 trades open across a session break |
 
@@ -158,21 +167,25 @@ part that makes the numbers trustworthy — do the same on any re-run):
    `spot_check.csv`, and verify ≥20 windows against the raw candles using the
    recipe printed in the report. This is the Phase 1 exit criterion and cannot
    be delegated to the Agent.
-2. ✅ **DONE — timestamp correction applied** (Senior Dev instructed): TRD §4.1.1
+2. ✅ **DONE — tick-grid quantization applied** (Senior Dev instructed).
+   `Decimal` throughout, post-calculation pessimistic snap, `raw_*` audit
+   columns, PRD §6.7 + TRD §4.1.2, 128 tests. Any Phase 2 order path must reuse
+   `pricing.quantize_to_tick` rather than re-deriving the rounding.
+3. ✅ **DONE — timestamp correction applied** (Senior Dev instructed): TRD §4.1.1
    rewritten, `verify_broker_timezone.py` replaced with the constant-offset logic
    plus an offline `--csv` mode, tests added. Re-run the verifier after every US
    DST transition date as a standing check.
-3. 🔴 **Handler → Senior Dev — confirm Q11 and Q12** (see §11.7). Both were
+4. 🔴 **Handler → Senior Dev — confirm Q11 and Q12** (see §11.7). Both were
    implemented to the literal spec + the Agent's recommendation because the
    Handler instructed "no further blockers"; each is a one-line change if the
    Senior Dev rules differently.
-4. **Then Phase 2 (dry-run) only on explicit sign-off**, and only after
+5. **Then Phase 2 (dry-run) only on explicit sign-off**, and only after
    Implementation Plan Step 2 (Supabase) is done Handler-side. Phase 2 adds
    `config.py` env loading, `mt5_client`, `supabase_client`, `logger`, `main.py`
    and refactors the validated logic into the live loop — the Phase 1 modules
    (`time_windows`, `candle_tracker`, `context_classifier`, `sweep_detector`,
    `trade_calculator`) are designed to be reused unchanged.
-5. Optional before Phase 2, if a longer history is cheap to export: re-run with
+6. Optional before Phase 2, if a longer history is cheap to export: re-run with
    a dataset spanning 2026-11-01 to close the fall-back DST gap (see §8).
 
 ## 10. Session Log
@@ -224,6 +237,47 @@ part that makes the numbers trustworthy — do the same on any re-run):
 - **`main` conflict check:** **no conflict.** `origin/main` (`5e0f35c`) has `docs/02-TRD.md` byte-identical to the base (`f6168daa`); the Handler's pasted §4.1.1 never reached GitHub. `data/nas100_m1_history.csv` is also byte-identical (`98ca2fe4`) on both, so the merge will be clean.
 - **Correction applied:** TRD §4.1.1 replaced with the constant −7h rule + evidence + enforcement; `verify_broker_timezone.py` rewritten (arithmetic-only conversion, offline `--csv` mode, exit-code gate); `config.py` / `m1_csv_source.py` docstrings repointed at the corrected section; report §1 status changed from "awaiting sign-off" to "RESOLVED"; 8 new tests (`test_verify_broker_timezone.py`) → **104 tests, all passing**. Verifier run against the real export: all four invariants PASS, exit 0; the old reading fails 3 of 4.
 - **Not done, deliberately:** no dashboard, no Supabase, no MT5 client, no order code — all later phases.
+
+**Session 11 (tick-grid quantization — this session):** Senior Dev retracted an
+earlier garbled-paste diagnosis (nothing was wrong with the R formula) and
+instructed the real change: quantize order prices to the tick grid.
+- **Diagnosed first, on the real output:** 1,297/2,631 (49.3%) of plans had an
+  off-grid `SL` **and** an off-grid `TP`; 1,980 (75.3%) had an off-grid partial
+  trigger; 2,065/4,139 `candle_a_mid` values were also off-grid, which is why
+  `Mid_A`/`Range` were deliberately **left exact** rather than dragged onto the
+  grid.
+- **Implemented:** `pricing.py` rewritten around `Decimal` (`D()`, `is_on_tick_grid`,
+  `quantize_to_tick(value, tick, direction)`, `direction_for`); `trade_calculator.py`
+  rewritten to keep `raw_stop_loss` / `raw_take_profit` / `raw_partial_trigger` for
+  audit, to clamp the partial inside TP, and to raise on misordered plans;
+  `config`, `bars`, `m1_csv_source`, `candle_tracker`, `context_classifier`,
+  `sweep_detector`, `window_evaluator`, `report`, `outputs` converted to `Decimal`.
+  `M1Bar.__post_init__` and `sweep_detector._levels()` coerce at the boundary —
+  `Decimal + float` raises in Python, so no float may leak into a comparison.
+- **Tests:** +22 in `test_quantization.py` (floor/ceiling primitives, an off-grid
+  Candle A 25430.5/25411.0 → `Mid_A` 25420.75, pessimism invariants across all 58
+  observed ranges, partial-never-beyond-TP, the on-grid no-op case); the rest of
+  the suite re-pointed at `Decimal` comparisons. **128 tests, all passing.**
+- **Re-ran everything** (18 s, 4,431 windows, same 2,631 trade ids):
+  WIN 1,717 / LOSS 914 / NO_SETUP 1,800; win rate 65.3%; net R **+579.373**
+  (was +575.135, **+4.238**); avg +0.220; partials 943.
+  **0** off-grid values remain in any price column.
+- **Before/after diff, honestly:** 1,057 final exit prices and 1,201 R-multiples
+  moved; mean ΔR **+0.003529**, range **−1.983 to +0.043**, **1,200 up / 1 down**.
+  Exactly **one** trade flipped WIN→LOSS: a LONG whose TP ceiling'd from
+  25,232.55 to 25,232.60, a price the market never printed before the bar rolled
+  into the (also tightened) stop. That is the pessimism rule doing its job.
+  The audit CSV now exports `raw_*` columns plus `prices_quantized` and
+  `quantize_direction` (the earlier comparison script `KeyError`'d on exactly
+  these missing columns — fixed at source rather than worked around).
+- **Docs:** PRD §6.7 note + new TRD §4.1.2 (rule, pessimism argument, worked
+  example from real rows, consequences, file map). Report §2 rewritten (its old
+  claim that a clean TP run is worth slightly under 1R was pre-quantization
+  arithmetic) and a new **§2.1** added that computes the quantization accounting
+  from the run itself instead of hard-coding numbers. Also fixed the stale
+  `§14` pointer in §10 by adding §14 below.
+- **Not done, deliberately:** no dashboard, no Supabase, no MT5 client, no order
+  code — all later phases.
 
 ---
 
@@ -412,3 +466,28 @@ been **re-derived**, not carried forward.
 - **Handle:** Display-only unit = 1.0 NAS100 price point = 10 ticks. Never used in trigger calculations.
 - **NY+7:** Confirmed broker server time convention — broker = NY local time + 7 hours, following US DST dates.
 - **cross_feed_directional_only:** Tag applied to any Phase 1 backtest result sourced from Dukascopy (non-execution-venue feed) rather than MT5 native export — indicates "directionally informative, not definitive logic validation."
+
+---
+
+## 14. Commit Reference & Reproduction (this branch)
+
+Branch: `arena/3e3fffac-chronos-trading-system` (never `main`). Verify any claim
+with `git rev-parse HEAD` against `git ls-remote origin <branch>` before trusting it.
+
+| Commit | Contents |
+|---|---|
+| `0b5efb5` | Docs D1–D4 fixes, Q1–Q10 bound, schema §8.1 evaluation order |
+| `4227f64` | Phase 1 engine, driver, 96 tests, data, generated report |
+| `1db1964` | Handover hash repoint + workspace-reset incident record |
+| `f0584be` | TRD §4.1.1 timezone correction + rewritten verifier + 8 tests |
+| *(this session)* | Tick-grid quantization (PRD §6.7, TRD §4.1.2, Decimal rewrite, 128 tests, regenerated outputs) |
+
+Reproduce from a clean checkout:
+
+```bash
+cd bot && python3 -m unittest discover -s tests          # 128 tests
+cd .. && python3 bot/historical_validation/validate_against_history.py \
+    --csv data/nas100_m1_history.csv                      # regenerates output/
+python3 bot/historical_validation/verify_broker_timezone.py \
+    --csv data/nas100_m1_history.csv                      # 4/4 invariants, exit 0
+```

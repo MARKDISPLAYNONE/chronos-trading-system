@@ -108,6 +108,11 @@ AUDIT_COLUMNS = [
     "take_profit_price",
     "partial_trigger_price",
     "risk_per_unit",
+    "raw_stop_loss_price",
+    "raw_take_profit_price",
+    "raw_partial_trigger_price",
+    "prices_quantized",
+    "quantize_direction",
     "partial_triggered",
     "partial_exit_time",
     "partial_exit_price",
@@ -138,7 +143,7 @@ def _ny_iso(when: dt.datetime | None) -> str:
     return aware.isoformat()
 
 
-def _fmt(value: float | None) -> str:
+def _fmt(value) -> str:
     return "" if value is None else f"{round_price(value):.5f}"
 
 
@@ -218,6 +223,11 @@ def audit_row(ev: WindowEvaluation) -> dict:
         "take_profit_price": _fmt(p.take_profit) if p else "",
         "partial_trigger_price": _fmt(p.partial_trigger) if p else "",
         "risk_per_unit": _fmt(p.risk_per_unit) if p else "",
+        "raw_stop_loss_price": _fmt(p.raw_stop_loss) if p and p.raw_stop_loss is not None else "",
+        "raw_take_profit_price": _fmt(p.raw_take_profit) if p and p.raw_take_profit is not None else "",
+        "raw_partial_trigger_price": _fmt(p.raw_partial_trigger) if p and p.raw_partial_trigger is not None else "",
+        "prices_quantized": str(bool(p and p.quantized)).lower() if p else "",
+        "quantize_direction": p.quantization_direction if p else "",
         "partial_triggered": str(bool(t and t.partial_triggered)).lower() if t else "",
         "partial_exit_time": _ny_iso(t.partial_exit_time) if (t and t.partial_exit_time) else "",
         "partial_exit_price": _fmt(t.partial_exit_price) if (t and t.partial_exit_price) else "",

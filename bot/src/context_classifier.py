@@ -23,6 +23,7 @@ Two details that are easy to get wrong and are therefore handled explicitly:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import Enum
 
 from .pricing import eq, ge, gt, le, lt
@@ -50,7 +51,7 @@ class Classification:
         return self.context is Context.VOID
 
 
-def classify(open_b: float, low_a: float, mid_a: float, high_a: float) -> Classification:
+def classify(open_b, low_a, mid_a, high_a) -> Classification:
     """Classify context from Candle B's open. Raises on an inconsistent candle."""
     if not le(low_a, mid_a) or not le(mid_a, high_a):
         raise ValueError(

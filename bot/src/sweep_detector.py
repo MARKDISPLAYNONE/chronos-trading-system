@@ -54,7 +54,7 @@ import datetime as dt
 from dataclasses import dataclass
 
 from .bars import M1Bar
-from .pricing import ge, le
+from .pricing import D, ge, le
 
 REASON_NO_SWEEP = "no sweep"
 REASON_SWEEP_NOT_REVERSED = "sweep not reversed"
@@ -82,8 +82,9 @@ class SweepResult:
         return self.reversal_time
 
 
-def _levels(direction: str, high_a: float, low_a: float, tick: float) -> tuple[float, float]:
+def _levels(direction: str, high_a, low_a, tick):
     """Return `(sweep_level, reversal_level)` for the direction."""
+    high_a, low_a, tick = D(high_a), D(low_a), D(tick)
     if direction == SHORT:
         return high_a + tick, high_a - tick
     if direction == LONG:

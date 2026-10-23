@@ -4,6 +4,11 @@ import datetime as dt
 import pathlib
 import sys
 import unittest
+from decimal import Decimal
+
+
+def D(x):
+    return Decimal(str(x))
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -27,12 +32,12 @@ class TestAggregation(unittest.TestCase):
         ]
         c = build_candle(BarSeries(bars), T0, 15)
         self.assertIsNotNone(c)
-        self.assertEqual(c.open, 99.5)
-        self.assertEqual(c.high, 100.2)
-        self.assertEqual(c.low, 98.7)
-        self.assertEqual(c.close, 99.3)
-        self.assertAlmostEqual(c.mid, (100.2 + 98.7) / 2)
-        self.assertAlmostEqual(c.range, 100.2 - 98.7)
+        self.assertEqual(c.open, D('99.5'))
+        self.assertEqual(c.high, D('100.2'))
+        self.assertEqual(c.low, D('98.7'))
+        self.assertEqual(c.close, D('99.3'))
+        self.assertEqual(c.mid, (D('100.2') + D('98.7')) / 2)
+        self.assertEqual(c.range, D('100.2') - D('98.7'))
         self.assertEqual(c.n_bars, 4)
         self.assertFalse(c.complete)
 
@@ -50,13 +55,13 @@ class TestAggregation(unittest.TestCase):
         bars = [bar(14, 100.0, 100.5, 99.5, 100.0), bar(15, 101.0, 105.0, 101.0, 104.0)]
         c = build_candle(BarSeries(bars), T0, 15)
         # the 15th minute belongs to Candle B, not Candle A
-        self.assertEqual(c.high, 100.5)
+        self.assertEqual(c.high, D('100.5'))
         self.assertEqual(c.n_bars, 1)
 
     def test_mid_need_not_be_tick_aligned(self):
         bars = [bar(0, 99.7, 100.0, 99.7, 99.8)]
         c = build_candle(BarSeries(bars), T0, 15)
-        self.assertAlmostEqual(c.mid, 99.85)  # half-tick, and that is correct
+        self.assertEqual(c.mid, D('99.85'))  # half-tick, and that is correct
 
 
 if __name__ == "__main__":
