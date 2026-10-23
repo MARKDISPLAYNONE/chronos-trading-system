@@ -1,7 +1,7 @@
 # Project Chronos — Phase 1 Validation Report
 
-**Generated:** 2026-10-23 17:53:43 (local)  
-**Runtime:** 10.9s  
+**Generated:** 2026-10-23 18:36:21 (local)  
+**Runtime:** 14.1s  
 **Input:** `data/nas100_m1_history.csv`  
 **Instrument:** NAS100 (tick 0.1)  
 **Scope:** Phase 1 — logic validation on historical M1 data. **No orders were placed, no broker was contacted, no database was used.**
@@ -33,7 +33,7 @@ Corroborating signals, all independent of the above:
 2. **The strategy's own skip set.** The three excluded windows (15:45–18:15) bracket a 17:00–18:00 break. Under NY+7 that break is exactly 17:00–18:00 every day; under the UTC reading it would sit at 19:00–20:00 and the skip set would be unexplained.
 3. **Holiday reopen.** The file's first bar is 2026-01-01 18:00 NY (the New Year's Day reopen) and Fridays end 16:59 NY year-round.
 
-**Status: flagged for Senior Dev sign-off.** `docs/02-TRD.md` §4.1.1 and `bot/historical_validation/verify_broker_timezone.py` are, on this evidence, wrong and need correcting. Nothing here has been edited unilaterally. The adapter defaults to `--convention broker`, validates it at load time, and refuses to run if the data disagrees — so this cannot silently produce a plausible-looking but shifted backtest.
+**Status: RESOLVED.** The finding above was escalated to the Senior Dev, who instructed the correction. `docs/02-TRD.md` §4.1.1 has been rewritten to state the constant-offset rule, and `bot/historical_validation/verify_broker_timezone.py` now implements it and reproduces the invariant checks below offline (`--csv ../data/nas100_m1_history.csv`). The adapter still validates the convention at load time and refuses to run if the data disagrees, so this cannot silently produce a plausible-looking but shifted backtest.
 
 ---
 
@@ -285,7 +285,7 @@ Verification recipe for each row: `High_A`/`Low_A` must equal the max/min of the
 
 ```bash
 cd bot
-python3 -m unittest discover -s tests          # 96 logic unit tests
+python3 -m unittest discover -s tests          # full logic suite
 python3 historical_validation/validate_against_history.py \
     --csv ../data/nas100_m1_history.csv
 ```

@@ -264,12 +264,14 @@ def render(
     w("3. **Holiday reopen.** The file's first bar is 2026-01-01 18:00 NY "
       "(the New Year's Day reopen) and Fridays end 16:59 NY year-round.")
     w("")
-    w("**Status: flagged for Senior Dev sign-off.** `docs/02-TRD.md` §4.1.1 and "
-      "`bot/historical_validation/verify_broker_timezone.py` are, on this "
-      "evidence, wrong and need correcting. Nothing here has been edited "
-      "unilaterally. The adapter defaults to `--convention broker`, validates it "
-      "at load time, and refuses to run if the data disagrees — so this cannot "
-      "silently produce a plausible-looking but shifted backtest.")
+    w("**Status: RESOLVED.** The finding above was escalated to the Senior Dev, "
+      "who instructed the correction. `docs/02-TRD.md` §4.1.1 has been rewritten "
+      "to state the constant-offset rule, and "
+      "`bot/historical_validation/verify_broker_timezone.py` now implements it "
+      "and reproduces the invariant checks below offline "
+      "(`--csv ../data/nas100_m1_history.csv`). The adapter still validates the "
+      "convention at load time and refuses to run if the data disagrees, so this "
+      "cannot silently produce a plausible-looking but shifted backtest.")
     w("")
     w("---")
     w("")
@@ -636,7 +638,7 @@ def render(
     w("")
     w("```bash")
     w("cd bot")
-    w("python3 -m unittest discover -s tests          # 96 logic unit tests")
+    w("python3 -m unittest discover -s tests          # full logic suite")
     w("python3 historical_validation/validate_against_history.py \\")
     w("    --csv ../data/nas100_m1_history.csv")
     w("```")

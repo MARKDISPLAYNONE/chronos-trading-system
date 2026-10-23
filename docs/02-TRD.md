@@ -98,40 +98,93 @@ configuration — it is a hard OS dependency.
   migration happens only AFTER core logic is validated locally (see
   `07-PHASE-PLAN.md`) — do not attempt this prematurely.
 
-### 4.1.1 Timezone Handling (Critical — Confirmed, Session 3)
+### 4.1.1 Timezone Handling (Critical — Corrected in Phase 1)
 
-MT5's `copy_rates_*` functions return raw Unix epoch timestamps
-(timezone-agnostic by nature). The MT5 **terminal display** shows these
-interpreted in the broker's server time, which is NOT UTC and NOT the
-Handler's local time — this was empirically confirmed and then precisely
-identified as follows:
+**Status:** this section was rewritten during Phase 1 after the historical
+export proved the original wording wrong. The original text claimed that MT5's
+raw epoch is "timezone-agnostic" (true UTC) and that the broker's NY+7 clock was
+a display convenience only. **That is not what MT5 actually returns.** The
+correction below is empirically verified against 287,746 M1 bars and is now the
+authoritative rule. Anyone implementing against the old wording will evaluate
+every strategy window 2–3 hours away from where the strategy says.
 
-**Confirmed finding:** Forex.com (GAIN Capital) runs demo/live servers on
-a convention known as **"NY+7"** — the broker server clock is always
-exactly 7 hours ahead of New York LOCAL time, and critically, it follows
-**US DST transition dates** (2nd Sunday of March → 1st Sunday of
-November), NOT EU DST dates. This means:
-- During US DST (EDT, UTC−4): broker server = UTC+3
-- During US standard time (EST, UTC−5): broker server = UTC+2
-- The broker's offset SHIFTS on US DST change dates, which do NOT align
-  with EU DST change dates — this was the original risk this section
-  flagged, now fully resolved with a confirmed, named convention rather
-  than an assumption
+#### What `copy_rates_*` actually returns
 
-**Practical implication for code — this is actually simpler than
-initially anticipated:** Since broker timestamps are raw epoch (UTC-
-equivalent) values, the conversion pipeline never needs to know or care
-about the broker's display convention at all for strategy logic:
+The `time` field of every MT5 bar is **broker server time, encoded as if it
+were Unix epoch UTC**. In other words the number, decoded as UTC, yields the
+broker's wall clock — not the true UTC instant.
 
-```python
-from datetime import datetime
-from zoneinfo import ZoneInfo
+Forex.com / GAIN Capital run what the trading community calls **"NY+7"**: the
+broker server clock is always exactly **7 hours ahead of New York local time**,
+and it follows **US DST transition dates** (2nd Sunday of March → 1st Sunday of
+November), not EU dates. Because the broker and New York change clocks on the
+same dates, the offset between them is a **constant 7 hours all year round** —
+which is precisely what makes the correction simple:
 
-# This is correct, year-round, with ZERO changes needed across any DST
-# transition (US or EU) — this is the ONLY conversion strategy logic uses:
-utc = datetime.fromtimestamp(raw_epoch, tz=ZoneInfo("UTC"))
-ny_time = utc.astimezone(ZoneInfo("America/New_York"))
 ```
+New York wall clock  =  datetime.fromtimestamp(epoch, UTC).replace(tzinfo=None) - timedelta(hours=7)
+```
+
+That subtraction is the **entire** conversion. No `zoneinfo`, no `pytz`, no DST
+lookup, and no broker-offset branch is required for this step — the DST shift is
+already baked into the raw value, and subtracting a constant 7 hours cancels it
+identically in both regimes:
+
+| Period | Broker clock | − 7h | New York |
+|---|---|---|---|
+| US daylight time (EDT, UTC−4) | UTC+3 | − 7h | **UTC−4** ✓ |
+| US standard time (EST, UTC−5) | UTC+2 | − 7h | **UTC−5** ✓ |
+
+Adding a DST-aware conversion **on top of** the subtraction would double-count
+the shift and silently move every bar by an hour for half the year.
+
+#### Why the original NY+7 finding still stands
+
+The NY+7 *convention* was confirmed correctly in Session 3 and is unchanged. What
+was wrong was the conclusion drawn from it: that the epoch could be treated as
+true UTC and the broker offset ignored. The offset is **load-bearing on the input
+side**, not decorative. Strategy code still never reasons about "broker time" as
+a concept — it reasons about New York wall clock, which is what the subtraction
+produces.
+
+#### How the correction was proven, and how it is enforced
+
+Under the old (UTC) reading, every session boundary drifts when DST changes.
+Under the corrected reading they are fixed local times, in both regimes:
+
+| Signal | Old reading (epoch = UTC) | Corrected reading (epoch = broker, −7h) |
+|---|---|---|
+| Daily maintenance break | 19:00–20:00 NY in summer, 18:00–19:00 in winter — moves at DST | **17:00–18:00 NY every day, all year** |
+| Friday close | drifts 19:59 → 18:59 NY across the DST date | **16:59 NY** in both EST and EDT |
+| Sunday open | drifts 21:00 → 20:00 NY | **18:00 NY** |
+| Intraday volume peak (July) | raw 13:30–20:00, where 13:00–14:00 is the *quietest* hour in the file | raw 16:30–23:00 — exactly the US cash session |
+| The 3 intentionally skipped windows (15:45–18:15) | break would sit at 19:00–20:00; skip set unexplained | break sits **inside** the skip set |
+
+An exchange does not move its session when a timezone changes; only a timestamp
+convention does. So the data cannot be read the old way and still describe a real
+NAS100 session.
+
+**This is now a hard runtime gate, not a convention to trust.**
+`bot/src/m1_csv_source.py` scores any input file against those session
+invariants (`no_saturday_bars`, `daily_break_1700_1800_ny`,
+`friday_close_1659_ny`, `sunday_open_1800_ny`) and **refuses to run** if they
+fail, so a wrong reading cannot silently produce a plausible-looking backtest.
+`bot/historical_validation/verify_broker_timezone.py` reproduces the same
+verification on demand, against a live terminal or an exported CSV.
+
+#### Rules that follow from this (binding on every phase)
+
+1. **Broker → New York is a constant −7h subtraction** on the raw epoch label.
+   Never add a DST-aware conversion after it.
+2. **Strategy logic may only reason in New York wall clock**, never in broker
+   time as a concept. The window definitions in PRD §6.1 are New York times.
+3. **`zoneinfo` is still used elsewhere** — for tagging whether a timestamp falls
+   in EST or EDT for reporting, and for detecting non-existent local times around
+   the spring-forward gap (`time_windows.localize()`). It is never used to
+   convert broker epochs into New York time.
+4. **Any new data source must pass the same invariant gate before use.** A feed
+   that stores true UTC would need an explicit, different adapter — never a
+   silent reinterpretation of the existing one.
 
 ### 4.2 Database & Backend
 | Component | Choice | Why |

@@ -16,14 +16,13 @@ THE IMPORTANT PART: what the timestamp actually means
 --------------------------------------------------------------------------
 Q3 said the adapter must "never trust any broker-local assumption from the
 file itself". This adapter goes further and *proves* the convention against
-the data before a single window is evaluated, because the Phase 1 dataset
-contradicts docs/02-TRD.md §4.1.1.
+the data before a single window is evaluated.
 
-TRD §4.1.1 asserts the raw epoch is true UTC ("timezone-agnostic by nature")
-and that NY+7 is a display artifact only. Evidence from
-`data/nas100_m1_history.csv` (287,746 M1 bars, Jan-Oct 2026) shows the export
-carries **broker server time encoded as if it were UTC**, i.e.
-`NY wall clock = utc_label(epoch) - 7h`:
+MT5 writes **broker server time encoded as if it were UTC**, so
+`NY wall clock = utc_label(epoch) - 7h`. This is now the authoritative rule in
+docs/02-TRD.md §4.1.1 (rewritten in Phase 1; the original text wrongly treated
+the epoch as true UTC). Evidence from `data/nas100_m1_history.csv`
+(287,746 M1 bars, Jan-Oct 2026):
 
   1. SESSION INVARIANTS. Under `epoch = true UTC` the daily maintenance break
      sits at 19:00-20:00 NY in summer and 18:00-19:00 NY in winter, and the
@@ -41,8 +40,8 @@ carries **broker server time encoded as if it were UTC**, i.e.
      at 19:00-20:00 and the skip set would be unexplained.
 
 Consequences:
-  * this is flagged to the Handler as a required correction to TRD §4.1.1 and
-    to `verify_broker_timezone.py` (see handover §13);
+  * TRD §4.1.1 and `verify_broker_timezone.py` were corrected to match in Phase 1
+    (Senior Dev instructed the edit); this adapter is the enforced implementation;
   * `load_bars()` validates the chosen convention and **refuses to run** if
     the data does not satisfy it, so a wrong convention can never silently
     produce a plausible-looking backtest;

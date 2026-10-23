@@ -58,14 +58,18 @@ NY_TZ = "America/New_York"
 UTC_TZ = "UTC"
 
 #: Broker server clock = New York local time + 7 hours ("NY+7"), following US
-#: DST dates (TRD §4.1.1, handover §4).
+#: DST dates. This is the load-bearing conversion for INPUT data: MT5's bar
+#: `time` field is broker server time encoded as if it were UTC, so
 #:
-#: IMPORTANT — Phase 1 finding: this is NOT display-only. The MT5 export in
-#: `data/nas100_m1_history.csv` stores broker server time encoded as if it
-#: were UTC, so this offset is load-bearing on the INPUT side. See
-#: `m1_csv_source.py` and handover §13 for the empirical proof (session
-#: invariants + intraday volume profile). The adapter validates the
-#: convention at load time and refuses to run if the data disagrees.
+#:     New York wall clock = utc_label(epoch) - BROKER_OFFSET_HOURS
+#:
+#: and that subtraction is the entire conversion — no DST lookup, no zoneinfo.
+#: The DST shift is already inside the raw value, and because the broker and New
+#: York change clocks on the same dates, the 7-hour offset is constant
+#: year-round. Corrected and now authoritative in docs/02-TRD.md §4.1.1.
+#:
+#: `m1_csv_source` enforces the convention against session invariants at load
+#: time and refuses to run if the data disagrees.
 BROKER_OFFSET_HOURS = 7
 
 # ---------------------------------------------------------------------------

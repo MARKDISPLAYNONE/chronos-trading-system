@@ -1,157 +1,297 @@
 """
 Project Chronos — Broker Timezone Verification Script
-========================================================
+=====================================================
 
-PURPOSE
--------
-Confirms how MT5 (Forex.com Global / GAIN Capital broker feed) timestamps
-relate to actual New York local time, which is the ONLY timezone the
-Zeussy Macro Time strategy logic cares about (all 21 daily windows are
-defined in NY local time per docs/01-PRD.md Section 6).
+CORRECTED IN PHASE 1. This file previously implemented the opposite convention
+and its two output columns could not both match the MT5 chart. It now implements
+the convention that the historical export actually proves, and it is the
+reference implementation of docs/02-TRD.md §4.1.1.
 
-CONFIRMED FINDING (see docs/02-TRD.md Section 4.1.1 for full writeup):
------------------------------------------------------------------------
-Forex.com / GAIN Capital's broker server clock runs on what the trading
-community calls "NY+7": the broker server time is ALWAYS exactly 7 hours
-ahead of New York LOCAL time, and it follows **US DST transition dates**
-(2nd Sunday in March -> 1st Sunday in November), not EU DST dates.
+THE RULE
+--------
+MT5's bar `time` field is **broker server time encoded as if it were Unix epoch
+UTC**. Forex.com / GAIN Capital run "NY+7": the server clock is always exactly
+7 hours ahead of New York local time, following US DST dates. Because the broker
+and New York change clocks on the same dates, the offset between them is a
+**constant 7 hours year-round**. So:
 
-    - During US Daylight Time (EDT, UTC-4): broker time = UTC+3
-    - During US Standard Time (EST, UTC-5): broker time = UTC+2
+    New York wall clock = utc_label(epoch) - 7 hours
 
-This means the broker's UTC offset itself SHIFTS on US DST dates, even
-though "NY+7" never changes. An earlier working theory (now disproven)
-assumed the broker ran on a fixed Africa/Nairobi (UTC+3, no DST) clock.
-That theory happened to produce correct-looking results when tested
-during US DST, but would have silently broken after the Nov 1 2026 US
-DST rollback (broker -> UTC+2, Nairobi stays UTC+3). DO NOT use a fixed
-UTC+3 or Nairobi assumption anywhere in this codebase.
+That subtraction is the ENTIRE conversion. No `zoneinfo`, no `pytz`, no DST
+lookup, no broker-offset branching. The DST shift is already baked into the raw
+value and the constant subtraction cancels it identically in both regimes:
 
-HARD RULE FOR ALL STRATEGY LOGIC
----------------------------------
-Strategy code must NEVER reference broker server time or any hardcoded
-hour offset. It must only ever convert raw UTC timestamps (what MT5's
-`time` field actually represents, in Unix epoch) into
-`America/New_York` using a proper DST-aware timezone library
-(`zoneinfo` or `pytz`). The "Broker Display" column in this script exists
-ONLY for human cross-checking against the MT5 terminal's own chart —
-it is a debug convenience, never a logic dependency.
+    EDT period: broker UTC+3 -> -7h -> UTC-4  (New York)   CORRECT
+    EST period: broker UTC+2 -> -7h -> UTC-5  (New York)   CORRECT
 
-HOW TO USE THIS SCRIPT
------------------------
-1. Run it while MT5 terminal is open and logged into the demo account.
-2. Compare the "As Broker Display (NY+7)" column against the timestamp
-   shown on the same bar in MT5's own H1 chart for NAS100. They should
-   match exactly.
-3. Compare the "As NY (strategy uses this)" column against what you know
-   to be true NY local time for that bar. This is the value the trading
-   logic will use for all window boundary calculations.
-4. RE-RUN THIS SCRIPT after Nov 1, 2026 (US DST end date) and again after
-   the next US DST start date (2nd Sunday March 2027) to reconfirm the
-   NY+7 relationship continues to hold after each transition. If it does
-   not, STOP all bot development and escalate to Handler/Senior Dev
-   immediately — the entire timezone assumption would need re-validation.
+Adding a second, DST-aware conversion on top of this would double-count the
+shift and move every bar by an hour for half the year. Do not do it.
 
+WHY THIS IS NOT OPTIONAL
+------------------------
+Read under the old assumption ("the epoch is true UTC"), every session boundary
+drifts when DST changes:
+
+    daily break   19:00-20:00 NY in summer, 18:00-19:00 NY in winter
+    Friday close  19:59 NY in summer, 18:59 NY in winter
+
+Read with the correction, they are fixed local times all year: break
+17:00-18:00, Friday close 16:59, Sunday open 18:00. An exchange does not move
+its session when a timezone changes, so only the corrected reading is physical.
+The same evidence also explains the strategy's three deliberately skipped
+windows (15:45-18:15), which bracket that 17:00-18:00 break.
+
+HOW TO RUN
+----------
+1. OFFLINE, against an exported CSV (no MT5, any OS, deterministic):
+
+       python3 verify_broker_timezone.py --csv ../data/nas100_m1_history.csv
+
+   Exit code 0 = every session invariant holds. Non-zero = the file does not
+   satisfy the convention and must not be used for strategy work.
+
+2. LIVE, against a running MT5 terminal (Windows only), which additionally
+   prints recent bars so a human can compare against the terminal's own chart:
+
+       python3 verify_broker_timezone.py
+
+RE-RUN THIS after every US DST transition date (2nd Sunday March, 1st Sunday
+November). If the invariants stop holding, STOP bot development and escalate —
+do not patch in a new hardcoded offset.
 """
 
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from __future__ import annotations
 
-import MetaTrader5 as mt5
+import argparse
+import csv
+import sys
+from datetime import datetime, timedelta, timezone
 
-# ---------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------
-SYMBOL = "NAS100"           # Confirmed API symbol string (docs/05-DATABASE-SCHEMA.md)
-TIMEFRAME = mt5.TIMEFRAME_H1
-NUM_BARS = 10                # How many most-recent bars to inspect
+# ---------------------------------------------------------------------------
+# The single load-bearing constant. Broker clock = New York local + 7 hours.
+# Constant year-round precisely because both change on US DST dates.
+# ---------------------------------------------------------------------------
+BROKER_OFFSET_HOURS = 7
 
-NY_TZ = ZoneInfo("America/New_York")
-UTC_TZ = ZoneInfo("UTC")
+# ---------------------------------------------------------------------------
+# Session invariants this venue must satisfy, in New York local time.
+# ---------------------------------------------------------------------------
+DAILY_BREAK = ("17:00", "18:00")   # platform maintenance / rollover, Mon-Thu
+FRIDAY_CLOSE = "16:59"             # last M1 bar of the week
+SUNDAY_OPEN = "18:00"              # first M1 bar of the week
 
-BROKER_OFFSET_HOURS = 7      # "NY+7" — for DEBUG DISPLAY ONLY. Never used in strategy logic.
+TICK_SIZE = 0.1
 
 
-def broker_display_time(ny_time: datetime) -> datetime:
+# ---------------------------------------------------------------------------
+# Conversion — deliberately arithmetic only
+# ---------------------------------------------------------------------------
+def broker_wall_clock(epoch: int) -> datetime:
+    """Decode the raw epoch as the broker's wall clock (naive).
+
+    `utc` is used here purely as a decoding device to read the label; no
+    timezone semantics are attached to the result.
     """
-    DEBUG / CROSS-REFERENCE ONLY.
-
-    Computes what the broker's own server clock would show for a given
-    NY local time, using the confirmed NY+7 convention. This exists
-    solely so a human can visually cross-check this script's output
-    against the MT5 terminal's own chart timestamps.
-
-    STRATEGY LOGIC MUST NEVER CALL THIS FUNCTION. All window
-    calculations, context determination, sweep/reversal detection, and
-    SL/TP logic must operate on `as_ny`, never on this value.
-    """
-    return ny_time + timedelta(hours=BROKER_OFFSET_HOURS)
+    return datetime.fromtimestamp(epoch, timezone.utc).replace(tzinfo=None)
 
 
-def main():
-    if not mt5.initialize():
-        print(f"ERROR: MT5 initialize() failed. Error code: {mt5.last_error()}")
-        return
+def new_york_wall_clock(epoch: int) -> datetime:
+    """Broker wall clock minus the constant 7 hours. THE whole conversion."""
+    return broker_wall_clock(epoch) - timedelta(hours=BROKER_OFFSET_HOURS)
 
-    try:
-        rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, NUM_BARS)
 
-        if rates is None or len(rates) == 0:
-            print(f"ERROR: No rates returned for symbol '{SYMBOL}'. "
-                  f"Check symbol is correct and visible in Market Watch.")
-            return
+def _hm(t: datetime) -> str:
+    return t.strftime("%H:%M")
 
-        print(f"\nBroker Timezone Verification — Symbol: {SYMBOL}  Timeframe: H1")
-        print(f"Confirmed convention: Broker = NY local time + 7 hours, follows US DST dates.")
-        print("=" * 110)
-        header = (
-            f"{'Raw Epoch':>12} | "
-            f"{'As UTC':>20} | "
-            f"{'As NY (strategy uses this)':>27} | "
-            f"{'As Broker Display (NY+7, debug only)':>37}"
+
+# ---------------------------------------------------------------------------
+# Verification
+# ---------------------------------------------------------------------------
+def verify(bars: list[tuple[int, float, float, float, float, int]]) -> tuple[bool, list[tuple[str, bool, str]]]:
+    """Check the session invariants. Returns (all_passed, rows)."""
+    if not bars:
+        return False, [("input", False, "no bars to verify")]
+
+    ny = [(t, new_york_wall_clock(t)) for t, *_ in bars]
+    rows: list[tuple[str, bool, str]] = []
+
+    # 1. No Saturday trading anywhere.
+    sat = sum(1 for _, n in ny if n.weekday() == 5)
+    rows.append(("no Saturday bars", sat == 0, f"{sat} Saturday bars"))
+
+    # 2. No Mon-Thu bar inside the daily break.
+    in_break = sum(1 for _, n in ny if n.weekday() < 4 and n.hour == 17)
+    rows.append(
+        (
+            f"daily break {DAILY_BREAK[0]}-{DAILY_BREAK[1]} NY",
+            in_break == 0,
+            f"{in_break} Mon-Thu bars inside 17:00-18:00 NY",
         )
-        print(header)
-        print("-" * 110)
+    )
 
-        for bar in rates:
-            raw_epoch = int(bar["time"])
+    # 3. Fridays end at 16:59 NY, never later (half-days may end earlier).
+    by_date: dict[object, list[datetime]] = {}
+    for _, n in ny:
+        by_date.setdefault(n.date(), []).append(n)
+    fri_last = {d: ts[-1] for d, ts in by_date.items() if d.weekday() == 4}
+    late = sum(1 for n in (t for _, t in ny) if n.weekday() == 4 and _hm(n) > FRIDAY_CLOSE)
+    at_close = sum(1 for t in fri_last.values() if _hm(t) == FRIDAY_CLOSE)
+    ok = bool(fri_last) and late == 0 and at_close / len(fri_last) >= 0.8
+    rows.append(
+        (
+            f"Friday close {FRIDAY_CLOSE} NY",
+            ok,
+            f"{at_close}/{len(fri_last)} Fridays close at {FRIDAY_CLOSE}, {late} bars later than that",
+        )
+    )
 
-            # MT5 raw epoch value is timezone-agnostic Unix time.
-            # Interpret as UTC first — this is the only safe universal anchor.
-            as_utc = datetime.fromtimestamp(raw_epoch, tz=UTC_TZ)
+    # 4. Sundays open at 18:00 NY.
+    sun_first = {d: ts[0] for d, ts in by_date.items() if d.weekday() == 6}
+    early = sum(1 for n in (t for _, t in ny) if n.weekday() == 6 and _hm(n) < SUNDAY_OPEN)
+    at_open = sum(1 for t in sun_first.values() if _hm(t) == SUNDAY_OPEN)
+    ok = bool(sun_first) and early == 0 and at_open / len(sun_first) >= 0.95
+    rows.append(
+        (
+            f"Sunday open {SUNDAY_OPEN} NY",
+            ok,
+            f"{at_open}/{len(sun_first)} Sundays open at {SUNDAY_OPEN}, {early} bars earlier than that",
+        )
+    )
 
-            # Convert to NY local time using a proper DST-aware library.
-            # THIS is the value all strategy logic (window boundaries,
-            # Candle A / Candle B timing, etc.) must use.
-            as_ny = as_utc.astimezone(NY_TZ)
+    return all(r[1] for r in rows), rows
 
-            # Debug-only broker display reconstruction for human cross-check
-            # against the MT5 terminal's own chart.
-            as_broker_display = broker_display_time(as_ny.replace(tzinfo=None))
 
-            print(
-                f"{raw_epoch:>12} | "
-                f"{as_utc.strftime('%Y-%m-%d %H:%M:%S %Z'):>20} | "
-                f"{as_ny.strftime('%Y-%m-%d %H:%M:%S %Z'):>27} | "
-                f"{as_broker_display.strftime('%Y-%m-%d %H:%M:%S'):>37} (NY+7, debug only)"
+def _read_csv(path: str) -> list[tuple[int, float, float, float, float, int]]:
+    """Read the agreed CSV contract: timestamp_utc,open,high,low,close,volume."""
+    out = []
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.reader(fh)
+        header = next(reader, None)
+        if header is None or [h.strip() for h in header][:6] != [
+            "timestamp_utc", "open", "high", "low", "close", "volume",
+        ]:
+            raise SystemExit(f"ERROR: unexpected CSV header in {path}: {header}")
+        for row in reader:
+            if not row or not row[0].strip():
+                continue
+            out.append(
+                (
+                    int(row[0]),
+                    float(row[1]),
+                    float(row[2]),
+                    float(row[3]),
+                    float(row[4]),
+                    int(float(row[5])),
+                )
             )
+    return out
 
-        print("=" * 110)
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+def report(rows: list[tuple[str, bool, str]], source: str, n_bars: int) -> int:
+    print()
+    print("Broker timezone verification — convention: broker clock = NY + 7h (constant)")
+    print(f"Source: {source}   Bars: {n_bars:,}")
+    print("=" * 96)
+    for name, passed, detail in rows:
+        print(f"  [{'PASS' if passed else 'FAIL'}] {name:<28} {detail}")
+    print("=" * 96)
+    if all(r[1] for r in rows):
+        print("\nRESULT: the file satisfies the NY+7 constant-offset convention.")
+        print("        Use it for strategy work. New York wall clock = utc_label(epoch) - 7h.")
+        return 0
+    print("\nRESULT: this file does NOT satisfy the convention.")
+    print("        Do NOT evaluate strategy windows against it. Investigate the export")
+    print("        before proceeding — see docs/02-TRD.md 4.1.1.")
+    return 1
+
+
+def print_sample(bars: list[tuple[int, float, float, float, float, int]], n: int = 10) -> None:
+    """Show the conversion for the most recent bars, for chart cross-checking."""
+    print()
+    print(f"Most recent {min(n, len(bars))} bars")
+    print("-" * 96)
+    print(f"{'Raw epoch':>12} | {'Broker clock (= raw label)':>26} | {'New York (raw - 7h)':>20} | {'Last price':>10}")
+    print("-" * 96)
+    for epoch, _o, _h, _l, c, _v in bars[-n:]:
         print(
-            "\nCROSS-CHECK INSTRUCTIONS:\n"
-            "  1. Open the MT5 terminal, view NAS100 H1 chart.\n"
-            "  2. Confirm the 'As Broker Display (NY+7)' column above matches\n"
-            "     the timestamps shown directly on the MT5 chart for these bars.\n"
-            "  3. The 'As NY' column is what all strategy/window logic will use.\n"
-            "     It must represent true, correct New York local time.\n"
-            "  4. Re-run this script after each US DST transition date to\n"
-            "     reconfirm the NY+7 relationship still holds. If it breaks,\n"
-            "     escalate immediately — do not patch with a new hardcoded offset.\n"
+            f"{epoch:>12} | {broker_wall_clock(epoch).strftime('%Y-%m-%d %H:%M'):>26} | "
+            f"{new_york_wall_clock(epoch).strftime('%Y-%m-%d %H:%M'):>20} | {c:>10.1f}"
         )
+    print("-" * 96)
+    print("Cross-check: the 'Broker clock' column is what the MT5 terminal's own")
+    print("chart shows for that bar. 'New York' is what every strategy window in")
+    print("PRD 6.1 is defined against. No DST conversion is applied to either.")
 
+
+# ---------------------------------------------------------------------------
+# Modes
+# ---------------------------------------------------------------------------
+def run_csv(path: str) -> int:
+    bars = _read_csv(path)
+    if not bars:
+        print(f"ERROR: no bars in {path}")
+        return 2
+    bars.sort(key=lambda b: b[0])
+    ok, rows = verify(bars)
+    print_sample(bars)
+    return report(rows, path, len(bars))
+
+
+def run_live(symbol: str, count: int) -> int:
+    try:
+        import MetaTrader5 as mt5
+    except ImportError:
+        print("ERROR: MetaTrader5 is not installed (Windows only).")
+        print("       Use --csv against an exported file instead:")
+        print("       python3 verify_broker_timezone.py --csv ../data/nas100_m1_history.csv")
+        return 2
+
+    if not mt5.initialize():
+        print(f"ERROR: mt5.initialize() failed. Error code: {mt5.last_error()}")
+        return 2
+    try:
+        if not mt5.symbol_select(symbol, True):
+            print(f"ERROR: could not select {symbol} in Market Watch.")
+            return 2
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, count)
+        if rates is None or len(rates) == 0:
+            print(f"ERROR: no rates returned for {symbol}.")
+            return 2
+        bars = [
+            (
+                int(r["time"]),
+                float(r["open"]),
+                float(r["high"]),
+                float(r["low"]),
+                float(r["close"]),
+                int(r["tick_volume"]),
+            )
+            for r in rates
+        ]
     finally:
         mt5.shutdown()
 
+    ok, rows = verify(bars)
+    print_sample(bars)
+    print("\nNOTE: a live window of a few hundred bars may not span a full week, so")
+    print("      the Friday/Sunday checks can report 'no data'. Use --csv with a")
+    print("      multi-month export for the complete verification.")
+    return report(rows, f"MT5 live ({symbol})", len(bars))
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Verify the MT5 broker timezone convention (NY+7).")
+    ap.add_argument("--csv", help="verify an exported M1 CSV instead of a live terminal")
+    ap.add_argument("--symbol", default="NAS100", help="symbol for live mode (default NAS100)")
+    ap.add_argument("--bars", type=int, default=5000, help="live mode: how many M1 bars to pull")
+    args = ap.parse_args(argv)
+    if args.csv:
+        return run_csv(args.csv)
+    return run_live(args.symbol, args.bars)
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

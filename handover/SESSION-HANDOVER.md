@@ -16,7 +16,7 @@
 
 Phase 1 code, tests and the validation report are committed. Every one of the 21 windows on all 211 trading dates in the dataset produced exactly one outcome row (4,431 rows, zero gaps, zero duplicates). Phase 1's exit gate is a **manual review**: the Handler must spot-check ≥20 windows from §11 of the report and confirm the logic is trustworthy before Phase 2 begins.
 
-⚠️ **One finding needs Senior Dev sign-off before Phase 1 is signed off**: the historical CSV does **not** contain true UTC, contrary to `docs/02-TRD.md` §4.1.1. See **§12** — read it before anything else in this file.
+✅ **The Phase 1 timestamp finding is closed.** The historical CSV does not contain true UTC; the correction was instructed by the Senior Dev and applied to `docs/02-TRD.md` §4.1.1 and `verify_broker_timezone.py`. See **§12** for the reasoning (read it before changing any timestamp code).
 
 ---
 
@@ -43,7 +43,7 @@ All located in `docs/` unless noted. All 8 exist, are committed, and pushed.
 | File | Status |
 |---|---|
 | `docs/01-PRD.md` | Current. Section 6.7/6.8 rewritten (partial-exit unit-bug fix). |
-| `docs/02-TRD.md` | Current. §4.1.1 NY+7 finding unchanged. In `0b5efb5`: glossary handle definition corrected to 10 ticks + display-only note, and the unterminated code fence at §4.1.1 closed (renders correctly now). The Session 6 "unexplained local modification" flag is resolved — it was the wholesale add in `8ed0833` plus a markdown error. |
+| `docs/02-TRD.md` | Current. **§4.1.1 fully rewritten** (timezone correction, §12): constant −7h broker→NY rule, evidence table, enforcement. Glossary handle corrected to 10 ticks + display-only note; code fence fixed. The Session 6 "unexplained local modification" flag is resolved — it was the wholesale add in `8ed0833` plus a markdown error. |
 | `docs/03-APP-FLOW.md` | Updated in `0b5efb5` — §2.4 step 3 rewritten to the raw price-distance partial trigger (stale handle math removed). Rest unchanged since initial delivery. |
 | `docs/04-DESIGN-BRIEF.md` | Current, unchanged since initial delivery. |
 | `docs/05-DATABASE-SCHEMA.md` | Updated in `0b5efb5` — `handle_size_in_ticks` column removed from `instruments`; four new controlled-vocabulary reasons added (`market_closed_no_data`, `ambiguous_same_bar_insufficient_granularity`, `missing_market_data`, `outside_data_range`) plus three reserved ones; new §8.1 (evaluation-order rules: same-bar M1 trigger, pessimistic intrabar ordering, fill assumption, R-multiple formula). **The DDL in `supabase/migrations/` must therefore NOT create `handle_size_in_ticks`.** |
@@ -60,7 +60,7 @@ All located in `docs/` unless noted. All 8 exist, are committed, and pushed.
 
 - **Instrument (NAS100):** Digits 1, Contract size 1, Tick size 0.1, Tick value $0.1/tick/lot, Volume min/max/step 0.1/1000/0.1, Margin ~0.5% notional. API symbol string: `"NAS100"`.
 - **Broker timezone:** Forex.com/GAIN Capital runs **"NY+7"** — broker server time is always exactly 7 hours ahead of New York LOCAL time, following **US DST transition dates**. This part is confirmed and still holds.
-  - ⚠️ **AMENDED in Phase 1 — see §12.** The second half of the original statement ("MT5 raw epoch is true UTC; NY+7 is display-only") is **not true of the actual export**: the epoch carries broker time, so NY+7 is load-bearing on input and the conversion is `utc_label(epoch) − 7h`. The strategy still never reasons about broker time as a *concept* — it reasons about New York wall clock, which is what the adapter produces — but the offset is now part of the input path, not a debug extra. Awaiting Senior Dev sign-off before TRD §4.1.1 is edited.
+  - ✅ **CORRECTED in Phase 1 (settled, see §12).** The original second half ("MT5 raw epoch is true UTC; NY+7 is display-only") was wrong. The epoch carries **broker time**, so NY+7 is load-bearing on input and the conversion is a **constant −7h subtraction** (`utc_label(epoch) − 7h`) — no zoneinfo, no DST lookup in that step. TRD §4.1.1 and `verify_broker_timezone.py` were rewritten to match. Strategy logic still never reasons about broker time as a concept: it reasons in New York wall clock, which is what the subtraction produces.
 - **Position size:** 10 contracts = MT5 `volume` field `10.0`.
 - **Partial-exit trigger:** Raw price-distance percentage — `entry + 0.80 × (TP − entry)` (long) / `entry − 0.80 × (entry − TP)` (short). Unit-invariant. "Handle" (= 1.0 NAS100 point = 10 ticks, derived as `1 / tick_size`) is display-only, never a calculation input.
 - **Sweep/reversal rule:** Sequence-agnostic. Only the final sweep+reversal state before window close matters.
@@ -158,10 +158,10 @@ part that makes the numbers trustworthy — do the same on any re-run):
    `spot_check.csv`, and verify ≥20 windows against the raw candles using the
    recipe printed in the report. This is the Phase 1 exit criterion and cannot
    be delegated to the Agent.
-2. 🔴 **Handler → Senior Dev — rule on §12 (the timestamp convention).** The code
-   already implements the data-proven reading and refuses to run otherwise, but
-   `docs/02-TRD.md` §4.1.1 still states the opposite. The TRD needs correcting
-   and `verify_broker_timezone.py` needs re-running. Proposed text is in §12.
+2. ✅ **DONE — timestamp correction applied** (Senior Dev instructed): TRD §4.1.1
+   rewritten, `verify_broker_timezone.py` replaced with the constant-offset logic
+   plus an offline `--csv` mode, tests added. Re-run the verifier after every US
+   DST transition date as a standing check.
 3. 🔴 **Handler → Senior Dev — confirm Q11 and Q12** (see §11.7). Both were
    implemented to the literal spec + the Agent's recommendation because the
    Handler instructed "no further blockers"; each is a one-line change if the
@@ -217,7 +217,13 @@ part that makes the numbers trustworthy — do the same on any re-run):
   verify with `git rev-parse HEAD` after pushing rather than trusting a
   successful push of a branch that may not contain the work.** Final hashes for
   this session are listed in §14.
-- **Not done, deliberately:** no dashboard, no Supabase, no MT5 client, no order code — all later phases. TRD §4.1.1 and `verify_broker_timezone.py` left untouched pending sign-off (§12.4).
+- **Not done, deliberately:** no dashboard, no Supabase, no MT5 client, no order code — all later phases.
+
+**Session 10 (backup + timezone correction — this session):** Handler ordered an immediate push, then the TRD/timezone correction, then a status report.
+- **Push:** the sandbox had re-cloned the repo (reflog `clone:` at 18:34), so the first push carried **no work** — the branch was identical to its base. Detected by comparing `git rev-parse HEAD` to the remote tip. Re-committed everything (`0b5efb5` docs, `4227f64` code+data+report, `1db1964` handover) and pushed; remote tip now equals local HEAD, verified.
+- **`main` conflict check:** **no conflict.** `origin/main` (`5e0f35c`) has `docs/02-TRD.md` byte-identical to the base (`f6168daa`); the Handler's pasted §4.1.1 never reached GitHub. `data/nas100_m1_history.csv` is also byte-identical (`98ca2fe4`) on both, so the merge will be clean.
+- **Correction applied:** TRD §4.1.1 replaced with the constant −7h rule + evidence + enforcement; `verify_broker_timezone.py` rewritten (arithmetic-only conversion, offline `--csv` mode, exit-code gate); `config.py` / `m1_csv_source.py` docstrings repointed at the corrected section; report §1 status changed from "awaiting sign-off" to "RESOLVED"; 8 new tests (`test_verify_broker_timezone.py`) → **104 tests, all passing**. Verifier run against the real export: all four invariants PASS, exit 0; the old reading fails 3 of 4.
+- **Not done, deliberately:** no dashboard, no Supabase, no MT5 client, no order code — all later phases.
 
 ---
 
@@ -324,9 +330,9 @@ reading of the existing documents**, with the alternative kept one line away:
 
 ---
 
-## 12. Phase 1 — Data Timezone Finding (CRITICAL — NEEDS SENIOR DEV SIGN-OFF)
+## 12. Phase 1 — Data Timezone Finding (RESOLVED — CORRECTION APPLIED)
 
-**Read this before trusting either the backtest or `docs/02-TRD.md` §4.1.1.**
+**STATUS: RESOLVED.** Escalated, then corrected on Senior Dev instruction. `docs/02-TRD.md` §4.1.1 has been rewritten and `bot/historical_validation/verify_broker_timezone.py` replaced. Both now state the constant-offset rule, and the verifier reproduces the invariant checks offline. Nothing in this section is an open question any more — it is kept because it explains *why* the code and docs look the way they do, and because the next person will otherwise "helpfully" reintroduce a DST lookup.
 
 ### 12.1 The finding
 
@@ -371,26 +377,29 @@ describe a real NAS100 session.
 - `bot/src/config.py` documents `BROKER_OFFSET_HOURS = 7` as **load-bearing on
   input**, superseding the "debug-only" framing in the old verify script.
 
-### 12.4 What was deliberately NOT done
+### 12.4 What was applied (Senior Dev instruction, this session)
 
-`docs/02-TRD.md` §4.1.1 and `bot/historical_validation/verify_broker_timezone.py`
-were **not edited** — that is a Senior Dev decision, and the TRD's finding is
-marked "do not re-litigate". Proposed replacement for §4.1.1 §"Practical
-implication":
+`docs/02-TRD.md` §4.1.1 was **replaced** with the corrected rule and
+`bot/historical_validation/verify_broker_timezone.py` was **rewritten**:
 
-> MT5's `copy_rates_*` returns the bar's `time` field in **broker server time
-> encoded as Unix epoch**, so the broker convention is load-bearing on the input
-> side, not display-only. Forex.com/GAIN run NY+7 (server = New York local + 7h,
-> following US DST dates), so the New York wall clock is obtained by
-> `utc_label(epoch) − 7h`, a constant offset that holds year-round precisely
-> because the broker and New York change clocks on the same dates. Verify any
-> export against session invariants — daily break 17:00–18:00 NY, Friday close
-> 16:59 NY, Sunday open 18:00 NY, no Saturday bars — before trusting it.
+- Broker → New York is a **constant −7h subtraction** on the raw epoch label.
+  No `zoneinfo`, no `pytz`, no DST lookup in that step — the DST shift is already
+  inside the raw value, and a second DST-aware conversion would double-count it.
+- The section now documents the EDT/EST arithmetic explicitly (broker UTC+3 →−7h→
+  UTC−4; broker UTC+2 →−7h→ UTC−5), the five pieces of evidence, and the rule
+  that `zoneinfo` is used only for reporting/regime tagging and the
+  non-existent-local-time guard (`time_windows.localize()`), never for the
+  broker→NY conversion.
+- The verifier gained an **offline `--csv` mode** so the same invariant gate runs
+  without Windows or MT5 (`python3 verify_broker_timezone.py --csv ../data/nas100_m1_history.csv`),
+  plus unit tests (`bot/tests/test_verify_broker_timezone.py`) covering the
+  constant-offset property in both DST regimes and proving that the old UTC
+  reading fails the gate.
+- `bot/src/config.py` and `bot/src/m1_csv_source.py` docstrings were updated to
+  point at the corrected §4.1.1 instead of describing it as wrong.
 
-Also worth re-running: `verify_broker_timezone.py`'s own cross-check assumes the
-opposite convention (it prints `as_ny` then adds 7h for the "broker display"),
-so under this data its two columns cannot both match the MT5 chart. The earlier
-"confirmed" result should be re-derived, not carried forward.
+The earlier "confirmed" result from `verify_broker_timezone.py` has therefore
+been **re-derived**, not carried forward.
 
 ---
 
