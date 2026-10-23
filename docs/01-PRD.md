@@ -151,24 +151,36 @@ is explicitly ignored (neither confirms nor invalidates).
 - Short entry price reference: `High_A - 1 tick`
 - Long entry price reference: `Low_A + 1 tick`
 
-### 6.7 Stop Loss & Take Profit
-Calculated from Candle A's range, fixed at order submission, **never
-adjusted** except the single partial-exit rule in 6.8:
+### 6.7 Stop Loss & Take Profit (Fib-Based, off Candle A Range)
 
-- **Short:** `SL = High_A + 0.5 × range` | `TP = Mid_A - 1 tick`
-- **Long:** `SL = Low_A - 0.5 × range` | `TP = Mid_A + 1 tick`
+- **Short:** SL = High_A + (0.5 × Range); TP = Mid_A − 1 tick
+- **Long:** SL = Low_A − (0.5 × Range); TP = Mid_A + 1 tick
+- SL/TP are never adjusted after entry, except per the partial-exit rule in 6.8.
+- All values are raw, exact prices computed from Candle A's High_A, Low_A, Mid_A, and Range. No unit conversion of any kind occurs in this calculation.
 
-### 6.8 Position Sizing & Partial Exit Management
-- Total position size: 10 contracts per valid trade
-- Calculate total entry→TP distance in advance, expressed in "handles"
-  (1 handle = 4 ticks)
-- When price has moved 80% of the entry→TP distance favorably:
-  - Close 9 of 10 contracts (lock in partial profit)
-  - Move SL on remaining 1 contract to breakeven (entry price)
-- Remaining 1 contract then either stops at breakeven (scratch on that
-  contract only — trade is still net profitable from the 9-contract
-  partial) or continues on to the original TP
-- No other adjustments to SL/TP at any point in the trade lifecycle
+### 6.8 Position Sizing & Partial Exit
+
+- **Position:** 10 contracts total (MT5 `volume` field = `10.0`, confirmed against this account's 0.1 lot step).
+
+- **Partial-exit trigger (raw price distance — no handle/tick conversion in the trigger logic):**
+Long: trigger_price = entry + 0.80 × (take_profit − entry)
+Short: trigger_price = entry − 0.80 × (entry − take_profit)
+
+text
+
+
+When price reaches `trigger_price` favorably (before TP, before SL): close 9 of the 10 contracts, move SL on the remaining 1 contract to breakeven (entry price). No other position adjustments occur. This is the only exception to "SL/TP never adjusted" in 6.7.
+
+- **"Handle" is a display/reporting unit only, never a calculation input.** For NAS100, confirmed empirically and from instrument spec:
+1 handle = 1.0 NAS100 price point = 10 ticks (tick_size = 0.1)
+handle_size = 1.0 / instrument.tick_size
+
+text
+
+
+This is derived at runtime from the `instruments` table's `tick_size` field — never hardcoded as a fixed tick count — so the dashboard/logs can report "moved X handles" in human-readable form without that number ever feeding back into the trigger calculation above.
+
+- **Historical note (do not reintroduce):** an earlier draft of this section referenced "1 handle = 4 ticks" as part of the trigger calculation itself. That value was never derived from the confirmed instrument spec (tick_size 0.1 → 10 ticks/handle) and was never used to place a real trade. It has been fully superseded by the raw-price-distance formula above, which removes "handle" from the calculation path entirely.
 
 ### 6.9 Edge Cases (must produce explicit tagged outcomes, never silent skips)
 1. No sweep by window close → `NO_SETUP`, reason: `"no sweep"`
