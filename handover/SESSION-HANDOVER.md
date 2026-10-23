@@ -43,11 +43,11 @@ All located in `docs/` unless noted. All 8 exist, are committed, and pushed.
 | File | Status |
 |---|---|
 | `docs/01-PRD.md` | Current. Section 6.7/6.8 rewritten (partial-exit unit-bug fix). |
-| `docs/02-TRD.md` | Current. §4.1.1 NY+7 finding unchanged. In `66f0b09`: glossary handle definition corrected to 10 ticks + display-only note, and the unterminated code fence at §4.1.1 closed (renders correctly now). The Session 6 "unexplained local modification" flag is resolved — it was the wholesale add in `8ed0833` plus a markdown error. |
-| `docs/03-APP-FLOW.md` | Updated in `66f0b09` — §2.4 step 3 rewritten to the raw price-distance partial trigger (stale handle math removed). Rest unchanged since initial delivery. |
+| `docs/02-TRD.md` | Current. §4.1.1 NY+7 finding unchanged. In `0b5efb5`: glossary handle definition corrected to 10 ticks + display-only note, and the unterminated code fence at §4.1.1 closed (renders correctly now). The Session 6 "unexplained local modification" flag is resolved — it was the wholesale add in `8ed0833` plus a markdown error. |
+| `docs/03-APP-FLOW.md` | Updated in `0b5efb5` — §2.4 step 3 rewritten to the raw price-distance partial trigger (stale handle math removed). Rest unchanged since initial delivery. |
 | `docs/04-DESIGN-BRIEF.md` | Current, unchanged since initial delivery. |
-| `docs/05-DATABASE-SCHEMA.md` | Updated in `66f0b09` — `handle_size_in_ticks` column removed from `instruments`; four new controlled-vocabulary reasons added (`market_closed_no_data`, `ambiguous_same_bar_insufficient_granularity`, `missing_market_data`, `outside_data_range`) plus three reserved ones; new §8.1 (evaluation-order rules: same-bar M1 trigger, pessimistic intrabar ordering, fill assumption, R-multiple formula). **The DDL in `supabase/migrations/` must therefore NOT create `handle_size_in_ticks`.** |
-| `docs/06-IMPLEMENTATION-PLAN.md` | §6 corrected in `66f0b09` (stale handover path). **Step 1 folder structure still not executed** — see §8. |
+| `docs/05-DATABASE-SCHEMA.md` | Updated in `0b5efb5` — `handle_size_in_ticks` column removed from `instruments`; four new controlled-vocabulary reasons added (`market_closed_no_data`, `ambiguous_same_bar_insufficient_granularity`, `missing_market_data`, `outside_data_range`) plus three reserved ones; new §8.1 (evaluation-order rules: same-bar M1 trigger, pessimistic intrabar ordering, fill assumption, R-multiple formula). **The DDL in `supabase/migrations/` must therefore NOT create `handle_size_in_ticks`.** |
+| `docs/06-IMPLEMENTATION-PLAN.md` | §6 corrected in `0b5efb5` (stale handover path). **Step 1 folder structure still not executed** — see §8. |
 | `docs/07-PHASE-PLAN.md` | Current. Appendix A updated this session — Phase 0 marked formally closed, historical data source decision recorded. |
 | `handover/SESSION-HANDOVER.md` | This file. Fully rewritten this session. |
 | `introductory/agent-intro-prompt.txt` | Current, unchanged since rename. |
@@ -197,18 +197,26 @@ part that makes the numbers trustworthy — do the same on any re-run):
 - Recommended path recorded in §9. Agent is idle pending Senior Dev answers.
 
 **Session 8 (doc-consistency pass + decision binding):** Senior Dev confirmed D1–D4 as real and prescribed exact fixes; answered 10 of 12 questions (Q1–Q10), leaving **Q11 and Q12 open**.
-- **Commit `66f0b09`:** D1 (old handover path rewritten to `handover/SESSION-HANDOVER.md` in 4 files; repo-wide grep for the old literal now clean), D2 (TRD glossary → 10 ticks + display-only note; APP-FLOW §2.4 step 3 → raw price-distance trigger; `handle_size_in_ticks` **dropped** from `instruments`), D3 (code fence in TRD §4.1.1 closed, fence count now even), plus the new controlled-vocabulary reasons (`market_closed_no_data`, `ambiguous_same_bar_insufficient_granularity`) and new schema **§8.1** evaluation-order rules.
-- **Follow-up commit on top of `66f0b09`** (this file): D4 wording corrected in §7/§8, §11 restructured into resolved-defects + binding-answers (§11.6), §3 doc-status rows, §9 next steps rewritten, this log.
+- **Commit `0b5efb5`:** D1 (old handover path rewritten to `handover/SESSION-HANDOVER.md` in 4 files; repo-wide grep for the old literal now clean), D2 (TRD glossary → 10 ticks + display-only note; APP-FLOW §2.4 step 3 → raw price-distance trigger; `handle_size_in_ticks` **dropped** from `instruments`), D3 (code fence in TRD §4.1.1 closed, fence count now even), plus the new controlled-vocabulary reasons (`market_closed_no_data`, `ambiguous_same_bar_insufficient_granularity`) and new schema **§8.1** evaluation-order rules.
+- **Follow-up commit on top of `0b5efb5`** (this file): D4 wording corrected in §7/§8, §11 restructured into resolved-defects + binding-answers (§11.6), §3 doc-status rows, §9 next steps rewritten, this log.
 - **Still zero Phase 1 code.** Deliberate. Hard Rule 6 held: Q11/Q12 were flagged rather than guessed.
 - **Open implementation detail flagged to the Handler, not decided unilaterally:** a local SQLite mirror of `window_evaluations` cannot satisfy the `user_id` / `instrument_id` / `trade_id` foreign keys (no auth user, no Supabase, no trades table in Phase 1). Proposal: keep identical column names/types and leave those three columns nullable/unpopulated, documented in code. Awaiting confirmation alongside Q11/Q12.
 
 
 **Session 9 (Phase 1 implementation — this session):** Data arrived (`data/nas100_m1_history.csv`, 287,746 M1 bars, Jan 1 – Oct 22 2026). Phase 1 built end-to-end and verified.
 - **Found the timezone defect (§12) before writing any strategy code.** The export's epoch is broker time, not UTC. Proved with four session invariants plus an intraday volume profile plus the strategy's own skip set; `--convention utc` fails all four invariants on this file. Flagged for sign-off rather than silently patching the TRD.
-- **Built** 13 modules under `bot/src/`, the Phase 1 driver, and 96 unit tests (all passing). Runtime 11 s for 4,431 windows. Standard library only. Code + outputs committed as `2dc3ae1`.
+- **Built** 13 modules under `bot/src/`, the Phase 1 driver, and 96 unit tests (all passing). Runtime 11 s for 4,431 windows. Standard library only. Code + outputs committed as `4227f64`.
 - **Evaluated** 211 trading dates × 21 windows = 4,431 rows, exactly one per window, zero duplicates. 2,631 trades, 65.3% win rate, +575.1R net (zero-cost fills — a logic gate, not a P&L forecast).
 - **Fixed two classification bugs found by inspecting real data:** the last export day was being labelled `market_closed_no_data` when the file simply ends (now `outside_data_range`), and US-holiday Mondays (13:00→18:00 closure) were being labelled feed holes (now `market_closed_no_data` via the 60-minute structural-gap rule, added to schema §8.1).
 - **Cross-verified independently:** a second, separately written implementation reproduced every derived field across 3,959 complete windows and re-simulated all 2,631 trades with zero disagreements; all 342 ambiguity windows individually confirmed as genuine Q5 cases with no discarded valid triggers.
+- **⚠️ Workspace reset incident (twice):** the sandbox re-cloned the repository
+  mid-session (reflog shows `clone: from ...` at 18:34), which discards the local
+  object database while keeping working-tree files. All work survived as
+  uncommitted files, but commit hashes from earlier in the session became
+  invalid. **Lesson for the next session: commit and push early and often, and
+  verify with `git rev-parse HEAD` after pushing rather than trusting a
+  successful push of a branch that may not contain the work.** Final hashes for
+  this session are listed in §14.
 - **Not done, deliberately:** no dashboard, no Supabase, no MT5 client, no order code — all later phases. TRD §4.1.1 and `verify_broker_timezone.py` left untouched pending sign-off (§12.4).
 
 ---
@@ -227,7 +235,7 @@ This section is kept as the record of *why* the code looks the way it does. It w
 
 ### 11.1 Documentation defects — ALL FOUR RESOLVED
 
-Senior Dev confirmed D1–D4 as real and prescribed exact fixes. All applied in commit `66f0b09` (`docs: fix D1-D4 doc defects and bind Phase 1 decisions`). See §10, Session 8. Table retained as the record of what was wrong and what was changed.
+Senior Dev confirmed D1–D4 as real and prescribed exact fixes. All applied in commit `0b5efb5` (`docs: fix D1-D4 doc defects and bind Phase 1 decisions`). See §10, Session 8. Table retained as the record of what was wrong and what was changed.
 
 | # | Defect | Location | Resolution |
 |---|---|---|---|
