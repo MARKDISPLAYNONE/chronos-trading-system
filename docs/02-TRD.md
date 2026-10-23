@@ -98,6 +98,40 @@ configuration — it is a hard OS dependency.
   migration happens only AFTER core logic is validated locally (see
   `07-PHASE-PLAN.md`) — do not attempt this prematurely.
 
+### 4.1.1 Timezone Handling (Critical — Amendment, Session 2)
+
+MT5's `copy_rates_*` functions return timestamps in **broker server time**,
+NOT UTC, despite official documentation claiming otherwise (confirmed via
+direct consultation with an MQL5/MT5 specialist developer, cross-referenced
+against community-reported discrepancies). This must be handled as follows:
+
+1. **Never hardcode a fixed hour offset** between broker time and NY time.
+   Both zones may independently observe DST, on different calendar dates,
+   which breaks any fixed-offset assumption at least twice a year.
+2. **Empirically determine the broker's actual timezone** (not assumed from
+   the Handler's own geographic location) using a one-time diagnostic
+   script (see `bot/historical_validation/verify_broker_timezone.py`,
+   to be created in Implementation Step 3) that compares a known bar's raw
+   epoch timestamp against real-world UTC and NY time.
+3. Represent the broker's timezone as a proper DST-aware zone object
+   (e.g., `zoneinfo.ZoneInfo("Europe/Athens")` if confirmed as EET), not a
+   fixed offset like `UTC+2` or `UTC+3`.
+4. Represent NY time as `zoneinfo.ZoneInfo("America/New_York")` — DST
+   handled automatically.
+5. All window-boundary logic (`time_windows.py`) operates in NY time only.
+   Broker timestamps are converted to NY time at the point of ingestion,
+   never the reverse.
+6. A verification test must be run and documented BEFORE Phase 1 exit,
+   confirming correct conversion across a known session boundary (e.g.,
+   confirming a 16:00 NY bar maps to the correct UTC equivalent for the
+   current DST state, per the dev's Step 4 methodology).
+
+**Library choice:** Python's built-in `zoneinfo` (3.9+, no extra
+dependency) is preferred over `pytz` for new code, functionally
+equivalent for this purpose — use whichever the Agent finds better
+documented/supported at implementation time, consistency within the
+codebase matters more than which specific library.
+
 ### 4.2 Database & Backend
 | Component | Choice | Why |
 |---|---|---|
