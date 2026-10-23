@@ -29,7 +29,7 @@ Terms used throughout all project docs, defined once here for consistency:
 | **Sweep** | Price trading beyond Candle A's high or low by at least 1 tick |
 | **Reversal** | Price trading back through that same level in the opposite direction by at least 1 tick — this is the entry trigger |
 | **Tick** | The smallest price increment the instrument can move (defined by the broker/instrument spec) |
-| **Handle** | A custom unit used in this strategy: 1 handle = 4 ticks |
+| **Handle** | A custom display unit used in this strategy: 1 handle = 10 ticks (confirmed against `tick_size` 0.1). Handle is a display-only unit, never used in trigger calculations — see PRD §6.8. |
 | **R-multiple** | Trade result expressed as a multiple of the amount risked (e.g., trade risked $100, made $200 → R-multiple = 2R) |
 | **NO_SETUP** | A logged outcome meaning the window was evaluated but no valid trade occurred, with a specific reason attached |
 | **Handler** | The human project owner/intermediary — relays instructions between Senior Dev and Agent |
@@ -131,6 +131,7 @@ from zoneinfo import ZoneInfo
 # transition (US or EU) — this is the ONLY conversion strategy logic uses:
 utc = datetime.fromtimestamp(raw_epoch, tz=ZoneInfo("UTC"))
 ny_time = utc.astimezone(ZoneInfo("America/New_York"))
+```
 
 ### 4.2 Database & Backend
 | Component | Choice | Why |

@@ -144,9 +144,13 @@ Low_A + 1 tick for long)
 [2] Calculate SL and TP per PRD 6.7 (based on Candle A's range)
 │
 ▼
-[3] Calculate total entry→TP distance in handles (1 handle = 4 ticks),
-and the specific price level representing 80% of that distance
-(this is the partial-exit trigger level, calculated in advance)
+[3] Calculate the partial-exit trigger price as a RAW PRICE DISTANCE
+(no unit conversion of any kind — see PRD §6.8):
+      long:  trigger = entry + 0.80 × (TP − entry)
+      short: trigger = entry − 0.80 × (entry − TP)
+    (Handle is a display-only unit: 1 handle = 10 ticks for NAS100,
+     derived at runtime as 1 / tick_size. It is never used in trigger
+     calculations — see PRD §6.8.)
 │
 ▼
 [4] Submit market order for 10 contracts, with SL and TP attached
