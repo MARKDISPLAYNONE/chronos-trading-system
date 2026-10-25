@@ -29,7 +29,7 @@ Terms used throughout all project docs, defined once here for consistency:
 | **Sweep** | Price trading beyond Candle A's high or low by at least 1 tick |
 | **Reversal** | Price trading back through that same level in the opposite direction by at least 1 tick — this is the entry trigger |
 | **Tick** | The smallest price increment the instrument can move (defined by the broker/instrument spec) |
-| **Handle** | A custom unit used in this strategy: 1 handle = 4 ticks |
+| **Handle** | A custom display unit used in this strategy: 1 handle = 10 ticks (confirmed against `tick_size` 0.1). Handle is a display-only unit, never used in trigger calculations — see PRD §6.8. |
 | **R-multiple** | Trade result expressed as a multiple of the amount risked (e.g., trade risked $100, made $200 → R-multiple = 2R) |
 | **NO_SETUP** | A logged outcome meaning the window was evaluated but no valid trade occurred, with a specific reason attached |
 | **Handler** | The human project owner/intermediary — relays instructions between Senior Dev and Agent |
@@ -98,39 +98,174 @@ configuration — it is a hard OS dependency.
   migration happens only AFTER core logic is validated locally (see
   `07-PHASE-PLAN.md`) — do not attempt this prematurely.
 
-### 4.1.1 Timezone Handling (Critical — Confirmed, Session 3)
+### 4.1.1 Timezone Handling (Critical — Corrected in Phase 1)
 
-MT5's `copy_rates_*` functions return raw Unix epoch timestamps
-(timezone-agnostic by nature). The MT5 **terminal display** shows these
-interpreted in the broker's server time, which is NOT UTC and NOT the
-Handler's local time — this was empirically confirmed and then precisely
-identified as follows:
+**Status:** this section was rewritten during Phase 1 after the historical
+export proved the original wording wrong. The original text claimed that MT5's
+raw epoch is "timezone-agnostic" (true UTC) and that the broker's NY+7 clock was
+a display convenience only. **That is not what MT5 actually returns.** The
+correction below is empirically verified against 287,746 M1 bars and is now the
+authoritative rule. Anyone implementing against the old wording will evaluate
+every strategy window 2–3 hours away from where the strategy says.
 
-**Confirmed finding:** Forex.com (GAIN Capital) runs demo/live servers on
-a convention known as **"NY+7"** — the broker server clock is always
-exactly 7 hours ahead of New York LOCAL time, and critically, it follows
-**US DST transition dates** (2nd Sunday of March → 1st Sunday of
-November), NOT EU DST dates. This means:
-- During US DST (EDT, UTC−4): broker server = UTC+3
-- During US standard time (EST, UTC−5): broker server = UTC+2
-- The broker's offset SHIFTS on US DST change dates, which do NOT align
-  with EU DST change dates — this was the original risk this section
-  flagged, now fully resolved with a confirmed, named convention rather
-  than an assumption
+#### What `copy_rates_*` actually returns
 
-**Practical implication for code — this is actually simpler than
-initially anticipated:** Since broker timestamps are raw epoch (UTC-
-equivalent) values, the conversion pipeline never needs to know or care
-about the broker's display convention at all for strategy logic:
+The `time` field of every MT5 bar is **broker server time, encoded as if it
+were Unix epoch UTC**. In other words the number, decoded as UTC, yields the
+broker's wall clock — not the true UTC instant.
 
-```python
-from datetime import datetime
-from zoneinfo import ZoneInfo
+Forex.com / GAIN Capital run what the trading community calls **"NY+7"**: the
+broker server clock is always exactly **7 hours ahead of New York local time**,
+and it follows **US DST transition dates** (2nd Sunday of March → 1st Sunday of
+November), not EU dates. Because the broker and New York change clocks on the
+same dates, the offset between them is a **constant 7 hours all year round** —
+which is precisely what makes the correction simple:
 
-# This is correct, year-round, with ZERO changes needed across any DST
-# transition (US or EU) — this is the ONLY conversion strategy logic uses:
-utc = datetime.fromtimestamp(raw_epoch, tz=ZoneInfo("UTC"))
-ny_time = utc.astimezone(ZoneInfo("America/New_York"))
+```
+New York wall clock  =  datetime.fromtimestamp(epoch, UTC).replace(tzinfo=None) - timedelta(hours=7)
+```
+
+That subtraction is the **entire** conversion. No `zoneinfo`, no `pytz`, no DST
+lookup, and no broker-offset branch is required for this step — the DST shift is
+already baked into the raw value, and subtracting a constant 7 hours cancels it
+identically in both regimes:
+
+| Period | Broker clock | − 7h | New York |
+|---|---|---|---|
+| US daylight time (EDT, UTC−4) | UTC+3 | − 7h | **UTC−4** ✓ |
+| US standard time (EST, UTC−5) | UTC+2 | − 7h | **UTC−5** ✓ |
+
+Adding a DST-aware conversion **on top of** the subtraction would double-count
+the shift and silently move every bar by an hour for half the year.
+
+#### Why the original NY+7 finding still stands
+
+The NY+7 *convention* was confirmed correctly in Session 3 and is unchanged. What
+was wrong was the conclusion drawn from it: that the epoch could be treated as
+true UTC and the broker offset ignored. The offset is **load-bearing on the input
+side**, not decorative. Strategy code still never reasons about "broker time" as
+a concept — it reasons about New York wall clock, which is what the subtraction
+produces.
+
+#### How the correction was proven, and how it is enforced
+
+Under the old (UTC) reading, every session boundary drifts when DST changes.
+Under the corrected reading they are fixed local times, in both regimes:
+
+| Signal | Old reading (epoch = UTC) | Corrected reading (epoch = broker, −7h) |
+|---|---|---|
+| Daily maintenance break | 19:00–20:00 NY in summer, 18:00–19:00 in winter — moves at DST | **17:00–18:00 NY every day, all year** |
+| Friday close | drifts 19:59 → 18:59 NY across the DST date | **16:59 NY** in both EST and EDT |
+| Sunday open | drifts 21:00 → 20:00 NY | **18:00 NY** |
+| Intraday volume peak (July) | raw 13:30–20:00, where 13:00–14:00 is the *quietest* hour in the file | raw 16:30–23:00 — exactly the US cash session |
+| The 3 intentionally skipped windows (15:45–18:15) | break would sit at 19:00–20:00; skip set unexplained | break sits **inside** the skip set |
+
+An exchange does not move its session when a timezone changes; only a timestamp
+convention does. So the data cannot be read the old way and still describe a real
+NAS100 session.
+
+**This is now a hard runtime gate, not a convention to trust.**
+`bot/src/m1_csv_source.py` scores any input file against those session
+invariants (`no_saturday_bars`, `daily_break_1700_1800_ny`,
+`friday_close_1659_ny`, `sunday_open_1800_ny`) and **refuses to run** if they
+fail, so a wrong reading cannot silently produce a plausible-looking backtest.
+`bot/historical_validation/verify_broker_timezone.py` reproduces the same
+verification on demand, against a live terminal or an exported CSV.
+
+#### Rules that follow from this (binding on every phase)
+
+1. **Broker → New York is a constant −7h subtraction** on the raw epoch label.
+   Never add a DST-aware conversion after it.
+2. **Strategy logic may only reason in New York wall clock**, never in broker
+   time as a concept. The window definitions in PRD §6.1 are New York times.
+3. **`zoneinfo` is still used elsewhere** — for tagging whether a timestamp falls
+   in EST or EDT for reporting, and for detecting non-existent local times around
+   the spring-forward gap (`time_windows.localize()`). It is never used to
+   convert broker epochs into New York time.
+4. **Any new data source must pass the same invariant gate before use.** A feed
+   that stores true UTC would need an explicit, different adapter — never a
+   silent reinterpretation of the existing one.
+
+### 4.1.2 Price Quantization — Tick Grid (Added in Phase 1)
+
+#### The gap this closes
+
+PRD §6.7 and §6.8 define SL, TP and the partial trigger with exact arithmetic
+(`High_A + 0.5·Range`, `Mid_A − 1 tick`, `entry ± 0.80 × distance`). A NAS100
+order price can only be submitted on a multiple of `tick_size` = 0.1. The
+original spec never said what to do with a calculated price that lands between
+two grid lines. On real data this is the normal case, not the exception:
+
+| Field | Trades landing off the 0.1 grid (2,631 plans) |
+|---|---|
+| `SL` | 1,297 (49.3%) |
+| `TP` | 1,297 (49.3%) |
+| `partial_trigger` | 1,980 (75.3%) |
+
+Leaving them unquantized produces prices no broker could have filled, and
+quantizing in an arbitrary (round-half-up) direction would silently flatter the
+results. This was an **undocumented gap in the original specification, not an
+error introduced by the engine.**
+
+#### Rule (binding)
+
+1. **All price arithmetic is `decimal.Decimal`.** Every price entering the engine
+   is coerced with `Decimal(str(value))`; no binary float touches a comparison,
+   a stop distance or an R-multiple. `float` appears only in output formatting.
+2. **Exact values stay exact.** `Range = High_A − Low_A` and
+   `Mid_A = (High_A + Low_A) / 2` are **never** quantized (unchanged from Q6).
+   The entry trigger (`High_A − 1 tick` / `Low_A + 1 tick`) is already on the grid
+   by construction.
+3. **Order prices are quantized after calculation, pessimistically:**
+
+   | Field | SHORT | LONG |
+   |---|---|---|
+   | `SL` | `ROUND_FLOOR` | `ROUND_CEILING` |
+   | `TP` | `ROUND_FLOOR` | `ROUND_CEILING` |
+   | `partial_trigger` | `ROUND_FLOOR` | `ROUND_CEILING` |
+
+   One direction per trade — `floor` for a SHORT, `ceiling` for a LONG — so a
+   single plan never mixes directions. A value already on the grid is unchanged.
+4. **`R` is measured post-quantization:** `R = |entry − SL_quantized|`.
+   The partial trigger is clamped so it can never sit beyond the quantized TP; if
+   quantization would push it past the target, the target wins.
+
+#### Why floor-for-short / ceiling-for-long is the pessimistic side
+
+For a SHORT, entry is below the stop and above the target. Flooring moves the
+stop **down**, toward entry — a tighter stop — and moves the target **down**,
+further from entry. For a LONG the geometry mirrors: ceiling moves the stop **up**
+toward entry and the target **up** away from it. In both directions the trade
+gets less room and a more distant target, which can only cost fills, never grant
+them. The property is asserted directly in `bot/tests/test_quantization.py`
+(invariants over all 58 observed candle ranges, not just spot checks).
+
+#### Worked example (real rows from the Phase 1 run)
+
+| Direction | Entry | `SL` raw → quantized | `TP` raw → quantized |
+|---|---|---|---|
+| LONG | 25,425.7 | 25,420.75 → **25,420.8** | 25,430.55 → **25,430.6** |
+| SHORT | 25,408.6 | 25,418.55 → **25,418.5** | 25,398.75 → **25,398.7** |
+
+#### Consequences to keep in mind when reading results
+
+- A clean run to TP is now worth ≈1R instead of slightly less than 1R, because
+  the target is a tick further out while `R` is measured against a tighter stop.
+  774 clean-TP trades score 0.9677R–1.0000R, 370 of them exactly 1.0000R.
+- Quantization can flip a marginal outcome. Exactly **1 of 2,631** trades flipped
+  (WIN → LOSS, −1.983R): a LONG whose TP moved from 25,232.55 to 25,232.60; the
+  bar tagged 25,232.55 and rolled over into the stop. That is the rule working as
+  designed — it removes an assumed fill the market never offered.
+- The audit CSV keeps both values for every price
+  (`raw_stop_loss_price` / `stop_loss_price`, and the same for `TP` and the
+  partial), plus `prices_quantized` and `quantize_direction`, so any row can be
+  re-derived by hand.
+
+#### Where it lives
+
+`bot/src/pricing.py` (`quantize_to_tick`, `direction_for`, `is_on_tick_grid`),
+`bot/src/trade_calculator.py` (`plan_trade`, `TradePlan.raw_*`),
+`bot/src/outputs.py` (audit columns), `bot/tests/test_quantization.py`.
 
 ### 4.2 Database & Backend
 | Component | Choice | Why |

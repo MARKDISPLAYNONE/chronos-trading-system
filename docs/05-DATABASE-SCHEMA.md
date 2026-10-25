@@ -74,7 +74,6 @@ not hardcoded across bot code and dashboard code separately.
 | `symbol` | `text` | Not null, unique per user | Exact symbol name as it appears in MT5 (e.g., `"US100"`, `"NAS100"` — exact value confirmed during implementation per TRD Section 14 open items) |
 | `tick_size` | `numeric` | Not null | Smallest price increment for this instrument |
 | `point_value` | `numeric` | Not null | Monetary value of one point move, per contract |
-| `handle_size_in_ticks` | `integer` | Not null, default `4` | Confirms the strategy's "1 handle = 4 ticks" definition explicitly per instrument, in case this ever varies |
 | `is_active` | `boolean` | Not null, default `true` | Allows disabling an instrument without deleting historical data tied to it |
 | `created_at` | `timestamptz` | Not null, default `now()` | Record creation timestamp |
 | `updated_at` | `timestamptz` | Not null, default `now()` | Last modified timestamp (updated via trigger, see Section 6) |
@@ -83,6 +82,13 @@ not hardcoded across bot code and dashboard code separately.
 - This table will typically have very few rows (likely just 1, for the
   single instrument this system trades), but exists as a proper reference
   table rather than hardcoded constants, per good data design practice.
+- **There is deliberately no `handle_size_in_ticks` column.** "Handle" is a
+  display/reporting unit only and is DERIVED at runtime as
+  `1 / instruments.tick_size` (for NAS100: `tick_size` 0.1 → 10 ticks per
+  handle). It is never stored, never hardcoded, and never used as an input
+  to any trigger calculation — see PRD §6.8. An earlier draft of this table
+  carried a defaulted `handle_size_in_ticks = 4` column; that reconciled to
+  the disproven "1 handle = 4 ticks" assumption and has been removed.
 
 ---
 
@@ -224,6 +230,7 @@ CREATE POLICY "insert_own_records"
 CREATE POLICY "update_own_records"
   ON window_evaluations FOR UPDATE
   USING (auth.uid() = user_id);
+```
 
 -- No DELETE policy is created intentionally — see note below
 Important design decision: no DELETE policy on any table. This system
@@ -294,9 +301,74 @@ Reason string	Used when
 "target hit after partial"	Remaining 1 contract reached original TP after partial exit
 "order rejected by broker"	Used in system_events, paired with broker's specific message
 "bot unavailable during window"	Used when outcome = 'MISSING_EVALUATION'
+"ambiguous_same_bar_insufficient_granularity"	A single M1 bar straddled BOTH the sweep and reversal thresholds but that bar's close did not confirm the reversal side, so sweep-then-reversal ordering cannot be proven at 1-minute granularity. Logged as outcome 'NO_SETUP'. Never resolved optimistically (see Section 8.1).
+"market_closed_no_data"	The window fell outside the instrument's trading session, so no price bars exist for it (e.g. every Friday-evening window from 18:45 ET onward, and exchange holidays). Logged as outcome 'NO_SETUP'. This is an environmental fact, NOT a bot fault — it must never be logged as 'MISSING_EVALUATION'.
+"missing_market_data"	Bars are absent while the instrument's session was demonstrably still trading (a feed hole). Logged as outcome 'NO_SETUP'. A data-quality fact, never a strategy result, and never a MISSING_EVALUATION.
+"outside_data_range"	The input file ends before this window (export boundary). Logged as outcome 'NO_SETUP'. Only reachable in local/CSV Phase 1 runs — a live bot reading a continuous feed cannot hit it.
 If a genuinely new scenario arises during implementation that doesn't fit
 this list, add it to this table first (update this doc), then use it
 in code — don't invent ad hoc reason strings that aren't documented here.
+
+**Reserved (not currently emitted):**
+- `"nonexistent_local_time_dst"` — a window's local start time does not exist that
+  day (the US spring-forward gap, 02:00–02:59). Cannot occur under the Mon–Fri
+  rule because both US transitions fall on a Sunday, so it exists only as a
+  guard in `time_windows.localize()`; would be logged as `NO_SETUP` if it ever
+  fired.
+- `"data_ends_before_trade_closed"` — a position was still open when the data
+  file ended, so no exit could be observed. Logged as `MISSING_EVALUATION`,
+  never scored as WIN/LOSS. Zero occurrences in the Phase 1 dataset.
+- `"scheduled_maintenance_window"` — reserved for the three structurally-excluded
+  windows (15:45–18:15 ET) that bracket the broker's daily platform
+  maintenance/rollover break. Per PRD §6.1 those three are NOT among the 21
+  evaluated windows and produce NO `window_evaluations` row at all, so nothing
+  emits this string today. It is documented here only so a future code path
+  never invents its own wording.
+
+### 8.1 Phase 1 evaluation-order rules (binding on the backtest and all later live code)
+
+These rules exist because a single 1-minute bar can contain more than one
+event. They were fixed by Senior Dev decision during Phase 1 and must be
+implemented identically in `sweep_detector`, `trade_calculator` and the
+backtest — never re-derived locally:
+
+1. **Same-bar sweep + reversal (M1).** Sweep/reversal sequencing is evaluated
+   on M1 bars (Candle A/B OHLC structure is granularity-safe at M15).
+   A single bar may register a confirmed trigger only if its own open→close
+   direction is consistent with "swept, then reversed":
+   - PREMIUM/short: bar `high >= High_A + 1 tick` **and** bar `close <= High_A − 1 tick`
+   - DISCOUNT/long: bar `low <= Low_A − 1 tick` **and** bar `close >= Low_A + 1 tick`
+   If a bar's high/low straddle both thresholds but its close does not
+   confirm the reversal side, the outcome is `NO_SETUP` /
+   `"ambiguous_same_bar_insufficient_granularity"`. The bot never guesses in
+   its own favour.
+2. **Intrabar exit ordering (pessimistic).** Within any single bar: SL is
+   evaluated first for the whole open position; TP is evaluated only if SL
+   was not touched; the 80%-partial trigger is evaluated only if neither SL
+   nor TP was touched. In particular, if one bar contains both the 80%
+   trigger price and the SL, **the SL wins**.
+3. **Fill assumption (Phase 1 only).** Zero spread, zero slippage, zero
+   commission. The entry fills exactly at the PRD §6.6 reference price
+   (`High_A − 1 tick` / `Low_A + 1 tick`) and exits fill exactly at the
+   computed SL/TP/partial-trigger price. Phase 1 validates classification
+   correctness, not realistic P&L.
+4. **Market-closed vs data-hole (Phase 1 data classification).** A window whose
+   bars are missing is classified by the length of the gap containing the
+   missing minutes, measured between the bars bracketing it: a gap of **60
+   minutes or more** is a structural market closure (holiday break, half-day,
+   Friday evening, weekend) and logs `"market_closed_no_data"`; a shorter gap
+   logs `"missing_market_data"`. If the file itself ends before the window, the
+   reason is `"outside_data_range"`. Rationale: 60 minutes is the length of the
+   venue's daily maintenance break and therefore the shortest closure that
+   exists, while the longest genuine feed hole in the Phase 1 export is 45
+   minutes — both measured, not assumed.
+
+5. **R-multiple definition.** `R = |entry − SL|`. With a partial:
+   `partial_R = 0.9 × ((trigger − entry)/R)` (sign-mirrored for shorts) +
+   `runner_R = 0.1 × ((final_exit − entry)/R)`. Without a partial:
+   `total_R = (final_exit − entry)/R`. Reported alongside the outcome label.
+
+
 
 9. Indexes (Performance Considerations)
 Given expected data volume (21 windows/day × 5 days/week ≈ 105 rows/week

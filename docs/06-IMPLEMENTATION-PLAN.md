@@ -365,6 +365,8 @@ if config.ENVIRONMENT == "live":
     require_explicit_confirmation_flag()  # e.g., a second, separate env
                                             # var like CONFIRM_LIVE_TRADING=yes
                                             # that must ALSO be set
+```
+
 This is a deliberate double-check, not paranoia — an autonomous system
 placing real orders must have a structural barrier against accidentally
 running live due to a misconfigured .env file.
@@ -375,7 +377,7 @@ A step is considered DONE only when:
 Code is written and committed to a feature branch (not main)
 The verification criteria listed for that step have been met and
 confirmed (not assumed)
-docs/00-HANDOVER.md is updated reflecting the step's completion
+handover/SESSION-HANDOVER.md is updated reflecting the step's completion
 The Handler has reviewed the change in VS Code before it is merged
 7. Open Items / Unresolved Implementation Questions
 Exact MT5 historical data export process/format for Step 7's validation

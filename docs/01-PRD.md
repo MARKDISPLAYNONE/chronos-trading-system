@@ -158,6 +158,19 @@ is explicitly ignored (neither confirms nor invalidates).
 - SL/TP are never adjusted after entry, except per the partial-exit rule in 6.8.
 - All values are raw, exact prices computed from Candle A's High_A, Low_A, Mid_A, and Range. No unit conversion of any kind occurs in this calculation.
 
+- **Tick-grid quantization (post-calculation, added in Phase 1).** The formulas
+  above stay exact: `Range`, `Mid_A` and the entry trigger are computed on
+  `decimal.Decimal` values and are never rounded. But a live NAS100 price can only
+  sit on a multiple of `tick_size` (0.1), so **after** SL, TP and the §6.8 partial
+  trigger have been calculated, each is snapped to the grid in the direction that
+  is pessimistic for the trade — **SHORT → round down (floor), LONG → round up
+  (ceiling)**. The effect is that a stop is never further from entry and a target
+  is never nearer to entry than the exact number, for either direction. `R` is
+  then measured against the *quantized* stop, so the two effects cannot cancel.
+  This step was missing from the original specification — an undocumented gap in
+  the spec, not an engine error — and is now binding. Implementation and proof of
+  the pessimism property are in TRD §4.1.2.
+
 ### 6.8 Position Sizing & Partial Exit
 
 - **Position:** 10 contracts total (MT5 `volume` field = `10.0`, confirmed against this account's 0.1 lot step).
