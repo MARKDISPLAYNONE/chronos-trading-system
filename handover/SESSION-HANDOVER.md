@@ -12,9 +12,14 @@
 
 **Collaboration model:** Handler (human, relays everything) ↔ Senior Dev (AI chat, owns architecture/logic) ↔ Coding Agent (AI, executes only).
 
-**Current phase:** 🟢 **Phase 1 (Logic Validation) — IMPLEMENTATION COMPLETE, AWAITING HANDLER SIGN-OFF.**
+**Current phase:** 🟢 **Phase 2 (Live Dry-Run, no orders) — IN PROGRESS.** Phase 1 is **CLOSED and merged to `main` at `1f9deb8`,** with Handler sign-off recorded.
 
-Phase 1 code, tests and the validation report are committed. Every one of the 21 windows on all 211 trading dates in the dataset produced exactly one outcome row (4,431 rows, zero gaps, zero duplicates). Phase 1's exit gate is a **manual review**: the Handler must spot-check ≥20 windows from §11 of the report and confirm the logic is trustworthy before Phase 2 begins.
+Phase 2 runs the validated logic against a live MT5 feed on the Handler's own
+machine for at least 5 consecutive trading days (planned: Mon 26 Oct → Tue 3 Nov
+2026), logging every window and **placing no orders — structurally, not by
+convention**. The window deliberately spans the **US fall-back DST transition
+(Sun 1 Nov 2026, 02:00 NY)**, the one regime Phase 1's dataset could not cover
+(it ends 2026-10-22 and therefore only exercised spring-forward). See §15.
 
 ✅ **The Phase 1 timestamp finding is closed.** The historical CSV does not contain true UTC; the correction was instructed by the Senior Dev and applied to `docs/02-TRD.md` §4.1.1 and `verify_broker_timezone.py`. See **§12** for the reasoning (read it before changing any timestamp code).
 
@@ -149,43 +154,51 @@ part that makes the numbers trustworthy — do the same on any re-run):
 ## 8. What's NOT Done
 
 - **No live bot, no dashboard, no Supabase.** Phase 1 is historical replay only; `mt5_client`, `supabase_client`, `order_executor`, `trade_manager`, `main.py` and everything under `dashboard/` are later phases (Steps 8–16).
-- **Phase 1 is not signed off yet** — it needs the Handler's ≥20-window spot-check (report §11 / `spot_check.csv`).
-- **DST coverage gap:** the dataset ends 2026-10-22, so the **March 8 spring-forward** is exercised but the **November 1 fall-back** is not. Fall-back is reasoned about (both transitions fall on a Sunday, so Mon–Fri windows cannot enter the repeated hour) but not empirically tested. A dataset spanning Nov 1 is the remaining DST evidence.
+- **Phase 2 is not built yet.** No `mt5_live_source`, no runner, no live DST monitor. Phase 2 is scoped but blocked on the live probe output (§15.4).
+- **DST coverage gap (narrowed, see §15.2):** the dataset ends 2026-10-22, so the
+  **March 8 spring-forward** is exercised but the **November 1 fall-back** is not.
+  Phase 2's live monitor is now the instrument intended to close this, and it is
+  the reason the dry-run window extends through Mon 2 Nov.
 - **Currency P&L is absent by design** (Q9): `result_currency_amount` is NULL and `instruments.point_value` remains unconfirmed.
 - **Two Phase-1 modelling limits worth knowing:** no gap fills are modelled (3 trades were open across a session break, listed in report §10), and trades are simulated independently, so two positions may overlap — that is a reporting simplification, not a portfolio-risk claim.
 - **`bot/src/config.py` holds no secrets and reads no environment.** Phase 2 will need `bot/.env` for MT5/Supabase; the names are already in `bot/.env.example`.
-- **Implementation Plan Step 1 (folder structure) has NOT been executed.** This is the literal next build step after Phase 1 scaffolding settles — it is not something already done, and earlier wording in this file overclaimed it. Still missing: `README.md`, `bot/src/`, `bot/tests/`, `bot/requirements.txt`, `bot/.env.example`, `dashboard/`, `supabase/migrations/`, `.github/workflows/`. (`dashboard/`, `supabase/` and `.github/` are out of Phase 1 scope anyway — see §11.2 Q1/Q2.)
+- **Implementation Plan Step 1 (folder structure) is now PARTLY done**, corrected here rather than left overclaimed: `README.md`, `bot/src/`, `bot/tests/`, `bot/requirements.txt`, `bot/.env.example`, `bot/historical_validation/` and `data/` exist. Still missing: `dashboard/`, `supabase/migrations/`, `bot/src/live/` (Phase 2), `.github/workflows/`. (`dashboard/`, `supabase/` and `.github/` are later-phase or Handler-side — see §11.2 Q1/Q2.)
 - Supabase project creation + migrations (Implementation Plan Step 2) — **out of Phase 1 scope by decision; Handler-side task, not the Agent's** (§11.2 Q1/Q2). It must not block Phase 1.
-- Phase 1 backtesting script (against MT5 native export data) not yet started — deliberately, pending answers to §11.
+- ~~Phase 1 backtesting script not yet started~~ — **done** (`bot/historical_validation/validate_against_history.py`).
 
 ---
 
 ## 9. Immediate Next Steps (In Order)
 
-1. 🔴 **Handler — Phase 1 sign-off gate.** Open
-   `bot/historical_validation/output/phase1_validation_report.md` §11 and
-   `spot_check.csv`, and verify ≥20 windows against the raw candles using the
-   recipe printed in the report. This is the Phase 1 exit criterion and cannot
-   be delegated to the Agent.
-2. ✅ **DONE — tick-grid quantization applied** (Senior Dev instructed).
+0. ✅ **CLOSED — Phase 1 signed off and merged** (`1f9deb8`). The former
+   sign-off gate is recorded as satisfied by the Handler's instruction at Phase 2
+   kickoff; `spot_check.csv` holds the 24 sampled windows used as evidence.
+1. 🔴 **Handler — keep the machine and MT5 terminal running** for the Phase 2
+   dry-run window (Mon 26 Oct → Tue 3 Nov 2026). Downtime is not a failure: it is
+   logged as `dry_run_gap_runner_down` and the run resumes forward-only.
+   **Next action:** run the live probe (below) and return its output before the
+   runner is built against the live API.
+2. 🔴 **Agent — build Phase 2** (`mt5_live_source`, the dry-run runner, the live
+   DST monitor, the structural no-order test) once the probe output is in hand.
+   Not started: see §15.4 for the two questions that need a ruling first.
+4. ✅ **DONE — tick-grid quantization applied** (Senior Dev instructed).
    `Decimal` throughout, post-calculation pessimistic snap, `raw_*` audit
    columns, PRD §6.7 + TRD §4.1.2, 128 tests. Any Phase 2 order path must reuse
    `pricing.quantize_to_tick` rather than re-deriving the rounding.
-3. ✅ **DONE — timestamp correction applied** (Senior Dev instructed): TRD §4.1.1
+5. ✅ **DONE — timestamp correction applied** (Senior Dev instructed): TRD §4.1.1
    rewritten, `verify_broker_timezone.py` replaced with the constant-offset logic
    plus an offline `--csv` mode, tests added. Re-run the verifier after every US
    DST transition date as a standing check.
-4. 🔴 **Handler → Senior Dev — confirm Q11 and Q12** (see §11.7). Both were
+6. 🔴 **Handler → Senior Dev — confirm Q11 and Q12** (see §11.7). Both were
    implemented to the literal spec + the Agent's recommendation because the
    Handler instructed "no further blockers"; each is a one-line change if the
    Senior Dev rules differently.
-5. **Then Phase 2 (dry-run) only on explicit sign-off**, and only after
-   Implementation Plan Step 2 (Supabase) is done Handler-side. Phase 2 adds
-   `config.py` env loading, `mt5_client`, `supabase_client`, `logger`, `main.py`
-   and refactors the validated logic into the live loop — the Phase 1 modules
+7. **Then Phase 3 (demo execution) only on explicit sign-off**, and only after
+   Implementation Plan Step 2 (Supabase) is done Handler-side. Phase 3 adds
+   `order_executor`, `trade_manager`, `supabase_client` and `main.py` — the Phase 1 modules
    (`time_windows`, `candle_tracker`, `context_classifier`, `sweep_detector`,
    `trade_calculator`) are designed to be reused unchanged.
-6. Optional before Phase 2, if a longer history is cheap to export: re-run with
+8. Optional before Phase 3, if a longer history is cheap to export: re-run with
    a dataset spanning 2026-11-01 to close the fall-back DST gap (see §8).
 
 ## 10. Session Log
@@ -278,6 +291,38 @@ instructed the real change: quantize order prices to the tick grid.
   `§14` pointer in §10 by adding §14 below.
 - **Not done, deliberately:** no dashboard, no Supabase, no MT5 client, no order
   code — all later phases.
+
+**Session 12 (Phase 2 kickoff — this session):** Phase 1 merged and closed; Phase 2
+scoped, documented and started. No engine code written yet — deliberately, see §15.4.
+- **Merge verified, not assumed.** `origin/main` = `1f9deb8`, a real merge commit
+  with parents `5e0f35c` (data) and `caca96a` (this branch). `git merge-base
+  caca96a origin/main` = `caca96a`, i.e. the branch is fully contained in `main`.
+  `git diff caca96a origin/main` is **empty** — main's tree is byte-identical.
+- **⚠️ Workspace reset, third occurrence.** The sandbox re-cloned at 14:19
+  (reflog `clone:`), discarding the object DB and checking the branch out at its
+  base `8ed0833`, so a naive `git status` looked like "everything deleted". The
+  remote branch still had `caca96a`. Recovered with `fetch --unshallow` +
+  `reset --hard caca96a`, then fast-forwarded onto `main`; branch and remote are
+  both `1f9deb8` now, tree clean, 128 tests green before any new work.
+- **Ran a DST pre-check before planning anything** (§15.2), because the dry-run
+  window starts Mon 26 Oct and today (25 Oct) is the EU fall-back date. Result:
+  the constant −7h rule survives the EU date — the maintenance break sits at
+  16:59→18:00 on **every** date in the file, including the Mar 8–28 stretch
+  between the US and EU spring-forward dates, which is exactly where an
+  EU-following broker would have shown a one-hour shift. It does not.
+- **Docs updated before code** (per Cross-Phase Rule 3): `07-PHASE-PLAN.md`
+  Phase 1 marked CLOSED with criteria checked, Phase 2 marked IN PROGRESS with
+  the Handler's four scoping decisions and a sharpened exit-criteria list;
+  Phase 0's stale "Nearly Closed" status corrected; the Phase 1 deliverable line
+  that said "never hardcoded offsets" corrected (it contradicted TRD §4.1.1);
+  schema vocabulary gained `"dry_run_gap_runner_down"`.
+- **Built the unblocking artifact, not the guess.** `bot/live/probe_mt5_live.py`
+  — a read-only probe the Handler runs on the Windows box, which measures the
+  live API instead of assuming it (§15.3). 15 new offline tests
+  (`test_probe_mt5_live.py`) pin its pure logic → **143 tests, all passing.**
+- **Not started, deliberately:** `mt5_live_source.py`, the runner, the live DST
+  monitor. Two questions in §15.4 change their shape, and the probe output has
+  to come back first.
 
 ---
 
@@ -491,3 +536,132 @@ cd .. && python3 bot/historical_validation/validate_against_history.py \
 python3 bot/historical_validation/verify_broker_timezone.py \
     --csv data/nas100_m1_history.csv                      # 4/4 invariants, exit 0
 ```
+
+---
+
+## 15. Phase 2 — Live Dry-Run (kickoff state)
+
+**Status: scoped and documented; runner not built.** Target window **Mon 26 Oct →
+Tue 3 Nov 2026** (6 NY trading days), which deliberately spans the US fall-back
+transition on **Sunday 1 Nov 2026, 02:00 NY**.
+
+### 15.1 What Phase 2 may and may not contain
+
+Binding, from the Handler's kickoff instruction:
+
+1. Live MT5 connection, real-time data, full window-evaluation logic.
+2. **Zero orders, structurally.** The order call must not exist in the Phase 2
+   entrypoint's code path — not a flag defaulting to off, not a commented-out
+   line. Asserted by a test that walks the entrypoint's import graph.
+3. Phase 1 logic modules (`window_evaluator`, `candle_tracker`,
+   `context_classifier`, `sweep_detector`, `trade_calculator`, `trade_simulator`,
+   `pricing`) are reused **unmodified**. A logic rewrite would silently
+   invalidate Phase 1's validation.
+4. Local CSVs, append-only, same schema mirror as Phase 1. No Supabase, no
+   dashboard work in this phase.
+5. Downtime is logged as `dry_run_gap_runner_down` and the run continues forward.
+   Missed windows are **never** reconstructed.
+6. Any live-API behaviour that differs from the CSV assumptions is escalated,
+   not patched around silently.
+
+### 15.2 DST pre-check performed at kickoff (read before the 1 Nov run)
+
+The dry-run window is only meaningful if the timestamp rule holds when the clocks
+change. Phase 1's export ends **2026-10-22**, so it exercises the March
+spring-forward but never the November fall-back. Two questions matter now:
+
+**(a) Does today's EU fall-back (25 Oct) move anything?** No — and this was
+checked rather than assumed, because the TRD claims the broker follows **US**,
+not EU, transition dates, and that claim is exactly what an EU-date broker would
+falsify. Measured on the export:
+
+| Period | EU vs US DST state | Maintenance break observed (NY, under −7h) |
+|---|---|---|
+| Jan 1 – Mar 7 | both standard | 16:59 → 18:00 |
+| **Mar 8 – Mar 28** | **US on DST, EU still standard** | **16:59 → 18:00 — no shift** |
+| Mar 29 – Oct 22 | both on DST | 16:59 → 18:00 |
+
+Every one of the 18 March breaks is `16:59 → 18:00`; every Sunday in the file
+opens at exactly 18:00; every Friday closes at 16:59 except three holidays
+(Good Friday 3 Apr 09:14, Juneteenth 19 Jun 12:59, Independence Day observed
+3 Jul 12:59 — all genuine early closes). A broker on EU dates would have shown a
+one-hour shift in the Mar 8–28 column. It does not. **Conclusion: the constant
+−7h rule is sound on both sides of both spring transitions, and today's EU
+change should be a no-op.**
+
+**(b) What is still untested?** The November fall-back itself. One nuance worth
+stating plainly, because it changes what the monitor can prove: the 02:00 NY
+change happens while the venue is **shut** (Friday 16:59 → Sunday 18:00). So no
+bar can ever be observed inside the repeated hour — the transition is observable
+only *indirectly*, via the Sunday 18:00 open and Monday's break still sitting at
+17:00–18:00 NY. The same caveat applies retroactively to Phase 1's "spans the
+March transition" claim: what it proved is that the offset was 7 on both sides,
+not that the switch instant is where the model says. That is why the live probe
+measures the broker clock **directly** (`tick.time − time.time()`) as well as
+checking bar invariants: the direct measurement is the only thing that can see
+the switch itself.
+
+### 15.3 Build plan (in order)
+
+| Step | Artifact | Why this order |
+|---|---|---|
+| 0 | `bot/live/probe_mt5_live.py` — **built this session** | Measures the live API (symbol spec, epoch behaviour, forming bar, measured clock offset, invariants) so the adapter is written against facts, not assumptions. Read-only. |
+| 1 | `bot/src/mt5_live_source.py` | Same contract as `m1_csv_source.load_bars` → `(BarSeries, LoadReport)`, producing a *rolling* series. Reuses `to_ny()`/`check_session_invariants`; never re-derives conversion. Drops the forming bar. |
+| 2 | `bot/live/dry_run_runner.py` | The loop: wait for a window to close → evaluate with the Phase 1 modules → append the row. Owns the gap protocol and startup/shutdown events. |
+| 3 | `bot/live/dst_monitor.py` | Continuous: measured clock offset + the four invariants on a trailing window, sampled across 1 Nov. |
+| 4 | `bot/tests/test_no_order_path.py` | Walks the runner's import graph and asserts no order-capable symbol is reachable. The structural guarantee, as a test. |
+| 5 | `bot/tests/test_mt5_live_source.py` | Contract tests against a **fake** MT5 module (the real one is Windows-only), including the forming bar, a disconnect mid-poll, and a symbol that does not exist. |
+
+### 15.4 Open questions — need a ruling before steps 2–4 are built
+
+**Q13 (blocking, log semantics).** The Handler's instruction is "one row per
+window exactly as windows close, no backfill/replay". That is not achievable
+literally: `evaluate_window` calls `trade_simulator.simulate(...)` with
+`config.MAX_BARS_TO_RESOLVE_TRADE`, walking forward up to **5 days** of bars from
+the trigger to find the exit. A traded window therefore has no final outcome at
+its own close. Options:
+ - **(A) recommended:** append the row when its outcome is determined — NO_SETUP
+   rows at window close, traded rows when the simulated trade resolves (usually
+   within minutes). Append-only is preserved; the only cost is that "rows
+   written" lags "windows closed", which is recorded in the audit CSV.
+ - (B) append a provisional row at close and never update it → it would record an
+   outcome the engine had not yet decided.
+ - (C) split into two files (close event + outcome event) → two rows per window,
+   contradicting "one row per window".
+
+**Q14 (blocking, crash semantics).** If the runner dies while a trade is open,
+on restart that trade's exit bars are **missing from memory** but present in
+MT5's own M1 history. Two defensible readings of "never fabricate missed
+windows":
+ - **(A) recommended:** conservative route — the affected window is logged
+   `dry_run_gap_runner_down` and never resolved. Costs a handful of rows in
+   exchange for "the log only ever contains what the bot actually saw".
+ - (B) resolve it from `copy_rates_range` after restart, on the grounds that the
+   broker's own bars are evidence, not fabrication.
+ The difference is definitional for the Handler/Senior Dev, not technical, so it
+ is asked rather than chosen.
+
+**Q15 (non-blocking flag, handled).** `copy_rates_from_pos(..., 0, N)` includes
+the **currently forming** M1 bar, which the CSV never had. The adapter will
+exclude it (bar closed ⟺ `bar.time + 60 ≤ now_broker`). Flagged because it is
+precisely the class of CSV→live difference that rule 6 covers; the probe prints
+whether it is happening on the terminal.
+
+**Q16 (non-blocking flag).** Supabase/`system_events` are named in the Phase 2
+objectives in `07-PHASE-PLAN.md` but are excluded by the kickoff instruction. The
+phase plan now records that as a decision rather than a gap, and marks the
+dashboard exit-criterion **deferred, not waived**.
+
+**Q17 (non-blocking flag).** Phase 2's entry criterion requires Phase 1 sign-off;
+recorded as satisfied by the kickoff instruction, with `spot_check.csv`
+(24 windows) as its evidence — noted so the gate is traceable, not assumed.
+
+### 15.5 What cannot be verified from the sandbox
+
+`MetaTrader5` is Windows-only and is **not importable here** (verified:
+`ModuleNotFoundError`). So every live claim — connection, symbol spec, epoch
+behaviour, forming bar, measured offset — must come from the Handler's machine
+via `probe_mt5_live.py`. What *is* verified here: 143 offline tests, the probe's
+read-only guarantee, and the arithmetic of the conversion and the invariants. No
+Phase 2 result will be reported as "passed" on sandbox evidence alone.
+

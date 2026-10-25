@@ -18,7 +18,7 @@ This document is the authority on "where are we and what's next." If this docume
 
 ## Phase 0 — Documentation & Foundation
 
-**Status: Nearly Closed** (see closure checklist in Appendix A)
+**Status: ✅ CLOSED** (all 7 checklist items done — see Appendix A; Phase 0 was formally closed before Phase 1 began)
 
 ### Entry Criteria
 - Project concept, strategy rules, and collaboration model agreed with Handler.
@@ -51,6 +51,9 @@ Handler must explicitly confirm both open items above are resolved. Only then is
 
 ## Phase 1 — Logic Validation (Historical Backtesting)
 
+**Status: ✅ CLOSED — merged to `main` at `1f9deb8` (Handler sign-off recorded).**
+All exit criteria met; evidence in `bot/historical_validation/output/`.
+
 ### Entry Criteria
 - Phase 0 formally closed (Handler sign-off obtained). ✅
 - Historical data source: MT5 native export from the Forex.com Global demo account, primary source. If MT5's available history depth is insufficient for a statistically meaningful sample, Dukascopy may be used as fallback, with any resulting backtest output explicitly tagged `cross_feed_directional_only`.
@@ -63,14 +66,14 @@ Handler must explicitly confirm both open items above are resolved. Only then is
 ### Deliverables
 - A backtesting script (or notebook) that ingests historical NAS100 data and, for every one of the 21 daily windows across a defined historical date range, outputs a logged outcome (WIN / LOSS / NO_SETUP / reason string) — mirroring exactly the schema defined in `docs/05-DATABASE-SCHEMA.md`.
 - A written validation report: sample size (number of trading days / windows evaluated), outcome distribution, and manual spot-check of at least 20 individual windows against raw candle data to confirm the logic is computing High_A/Low_A/Mid_A, context, sweep, reversal, SL/TP, and partial-exit correctly.
-- All timestamp handling in this script uses `zoneinfo`/`pytz` NY conversion — never hardcoded offsets. The broker-display debug helper (NY+7) may be used for cross-referencing only, never for logic.
+- All timestamp handling in this script follows `docs/02-TRD.md` §4.1.1 as corrected during Phase 1: **broker epoch → New York is a constant −7h subtraction**, with no DST-aware conversion applied on top. `zoneinfo` is used only for reporting (EST/EDT tagging) and for non-existent-local-time guards, never to convert broker epochs. *(Corrected at Phase 2 kickoff: the original wording here — "never hardcoded offsets" — predated the Phase 1 correction and contradicted the TRD, which is authoritative.)*
 
 ### Exit Criteria
-- [ ] Backtest runs end-to-end without crashing across the full test date range.
-- [ ] Every window in the test range produces exactly one outcome row — no missing evaluations.
-- [ ] Manual spot-check of ≥20 windows confirms logic matches the PRD Section 6 spec exactly (context rule, sequence-agnostic sweep/reversal, fib-based SL/TP, 80% partial-exit/breakeven).
-- [ ] Zero known logic bugs remain open.
-- [ ] Validation report written and committed.
+- [x] Backtest runs end-to-end without crashing across the full test date range.
+- [x] Every window in the test range produces exactly one outcome row — no missing evaluations. (4,431/4,431 across 211 dates × 21 windows, zero duplicates.)
+- [x] Manual spot-check of ≥20 windows confirms logic matches the PRD Section 6 spec exactly (context rule, sequence-agnostic sweep/reversal, fib-based SL/TP, 80% partial-exit/breakeven). (`spot_check.csv`, 24 windows.)
+- [x] Zero known logic bugs remain open. (Two classification defects and the timestamp convention were found and fixed; quantization gap closed in `caca96a`.)
+- [x] Validation report written and committed.
 
 ### Handler Sign-Off Requirement
 Handler reviews the validation report and spot-check samples, explicitly confirms the logic is trustworthy, before Phase 2 begins.
@@ -78,6 +81,27 @@ Handler reviews the validation report and spot-check samples, explicitly confirm
 ---
 
 ## Phase 2 — Live Dry-Run (No Orders Placed)
+
+**Status: 🔄 IN PROGRESS — started after the Phase 1 merge (`1f9deb8`).**
+
+**Scoping decisions taken by the Handler at kickoff (binding for this phase):**
+
+- **Executed locally on the Handler's machine**, with the MT5 terminal logged
+  into the existing demo account, because MT5 requires a live terminal and no
+  free-tier always-on Windows host exists. Cloud/scaling architecture is
+  deferred to the Phase 3→4 boundary. The Handler keeps the machine and the
+  terminal running for the whole window; any downtime is a logged gap
+  (`dry_run_gap_runner_down`), not a failure.
+- **No Supabase writes in this phase.** Rows are appended to local CSVs with the
+  same schema mirror Phase 1 produced (`window_evaluations.csv`,
+  `window_evaluations_audit.csv`). Supabase is Handler-side and parallel; the
+  dashboard criterion below is therefore deferred, not waived.
+- **No order capability exists in the Phase 2 codebase at all** — not a flag,
+  not a commented-out call. Verified by a static test over the runner's import
+  graph, not merely by observing that nothing was sent.
+- **Live DST invariant monitor** runs for the whole window, so the US fall-back
+  transition (Sunday 1 Nov 2026, 02:00 NY) is captured live. Phase 1's dataset
+  ended 2026-10-22 and therefore covered only the spring transition.
 
 ### Entry Criteria
 - Phase 1 signed off.
@@ -93,10 +117,13 @@ Handler reviews the validation report and spot-check samples, explicitly confirm
 - `system_events` log showing clean startup/shutdown and any connection issues, with no silent failures.
 
 ### Exit Criteria
-- [ ] Minimum 5 consecutive trading days of dry-run operation with zero missing window evaluations.
-- [ ] Zero unhandled exceptions / crashes requiring manual restart.
-- [ ] Dashboard (if built by this point per Implementation Plan ordering) correctly displays dry-run data.
-- [ ] Handler has reviewed at least one full day's worth of logged windows and confirms they make sense against the actual chart.
+- [ ] **≥5 consecutive New York trading days** of dry-run operation (planned window: Mon 26 Oct → Tue 3 Nov 2026).
+- [ ] **Zero orders placed**, verified *structurally* — the order-sending call is unreachable from the Phase 2 entrypoint and a test asserts it — not merely observed empirically.
+- [ ] **All 21 windows logged on every day the runner was up**, each with a valid outcome and reason (zero missing evaluations).
+- [ ] **Zero unhandled crashes.** Restarts are permitted only via the gap protocol: windows missed while down are logged `dry_run_gap_runner_down` and never backfilled.
+- [ ] **DST invariant checks PASS continuously** through the 1 Nov 2026 fall-back transition: exactly one evaluation per window on 2 Nov, no double-fire, no dropped window, no hour shift in the maintenance break, Friday close or Sunday open.
+- [ ] Dashboard criterion **deferred** to Phase 3 (no Supabase writes in Phase 2 — see the scoping decisions above).
+- [ ] Handler has reviewed at least one full day of logged windows against the actual chart and signed off.
 
 ### Handler Sign-Off Requirement
 Handler explicitly confirms dry-run output is trustworthy and stable before any real order is allowed to be placed, even on demo.

@@ -305,6 +305,7 @@ Reason string	Used when
 "market_closed_no_data"	The window fell outside the instrument's trading session, so no price bars exist for it (e.g. every Friday-evening window from 18:45 ET onward, and exchange holidays). Logged as outcome 'NO_SETUP'. This is an environmental fact, NOT a bot fault — it must never be logged as 'MISSING_EVALUATION'.
 "missing_market_data"	Bars are absent while the instrument's session was demonstrably still trading (a feed hole). Logged as outcome 'NO_SETUP'. A data-quality fact, never a strategy result, and never a MISSING_EVALUATION.
 "outside_data_range"	The input file ends before this window (export boundary). Logged as outcome 'NO_SETUP'. Only reachable in local/CSV Phase 1 runs — a live bot reading a continuous feed cannot hit it.
+"dry_run_gap_runner_down"	Phase 2 only. The dry-run runner (or the MT5 terminal it depends on) was not running for some part of the window, so the window was not observed. Logged as outcome 'NO_SETUP' with this reason at restart, as a forward-only record — the missed window is **never** reconstructed from later data. Must not be confused with 'market_closed_no_data' (the venue was shut) or 'missing_market_data' (the feed had a hole): this one is the bot's own availability, and it is the bot's own fault.
 If a genuinely new scenario arises during implementation that doesn't fit
 this list, add it to this table first (update this doc), then use it
 in code — don't invent ad hoc reason strings that aren't documented here.
