@@ -35,12 +35,17 @@ introductory/               role prompts for the Handler/Senior Dev/Agent
 data/nas100_m1_history.csv  Phase 1 input: NAS100 M1, Jan-Oct 2026 (~13 MB)
 bot/
   src/                      engine: windows, candles, context, sweep, sizing
-  tests/                    219 unit tests (stdlib unittest)
+  tests/                    281 unit tests (stdlib unittest)
   historical_validation/
     validate_against_history.py   Phase 1 driver
     export_history_csv.py         MT5 export (Windows-only, Handler runs it)
     verify_broker_timezone.py     broker clock cross-check
-  live/                       Phase 2: probe_mt5_live.py (read-only, Windows)
+  live/                       Phase 2 (Windows, needs a running terminal)
+    probe_mt5_live.py           read-only environment/API probe
+    dry_run_runner.py           the dry-run loop — places NO orders
+    dst_monitor.py              continuous DST invariant monitor (separate process)
+    csv_emitter.py              append-only log writer (Phase 1 schema)
+    output/                     generated logs (git-ignored)
     output/                       generated report + schema-mirror CSVs
 ```
 

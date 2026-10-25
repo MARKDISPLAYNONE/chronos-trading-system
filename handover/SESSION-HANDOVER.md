@@ -154,7 +154,7 @@ part that makes the numbers trustworthy — do the same on any re-run):
 ## 8. What's NOT Done
 
 - **No live bot, no dashboard, no Supabase.** Phase 1 is historical replay only; `mt5_client`, `supabase_client`, `order_executor`, `trade_manager`, `main.py` and everything under `dashboard/` are later phases (Steps 8–16).
-- **Phase 2 is partly built.** `mt5_live_source.py` is done and offline-tested (§15.7). Still missing: the runner, the live DST monitor, the CSV emitter — blocked on Q13/Q14 (§15.4).
+- **Phase 2 code is complete but has never run against a live terminal.** Every module is offline-tested (281 tests) and the API shape was measured by the probe, but the loop itself is unexercised. `--check` then a supervised first ten minutes is the plan (§15.10).
 - **DST coverage gap (narrowed, see §15.2):** the dataset ends 2026-10-22, so the
   **March 8 spring-forward** is exercised but the **November 1 fall-back** is not.
   Phase 2's live monitor is now the instrument intended to close this, and it is
@@ -178,10 +178,9 @@ part that makes the numbers trustworthy — do the same on any re-run):
    logged as `dry_run_gap_runner_down` and the run resumes forward-only.
    **Next action:** run the live probe (below) and return its output before the
    runner is built against the live API.
-2. 🟡 **Agent — Phase 2 build, in progress.** ✅ `mt5_live_source.py` (adapter,
-   §15.7). ⏳ still to build: `dry_run_runner.py`, `dst_monitor.py`, the CSV row
-   emitter — blocked on Q13/Q14 (§15.4), which decide when a row may be written
-   and what a crash gap means.
+2. ✅ **DONE — Phase 2 build complete.** `mt5_live_source.py` (§15.7),
+   `dry_run_runner.py`, `dst_monitor.py`, `csv_emitter.py` (§15.9). Q13/Q14
+   approved and implemented. **Ready to launch** after the §15.10 preflight.
    **Live offset still unconfirmed** — needs a market-open probe run (§15.8).
 4. ✅ **DONE — tick-grid quantization applied** (Senior Dev instructed).
    `Decimal` throughout, post-calculation pessimistic snap, `raw_*` audit
@@ -365,6 +364,45 @@ run's bars, and by the calendar (this session's date is a Sunday).
 - **Tests: 161 → 219.**
 - **Still open:** live offset confirmation (needs a market-open run — must not be
   described as "verified live" until then), Q13/Q14, and the runner itself.
+
+**Session 13 (Phase 2 build — this session):** Q13 and Q14 approved; runner, DST
+monitor and CSV emitter built. **281 tests, all passing.**
+- **Docs first:** the Phase 3 crash-recovery requirement is now written into
+  `docs/07-PHASE-PLAN.md` (as instructed): genuine broker-side reconciliation is
+  required once real orders exist, and Phase 2's log-and-abandon is explicitly
+  not acceptable there. Mechanism not built — recorded so it is not rediscovered
+  cold at the boundary.
+- **`bot/live/csv_emitter.py`** — append-only; reuses `src.outputs`' row builders
+  so live and backtest columns cannot drift; re-reads the CSV on restart so a
+  crash cannot duplicate a row.
+- **`bot/live/dry_run_runner.py`** — the loop. Three findings came out of writing
+  its tests, all fixed:
+  1. **Backfill would have silently broken Q14.** After a reconnect MT5 returns
+     the bars for the minutes we were blind for, so a naive runner scores the
+     missed window as a normal evaluation. Fixed with an observation ledger: a
+     window is only evaluated if its whole span was watched. Same rule applied to
+     a trade's **exit minute**, so an outage mid-trade yields a gap, not a WIN.
+  2. `_gap_scan_lower_bound` used `min` where the later bound was needed, pulling
+     a full extra day of windows into the launch-day scan.
+  3. `evaluate_window` raises `IndexError` on an empty `BarSeries`. Guarded
+     runner-side (Phase 1 logic left untouched) so a feed with no bars cannot
+     kill the loop or score a window.
+- **`bot/live/dst_monitor.py`** — independent background process; loads
+  `verify_broker_timezone.py` **by path** and calls its `verify()`, so the
+  monitor and the Phase 1 gate cannot disagree (a test asserts the verdicts
+  match). Records the measured offset (staleness-gated), the four invariants,
+  NY-minute back-steps (a repeated local hour) and gaps, plus per-date schedule
+  integrity.
+- **DST double-fire is now provable, not assumed:** at startup every scheduled
+  window in the planned range is converted to UTC and the runner refuses to start
+  if any is ambiguous or non-existent. A test forces 2026-11-01 to count as a
+  trading day to prove the guard fires.
+- **Full-day integration test:** a synthetic weekday through the real runner
+  produces exactly 21 rows for that trading date, 21 distinct labels, valid
+  outcome + reason each, zero gap rows.
+- **Readiness:** ready for a Monday 26 Oct launch after a ~5-minute preflight
+  (`pip install tzdata` → probe → `--check`). See §15.10 for the honest residual
+  risk and the day-one partial-coverage note.
 
 ---
 
@@ -844,4 +882,111 @@ confirmed live.** A genuine live confirmation needs a run while the market is
 open (Monday during NY hours). Until then no report may describe it as
 "verified live". The suite pins all of this: a Sunday fake terminal must produce
 exit 0 with no offset number, and a Monday-mid-session fake must produce one.
+
+### 15.9 Phase 2 build complete: runner, DST monitor, CSV emitter
+
+Built this session, all offline-tested. **281 tests, all passing.**
+
+| File | What it is |
+|---|---|
+| `bot/live/csv_emitter.py` | Append-only writer reusing Phase 1's exact row builders from `src.outputs` — columns cannot drift |
+| `bot/live/dry_run_runner.py` | The loop: ingest → `evaluate_window` (unmodified) → append. Owns Q13 timing and Q14 crash policy |
+| `bot/live/dst_monitor.py` | Separate background process; continuous invariant + offset + schedule-integrity evidence through 1 Nov |
+| `bot/tests/test_dry_run_runner.py` | 40 tests |
+| `bot/tests/test_dst_monitor.py` | 26 tests |
+
+#### The one design problem that mattered
+
+MT5 **backfills** the minutes it was not connected for. So the naive
+implementation of Q14 — "if the runner missed a window, don't score it" — would
+have silently violated Q14, because after a reconnect the bars for the missed
+window are simply *there*, and `evaluate_window` would score them like any other.
+
+The runner therefore keeps an **observation ledger**: the wall-clock intervals
+during which it was connected and polling, persisted in `runner_state.json`. A
+window counts as observed only if its entire `[open, close)` span sits inside one
+interval. `evaluate_window` is never called for a window that is not observed,
+and a trade whose **exit minute** was not observed is not scored either — even
+though the process survived and the exit is in the history. That last case is the
+one a reader would not think to check, and it has its own test.
+
+Consequence for the log, stated plainly: a window's row records what the runner
+**saw**, not what the market did. That is the Handler's policy and it is now
+enforced by structure rather than by intention.
+
+#### Q13 / Q14 as implemented
+
+- **Q13.** NO_SETUP rows at window close. Traded rows only when `simulate()`
+  resolves — possibly days later. Pending windows are re-evaluated every poll and
+  the pending set is persisted. A trade that is still unresolved after
+  `MAX_BARS_TO_RESOLVE_TRADE` is emitted as `MISSING_EVALUATION` /
+  `data_ends_before_trade_closed` with a `resolution_deadline_passed` flag, so no
+  window can hang forever. `evaluated_at` is the **write** time, so file order is
+  decision order and the audit trail says so.
+- **Q14.** Crash reconciliation at startup: any window pending at shutdown becomes
+  `dry_run_gap_runner_down`. Its audit row keeps the candles, sweep and plan
+  (facts that *were* seen) and carries **no** exit price, exit kind or R. Nothing
+  is inferred.
+- **Phase 3 note added** to `docs/07-PHASE-PLAN.md`: crash recovery with
+  broker-side reconciliation is required once real orders exist; Option A is
+  explicitly not acceptable there. Not built now, by instruction.
+
+#### DST: windows provably cannot double-fire
+
+At startup the runner converts every scheduled window in the planned range to
+UTC and **refuses to start** if any is ambiguous (a doubled local time) or
+non-existent (a skipped one). Under the Mon–Fri rule this cannot happen — both US
+transitions fall on a Sunday — and a test forces `2026-11-01` to be treated as a
+trading day to prove the guard actually fires rather than merely existing.
+`--check` prints the result. 7 trading dates verified in the 26 Oct – 3 Nov range.
+
+#### Evidence from a simulated full day
+
+A synthetic weekday fed through the real runner produces **21 rows for that
+trading date, 21 distinct labels, valid outcome + reason on every one, zero gap
+rows** — the Phase 2 exit criterion demonstrated for one day, with the mechanism
+identical for the rest. Four tests cover it.
+
+### 15.10 Readiness for a Monday 26 Oct launch
+
+**Yes, ready** — with a short preflight, because nothing here can be tested
+against a real terminal from this sandbox.
+
+Preflight (about five minutes, in order):
+
+1. `pip install tzdata` — **required**; Windows has no IANA database and the
+   runner will refuse to start without it with an explicit message.
+2. `python live/probe_mt5_live.py` — confirms the terminal, demo account, symbol
+   spec and (now that the market is open) the **live offset**. This is the
+   outstanding confirmation; until it comes back, no report may call the offset
+   "verified live".
+3. `python live/dry_run_runner.py --check` — runs every startup guard (demo
+   account, symbol spec, DST-safe schedule, invariant gate on the live feed) and
+   exits without looping. If this passes, the runner is safe to start.
+
+Then, in two separate terminals:
+
+```
+python live/dst_monitor.py            :: continuous, independent
+python live/dry_run_runner.py         :: the loop
+```
+
+**Residual risk, honestly:** the live API surface `LiveBarSource` consumes
+(`copy_rates_from_pos` dtype, integer epoch, forming bar) was already measured on
+this terminal by the probe, so the shape is known. What has never run is the
+runner's *loop* against that API. `--check` exercises startup; the first ten
+minutes of the real run exercise the rest. If something is wrong it will show as
+a `feed_error` or `step_error` event in `runner_events.csv` within minutes, not as
+silent nonsense — the loop logs and continues rather than dying.
+
+**What would actually delay launch:** tzdata not installed, the terminal not
+logged into the demo account, or the probe reporting a non-demo `trade_mode`.
+None of those is a code problem.
+
+**Day-one partial coverage is expected.** If the runner starts mid-morning on
+Monday, the windows that closed earlier that day are logged as
+`dry_run_gap_runner_down` with a `not_observed_by_runner` flag. That is the honest
+record, not a defect — the exit criterion ("21/21 every day") applies to full days
+after launch. Starting at the Sunday 18:00 reopen would avoid it entirely;
+starting Monday morning will not, and the log will say so.
 

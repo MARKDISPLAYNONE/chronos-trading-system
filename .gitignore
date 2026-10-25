@@ -23,6 +23,13 @@ Thumbs.db
 # Phase 1 generated artefacts (regenerable from data/ + code)
 bot/historical_validation/output/*.sqlite
 
+# Phase 2 live-run state (generated on the Handler's machine while the dry run
+# is in progress). Append-only logs and the runner's crash-recovery state: they
+# must never be committed mid-run, and the Phase 2 report quotes from them once
+# the run closes.
+bot/live/output/
+bot/live/**/__pycache__/
+
 # Local virtualenvs / test caches
 .pytest_cache/
 .ruff_cache/

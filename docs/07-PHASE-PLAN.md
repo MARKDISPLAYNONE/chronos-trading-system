@@ -132,6 +132,19 @@ Handler explicitly confirms dry-run output is trustworthy and stable before any 
 
 ## Phase 3 — Demo Execution (Real Orders, Demo Account)
 
+> **Crash recovery is a Phase 3 requirement, not a Phase 2 one.** Phase 2 runs
+> with **no orders in existence**, so a crash can safely be handled by the
+> log-and-abandon policy (Q14, Option A): windows the runner did not observe are
+> recorded as `dry_run_gap_runner_down` and are never reconstructed from broker
+> history. That is acceptable *only* while nothing is live.
+>
+> **Phase 3 requires genuine crash recovery** — on restart, the bot must query
+> broker-side account/position state and reconcile real open orders. Option A
+> (log-and-abandon) is **not acceptable once real capital/orders exist**, because
+> a restart that ignores an open position is a position nobody is managing.
+> Do not build that mechanism in Phase 2; it is recorded here so it is not
+> rediscovered cold at the Phase 2 → 3 boundary.
+
 > **Measured execution cost (Phase 2 probe, Oct 2026):** live spread on NAS100
 > was **30 points = 3.0 index points** at probe time. Phase 1 and Phase 2 both
 > assume zero spread by decision (Q8), so this changed no result in either. Phase
