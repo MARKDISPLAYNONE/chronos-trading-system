@@ -324,6 +324,15 @@ scoped, documented and started. No engine code written yet — deliberately, see
   monitor. Two questions in §15.4 change their shape, and the probe output has
   to come back first.
 
+**Session 12, follow-up after the first live run:** the Handler ran the probe on
+the Windows box. It confirmed the connection, the demo account, the broker and
+the full NAS100 spec (all matching Phase 1 — see §15.6), then crashed on
+`SymbolInfo.session_quotes`, a field this MT5 build does not have. The probe was
+at fault, not the feed. Rebuilt it so optional fields cannot raise and each
+section is isolated (§15.6), with 18 new tests that inject a fake terminal
+shaped like the real one. **Still needed from the Handler: a re-run**, to collect
+the rates dtype/epoch, forming-bar and offset-measurement sections.
+
 ---
 
 ## 11. Phase 1 Pre-Flight — Questions and how each was resolved (Q1–Q12)
@@ -664,4 +673,53 @@ behaviour, forming bar, measured offset — must come from the Handler's machine
 via `probe_mt5_live.py`. What *is* verified here: 143 offline tests, the probe's
 read-only guarantee, and the arithmetic of the conversion and the invariants. No
 Phase 2 result will be reported as "passed" on sandbox evidence alone.
+
+### 15.6 Live facts measured on the Handler's terminal (first probe run)
+
+The first live run crashed partway, but everything it printed before crashing is
+real terminal output and is recorded here as measured fact — not inference.
+
+| Fact | Measured | Status |
+|---|---|---|
+| MT5 connection | live terminal, logged in | ✅ |
+| Account type | `trade_mode: 0` (demo) | ✅ Phase 2 is allowed to run |
+| Broker | Gain Global Markets / FOREX.com Global | ✅ same broker as the export |
+| NAS100 `digits` / `point` | 1 / 0.1 | ✅ |
+| `trade_tick_size` / `trade_tick_value` | 0.1 / 0.1 | ✅ matches `config.TICK_SIZE` exactly — quantization (TRD §4.1.2) stands |
+| `volume_min` / `step` / `max` | 0.1 / 0.1 / 1000.0 | ✅ 10.0 volume step is legal |
+| Live spread | **30 points = 3.0 index points** | ℹ️ new information, see below |
+
+**The spread number.** 3.0 index points is roughly 30× the tick size. It changes
+nothing in Phase 1 or Phase 2, both of which assume zero spread by decision (Q8)
+and score logic, not execution. It is the first real execution-cost figure the
+project owns, and it is enough to matter for Phase 3: a clean TP run is worth
+≈1R and the stop is ≈0.5·Range, so on a median range a 3.0-point spread is a
+non-trivial fraction of 1R. Recorded in `07-PHASE-PLAN.md` under Phase 3.
+
+**What is still missing** (the sections the crash skipped): rates dtype and
+epoch type, the forming-bar check, and the direct broker-offset measurement.
+Those are the three that gate the live adapter, so the probe fix (next
+paragraph) must be re-run before `mt5_live_source.py` is written.
+
+#### The probe bug, and why it mattered
+
+The run died on `SymbolInfo.session_quotes` — an attribute this package build
+does not expose. The field is a cosmetic session counter that the engine never
+reads, so nothing about the live data was wrong; the probe was.
+
+The real defect was not the missing `getattr`. It was that one unguarded
+attribute could abort five sections, and it did: the crash landed *before* the
+clock, rates and forming-bar checks, i.e. before every measurement that actually
+matters. Two changes:
+
+1. `field(obj, name)` reads optional attributes without raising and reports their
+   absence as a **note**, never an escalation.
+2. Each section runs inside its own guard. A section that raises is recorded as
+   an escalation and **the probe continues** to the remaining sections.
+
+Class of bug now closed by test, not by intention: `test_probe_mt5_live.py`
+injects a fake MT5 module shaped like the real terminal (no `session_quotes`) and
+asserts the probe still reaches the offset measurement and exits 0. There is a
+second test where an *entire section* raises and the following sections still
+run. Suite is now **161 tests**.
 

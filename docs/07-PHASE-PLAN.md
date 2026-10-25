@@ -132,6 +132,15 @@ Handler explicitly confirms dry-run output is trustworthy and stable before any 
 
 ## Phase 3 — Demo Execution (Real Orders, Demo Account)
 
+> **Measured execution cost (Phase 2 probe, Oct 2026):** live spread on NAS100
+> was **30 points = 3.0 index points** at probe time. Phase 1 and Phase 2 both
+> assume zero spread by decision (Q8), so this changed no result in either. Phase
+> 3 is where it starts to matter: a clean TP run is worth ≈1R against a stop of
+> ≈0.5·Range, so 3.0 points is a meaningful fraction of 1R on a median-range
+> candle. Phase 3 must model spread explicitly rather than inherit the zero-cost
+> assumption, and should measure the spread distribution across sessions rather
+> than reuse this single sample.
+
 ### Entry Criteria
 - Phase 2 signed off.
 - `ENVIRONMENT=demo` and `CONFIRM_LIVE_TRADING=false` safeguard flags verified in place and functioning (per `docs/06-IMPLEMENTATION-PLAN.md`).

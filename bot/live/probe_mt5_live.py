@@ -28,6 +28,22 @@ against. It answers, from the real terminal:
   7. Is the newest bar in `copy_rates_from_pos` still FORMING? (The CSV never
      had one. An unfinished bar must never be used to build Candle A or B.)
 
+FAILURE ISOLATION (fixed after the first live run)
+--------------------------------------------------
+The first run on the Handler's terminal crashed on `SymbolInfo.session_quotes`,
+an attribute this package build does not have. It took down the clock, the
+rates and the forming-bar sections — the parts that actually matter. Two changes
+make that class of bug impossible to repeat:
+
+  * every non-essential attribute is read through `field()`, which returns a
+    placeholder instead of raising, and is reported as a cosmetic note;
+  * each section runs inside its own guard, so a failure in one is recorded and
+    the probe **continues**. A missing cosmetic field can never cost you the
+    offset measurement again.
+
+A section that raises is still reported as an escalation — the point is that the
+rest of the evidence is collected first.
+
 SAFETY
 ------
 This script only reads. It calls `initialize`, `terminal_info`, `account_info`,
@@ -37,10 +53,10 @@ function, and it changes no account state. Read-only by construction.
 
 HOW TO RUN (Windows, MT5 terminal open and logged into the demo account)
 -----------------------------------------------------------------------
-    python probe_mt5_live.py
-    python probe_mt5_live.py --symbol NAS100 --bars 3000
+    python live/probe_mt5_live.py
+    python live/probe_mt5_live.py --symbol NAS100 --bars 3000
 
-Exit code 0 = every check that can pass offline-live passed.
+Exit code 0 = every check that can pass live passed.
 Exit code 1 = something is not what Phase 1 assumed: send the output back,
 change nothing, and let the Senior Dev rule on it.
 
@@ -51,18 +67,51 @@ number is masked and no password is ever read.
 from __future__ import annotations
 
 import argparse
+import calendar
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 # Phase 1's single source of truth for the conversion. Reused, not re-derived:
 # if this probe disagrees with the adapter later, one of them is wrong and the
 # disagreement is the bug.
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src import config  # noqa: E402
 
 DAILY_BREAK_HOUR = 17          # 17:00-18:00 NY, Mon-Thu (TRD §4.1.1)
 FRIDAY_CLOSE = "16:59"         # last M1 bar of the week
 SUNDAY_OPEN = "18:00"          # first M1 bar of the week
+
+#: printed instead of a value when the package build lacks an attribute
+ABSENT = "<absent on this build>"
+
+
+def field(obj, name: str, default=ABSENT):
+    """Read an optional attribute without ever raising.
+
+    MT5's named tuples vary between package builds — `SymbolInfo` on the
+    Handler's terminal has no `session_quotes`, for example. These fields are
+    cosmetic for our purposes, so their absence is a note, never a failure.
+    """
+    try:
+        return getattr(obj, name, default)
+    except Exception:  # a property that raises is, for our purposes, absent
+        return default
+
+
+def as_dict(obj) -> dict:
+    """Best-effort field dump, so an unknown build's schema is still visible."""
+    for attempt in ("_asdict",):
+        fn = getattr(obj, attempt, None)
+        if callable(fn):
+            try:
+                return dict(fn())
+            except Exception:
+                pass
+    try:
+        return {k: v for k, v in vars(obj).items() if not k.startswith("_")}
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -135,168 +184,325 @@ def session_invariants(ny_times: list[datetime]) -> list[tuple[str, bool, str]]:
     return rows
 
 
+def rate_times(rates) -> list[int]:
+    """Pull the integer `time` field out of a rates array, whatever it looks like.
+
+    Handles numpy structured arrays (`rates["time"]`), a sequence of dicts, and
+    a sequence of tuples whose declared dtype names give the column order.
+    """
+    if rates is None:
+        return []
+    try:
+        column = rates["time"]
+        return [int(t) for t in column]
+    except Exception:
+        pass
+    names = getattr(getattr(rates, "dtype", None), "names", None)
+    idx = list(names).index("time") if names and "time" in names else 0
+    out: list[int] = []
+    for row in rates:
+        try:
+            out.append(int(row["time"]))
+        except Exception:
+            out.append(int(row[idx]))
+    return out
+
+
 # ---------------------------------------------------------------------------
-# Live probe (all MT5 access lives here)
+# Findings
 # ---------------------------------------------------------------------------
-def main(argv: list[str] | None = None) -> int:
+class Findings:
+    """Escalations vs cosmetic notes. Only escalations change the exit code."""
+
+    def __init__(self) -> None:
+        self.problems: list[str] = []
+        self.notes: list[str] = []
+
+    def problem(self, msg: str) -> None:
+        self.problems.append(msg)
+
+    def note(self, msg: str) -> None:
+        self.notes.append(msg)
+
+
+def section(title: str, findings: Findings):
+    """Decorator: a failing section is recorded and the probe continues.
+
+    This is the direct fix for the first live run, where one absent attribute
+    aborted every section after it.
+    """
+    def wrap(fn):
+        def run(*a, **kw):
+            print(f"\n--- {title} ---")
+            try:
+                return fn(*a, **kw)
+            except Exception as exc:  # noqa: BLE001 - deliberate catch-all
+                print(f"  [SECTION FAILED] {type(exc).__name__}: {exc}")
+                print("  (continuing — the remaining sections still run)")
+                findings.problem(
+                    f"section '{title}' failed: {type(exc).__name__}: {exc}"
+                )
+                return None
+        run.section_title = title  # type: ignore[attr-defined]
+        return run
+    return wrap
+
+
+# ---------------------------------------------------------------------------
+# Sections (all MT5 access lives here)
+# ---------------------------------------------------------------------------
+def main(argv: list[str] | None = None, mt5_module=None) -> int:
     ap = argparse.ArgumentParser(description="Read-only MT5 probe for Phase 2")
     ap.add_argument("--symbol", default=config.INSTRUMENT_SYMBOL)
     ap.add_argument("--bars", type=int, default=3000, help="how many M1 bars to pull")
     args = ap.parse_args(argv)
 
-    try:
-        import MetaTrader5 as mt5  # noqa: N813  (Windows-only, lazy on purpose)
-    except Exception as exc:  # pragma: no cover - depends on host OS
-        print("FATAL: the MetaTrader5 package is not importable here.")
-        print(f"       {type(exc).__name__}: {exc}")
-        print("       Run this on the Windows machine that hosts the terminal.")
-        return 1
+    if mt5_module is not None:
+        mt5 = mt5_module            # injected by the tests
+    else:
+        try:
+            import MetaTrader5 as mt5  # noqa: N813  (Windows-only, lazy on purpose)
+        except Exception as exc:  # pragma: no cover - depends on host OS
+            print("FATAL: the MetaTrader5 package is not importable here.")
+            print(f"       {type(exc).__name__}: {exc}")
+            print("       Run this on the Windows machine that hosts the terminal.")
+            return 1
 
+    findings = Findings()
     print("=" * 96)
     print("Project Chronos — Phase 2 live probe (read-only)")
     print("=" * 96)
-    print(f"MetaTrader5 package version : {getattr(mt5, '__version__', 'unknown')}")
+    print(f"MetaTrader5 package version : {field(mt5, '__version__', 'unknown')}")
+    print(f"Instrument requested        : {args.symbol}")
 
     if not mt5.initialize():
         print(f"FATAL: initialize() failed — last_error = {mt5.last_error()}")
         print("       Is the terminal installed, running and logged in?")
         return 1
 
-    problems: list[str] = []
-    try:
+    state: dict = {}
+
+    # ---- 1. terminal + account ------------------------------------------
+    @section("terminal and account", findings)
+    def read_environment():
         ti = mt5.terminal_info()
         ai = mt5.account_info()
         if ti is None or ai is None:
-            print(f"FATAL: terminal_info()/account_info() returned None "
-                  f"(last_error={mt5.last_error()})")
-            return 1
-
-        print(f"Terminal                    : {ti.name} build {ti.build}, "
-              f"connected={ti.connected}")
-        masked = ("*" * (len(str(ai.login)) - 2)) + str(ai.login)[-2:] if ai.login else "n/a"
-        print(f"Account                     : {ai.company} / server {ai.server} "
-              f"/ login {masked}")
-        print(f"Account currency / leverage : {ai.currency} / 1:{ai.leverage}")
-        print(f"trade_mode                  : {ai.trade_mode} "
+            findings.problem(
+                f"terminal_info()/account_info() returned None "
+                f"(last_error={mt5.last_error()})"
+            )
+            return
+        state["terminal"], state["account"] = ti, ai
+        print(f"Terminal                    : {field(ti, 'name')} "
+              f"build {field(ti, 'build')}, connected={field(ti, 'connected')}")
+        login = field(ai, "login", "")
+        masked = ("*" * max(0, len(str(login)) - 2)) + str(login)[-2:] if login else "n/a"
+        print(f"Account                     : {field(ai, 'company')} / "
+              f"server {field(ai, 'server')} / login {masked}")
+        print(f"Account currency / leverage : {field(ai, 'currency')} / "
+              f"1:{field(ai, 'leverage')}")
+        print(f"trade_mode                  : {field(ai, 'trade_mode')}  "
               f"(0=demo, 1=contest, 2=real)")
-        if ai.trade_mode != 0:
-            problems.append("account is NOT a demo account — Phase 2 must not run here")
-        if not ti.connected:
-            problems.append("terminal reports disconnected")
+        if field(ai, "trade_mode") != 0:
+            findings.problem("account is NOT a demo account — Phase 2 must not run here")
+        if field(ti, "connected") is not True:
+            findings.problem("terminal reports disconnected")
 
-        # ---- symbol spec ---------------------------------------------------
+    # ---- 2. symbol spec --------------------------------------------------
+    @section("symbol spec", findings)
+    def read_symbol():
         info = mt5.symbol_info(args.symbol)
         if info is None:
-            print(f"\nFATAL: symbol {args.symbol!r} not found. Visible symbols "
-                  f"matching nothing. last_error={mt5.last_error()}")
-            print("       ESCALATE — do not substitute a lookalike symbol name.")
-            return 1
-        if not info.visible and not mt5.symbol_select(args.symbol, True):
-            problems.append(f"{args.symbol} could not be selected into Market Watch")
+            findings.problem(
+                f"symbol {args.symbol!r} not found on this terminal "
+                f"(last_error={mt5.last_error()}) — do not substitute a lookalike"
+            )
+            return
+        state["symbol"] = info
+        print(f"name / path                 : {field(info, 'name')} / {field(info, 'path')}")
+        print(f"digits / point              : {field(info, 'digits')} / "
+              f"{field(info, 'point')}")
+        print(f"trade_tick_size             : {field(info, 'trade_tick_size')}")
+        print(f"trade_tick_value            : {field(info, 'trade_tick_value')}")
+        print(f"volume_min / step / max     : {field(info, 'volume_min')} / "
+              f"{field(info, 'volume_step')} / {field(info, 'volume_max')}")
+        print(f"trade_mode / filling_mode   : {field(info, 'trade_mode')} / "
+              f"{field(info, 'filling_mode')}")
 
-        print("\n--- symbol spec ---")
-        print(f"name / path                 : {info.name} / {info.path}")
-        print(f"digits / point              : {info.digits} / {info.point}")
-        print(f"trade_tick_size             : {getattr(info, 'trade_tick_size', 'MISSING')}")
-        print(f"trade_tick_value            : {getattr(info, 'trade_tick_value', 'MISSING')}")
-        print(f"volume_min / step / max     : {info.volume_min} / {info.volume_step} / {info.volume_max}")
-        print(f"trade_mode / filling        : {info.trade_mode} / "
-              f"{getattr(info, 'filling_mode', 'MISSING')}")
-        print(f"spread (points)             : {info.spread}")
-        print(f"session_deals / quotes      : {info.session_deals} / {info.session_quotes}")
+        spread = field(info, "spread", None)
+        point = field(info, "point", None)
+        if spread is None:
+            findings.note("`spread` is absent on this build")
+        else:
+            pts = f" = {spread * point:.2f} price points" if point else ""
+            print(f"spread (now)                : {spread} points{pts}")
+            findings.note(
+                f"live spread measured at {spread} points{pts}. Phase 1 and Phase 2 "
+                f"both assume zero spread, so this changes no Phase 2 number — but "
+                f"it is the first real execution cost we have a number for, and "
+                f"Phase 3 will need it."
+            )
 
-        tick_size = getattr(info, "trade_tick_size", None) or info.point
-        if abs(float(tick_size) - float(config.TICK_SIZE)) > 1e-12:
-            problems.append(
+        # cosmetic session counters: present on some builds, absent on others
+        deals = field(info, "session_deals", None)
+        quotes = field(info, "session_quotes", None)
+        if deals is None or quotes is None:
+            print(f"session_deals / quotes      : "
+                  f"{deals if deals is not None else ABSENT} / "
+                  f"{quotes if quotes is not None else ABSENT}")
+            findings.note(
+                "SymbolInfo on this build lacks 'session_deals'/'session_quotes' "
+                "(cosmetic counters, unused by the engine). Not an escalation; the "
+                "probe now guards optional fields so their absence cannot abort the run."
+            )
+        else:
+            print(f"session_deals / quotes      : {deals} / {quotes}")
+
+        tick_size = field(info, "trade_tick_size", None) or point
+        if tick_size is None:
+            findings.problem("neither trade_tick_size nor point is available")
+        elif abs(float(tick_size) - float(config.TICK_SIZE)) > 1e-12:
+            findings.problem(
                 f"trade_tick_size={tick_size} does not match Phase 1's "
                 f"config.TICK_SIZE={config.TICK_SIZE} — quantization is built on 0.1"
             )
 
-        # ---- the clock: measured, not inferred ------------------------------
-        print("\n--- clock (the load-bearing assumption) ---")
+        names = getattr(getattr(info, "dtype", None), "names", None) or list(as_dict(info))
+        if names:
+            print(f"fields on this SymbolInfo   : {len(names)} -> {', '.join(map(str, names))}")
+
+    # ---- 3. clock: measured, not inferred --------------------------------
+    @section("clock (the load-bearing assumption)", findings)
+    def read_clock():
         import time as _time
         tick = mt5.symbol_info_tick(args.symbol)
-        if tick is None or not tick.time:
-            problems.append("symbol_info_tick() gave no timestamp — cannot measure the clock")
-            now_broker = int(_time.time())
-        else:
-            now_utc = _time.time()
-            off = measure_offset_hours(tick.time, now_utc)
-            now_broker = tick.time
-            print(f"last tick, broker stamp     : {decode_broker_label(tick.time)} (raw broker label)")
-            print(f"true UTC now (system clock) : {datetime.fromtimestamp(now_utc, timezone.utc).replace(tzinfo=None)}")
-            print(f"measured broker − UTC       : {off:+.2f} h   (expect +2.00 winter / +3.00 summer)")
-            print(f"NY now, per TRD §4.1.1 −7h  : {to_ny(tick.time)}")
-            ny_true = datetime.now(timezone.utc).astimezone(
-                __import__("zoneinfo").ZoneInfo("America/New_York")).replace(tzinfo=None)
-            print(f"NY now, per system tz (EST/EDT, cross-check only): {ny_true}")
-            drift = abs((to_ny(tick.time) - ny_true).total_seconds())
-            print(f"agreement, −7h rule vs system tz: {drift:.0f} s"
+        ts = field(tick, "time", None) if tick is not None else None
+        if not ts:
+            findings.problem(
+                "symbol_info_tick() gave no timestamp — the broker clock could not "
+                "be measured, which is the one check the CSV cannot substitute for"
+            )
+            return
+        state["now_broker"] = int(ts)
+        now_utc = _time.time()
+        off = measure_offset_hours(int(ts), now_utc)
+        print(f"last tick, broker stamp     : {decode_broker_label(ts)} (raw broker label)")
+        print(f"true UTC now (system clock) : "
+              f"{datetime.fromtimestamp(now_utc, timezone.utc).replace(tzinfo=None)}")
+        print(f"measured broker - UTC       : {off:+.2f} h   (expect +2.00 winter / +3.00 summer)")
+        print(f"NY now, per TRD 4.1.1 (-7h) : {to_ny(ts)}")
+        try:
+            from zoneinfo import ZoneInfo
+            ny_true = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York")).replace(tzinfo=None)
+            drift = abs((to_ny(ts) - ny_true).total_seconds())
+            print(f"NY now, per system tz       : {ny_true}   (EST/EDT cross-check only)")
+            print(f"agreement, -7h rule vs system tz: {drift:.0f} s"
                   f"{'  OK' if drift < 120 else '  <-- ESCALATE: they disagree'}")
             if drift >= 120:
-                problems.append(
-                    f"constant −7h gives NY {to_ny(tick.time)} but the system's own "
+                findings.problem(
+                    f"constant -7h gives NY {to_ny(ts)} but the system's own "
                     f"America/New_York says {ny_true} ({drift:.0f}s apart)"
                 )
-            if not (1.5 <= off <= 3.5):
-                problems.append(f"measured broker−UTC offset {off:+.2f}h is outside 2–3h; "
-                                "the NY+7 model does not hold on this feed")
+        except Exception as exc:  # zoneinfo/tzdata missing is not fatal
+            findings.note(f"system-timezone cross-check skipped: {type(exc).__name__}: {exc}")
+        if not (1.5 <= off <= 3.5):
+            findings.problem(
+                f"measured broker-UTC offset {off:+.2f}h is outside 2-3h; the NY+7 "
+                f"model does not hold on this feed"
+            )
+        else:
+            print(f"NY+7 model                  : CONSISTENT with a US-DST broker")
 
-        # ---- bars ----------------------------------------------------------
+    # ---- 4. bars ---------------------------------------------------------
+    @section("M1 bars", findings)
+    def read_rates():
         rates = mt5.copy_rates_from_pos(args.symbol, mt5.TIMEFRAME_M1, 0, args.bars)
         if rates is None or len(rates) == 0:
-            print(f"\nFATAL: copy_rates_from_pos returned nothing "
-                  f"(last_error={mt5.last_error()}). ESCALATE.")
-            return 1
-
-        print("\n--- M1 bars ---")
+            findings.problem(
+                f"copy_rates_from_pos returned nothing (last_error={mt5.last_error()})"
+            )
+            return
+        state["rates"] = rates
         print(f"rows returned               : {len(rates)}")
-        print(f"dtype names                 : {rates.dtype.names}")
-        print(f"first row                   : {tuple(rates[0])}")
-        print(f"last row                    : {tuple(rates[-1])}")
-        time_is_int = all(isinstance(int(b["time"]), int) for b in rates[:50])
-        print(f"`time` is an integer epoch  : {time_is_int}")
+        print(f"dtype names                 : {field(getattr(rates, 'dtype', None), 'names')}")
+        try:
+            print(f"first row                   : {tuple(rates[0])}")
+            print(f"last row                    : {tuple(rates[-1])}")
+        except Exception as exc:
+            findings.note(f"row dump skipped: {type(exc).__name__}: {exc}")
 
-        bar_times = [int(b["time"]) for b in rates]
+        bar_times = rate_times(rates)
+        if not bar_times:
+            findings.problem("could not extract a 'time' column from the rates array")
+            return
+        state["bar_times"] = bar_times
+        print(f"`time` is an integer epoch  : "
+              f"{all(isinstance(t, int) for t in bar_times[:50])}")
+        print(f"first / last bar (broker)   : {decode_broker_label(bar_times[0])} / "
+              f"{decode_broker_label(bar_times[-1])}")
+
         gaps = [(a, b) for a, b in zip(bar_times, bar_times[1:]) if b - a > 60]
         print(f"gaps between consecutive M1 : {len(gaps)}"
-              + (f" (largest {max(b - a for a, b in gaps)}s)" if gaps else ""))
+              + (f" (largest {(max(b - a for a, b in gaps)) // 60} min)" if gaps else ""))
         for a, b in gaps[-3:]:
             print(f"    {decode_broker_label(a)} -> {decode_broker_label(b)}  "
                   f"({(b - a) // 60} min)")
 
-        fi = forming_bar_index(bar_times, now_broker)
-        print(f"newest bar still forming?   : "
-              f"{'YES — index ' + str(fi) + ', must be dropped' if fi is not None else 'no'}")
-        if fi is not None:
-            print("    NOTE: the CSV never contained a forming bar. The live adapter")
-            print("          must exclude it or Candle A/B can be built from an")
-            print("          unfinished candle. This is a CSV→live difference, logged.")
+        now_broker = state.get("now_broker")
+        if now_broker is None:
+            findings.note("forming-bar check skipped: the broker clock was not measured")
+        else:
+            fi = forming_bar_index(bar_times, now_broker)
+            print(f"newest bar still forming?   : "
+                  f"{'YES — index ' + str(fi) + ', must be dropped' if fi is not None else 'no'}")
+            if fi is not None:
+                print("    NOTE: the CSV never contained a forming bar. The live adapter")
+                print("          must exclude it or Candle A/B can be built from an")
+                print("          unfinished candle. This is a CSV->live difference, logged.")
 
+    # ---- 5. invariants on live bars --------------------------------------
+    @section("session invariants on live bars", findings)
+    def check_invariants():
+        bar_times = state.get("bar_times")
+        if not bar_times:
+            findings.note("invariant check skipped: no bars were read")
+            return
         ny_times = [to_ny(t) for t in bar_times]
-        print(f"NY range (constant −7h)     : {ny_times[0]} -> {ny_times[-1]}")
-        print("\n--- session invariants on live bars ---")
+        print(f"NY range (constant -7h)     : {ny_times[0]} -> {ny_times[-1]}")
+        print("")
         for name, ok, detail in session_invariants(ny_times):
             print(f"  [{'PASS' if ok else 'FAIL'}] {name:<36} {detail}")
             if not ok:
-                problems.append(f"live invariant failed: {name} ({detail})")
+                findings.problem(f"live invariant failed: {name} ({detail})")
 
-        print("\n--- weekday coverage in this window ---")
         seen: dict[str, int] = {}
         for t in ny_times:
             seen[t.strftime("%a")] = seen.get(t.strftime("%a"), 0) + 1
-        print("  " + "  ".join(f"{k}:{v}" for k, v in sorted(seen.items())))
-    finally:
-        mt5.shutdown()
+        print("\nweekday coverage in this window: "
+              + "  ".join(f"{k}:{v}" for k, v in sorted(seen.items())))
 
+    for fn in (read_environment, read_symbol, read_clock, read_rates, check_invariants):
+        fn()
+
+    try:
+        mt5.shutdown()
+    except Exception as exc:  # pragma: no cover
+        findings.note(f"shutdown() raised {type(exc).__name__}: {exc}")
+
+    # ---- verdict ---------------------------------------------------------
     print("\n" + "=" * 96)
-    if problems:
-        print("RESULT: ESCALATE — the live feed is not what Phase 1 assumed:")
-        for p in problems:
+    if findings.notes:
+        print("NOTES (cosmetic, not escalations):")
+        for n in findings.notes:
+            print(f"  - {n}")
+    if findings.problems:
+        print("\nRESULT: ESCALATE — the live feed is not what Phase 1 assumed:")
+        for p in findings.problems:
             print(f"  • {p}")
         print("Send this output back before any Phase 2 code is written against it.")
         return 1
-    print("RESULT: all live checks passed. Phase 2 may be built against these facts.")
+    print("\nRESULT: all live checks passed. Phase 2 may be built against these facts.")
     return 0
 
 
