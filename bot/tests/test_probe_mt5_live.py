@@ -197,10 +197,10 @@ class FakeMT5:
         return self._rates
 
 
-def run_probe(mt5, *args):
+def run_probe(mt5, *args, now_fn=None):
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        code = probe.main(list(args), mt5_module=mt5)
+        code = probe.main(list(args), mt5_module=mt5, now_fn=now_fn)
     return code, buf.getvalue()
 
 
@@ -385,7 +385,13 @@ class TestProbeVerdicts(unittest.TestCase):
         code, out = run_probe(FakeMT5(tick_stamp=0))
         self.assertEqual(code, 1)
         self.assertIn("could not be measured", out)
-        self.assertIn("forming-bar check skipped", out)
+
+    def test_forming_bar_check_does_not_need_the_tick(self):
+        """Forming-bar detection runs off the system clock, so a missing tick
+        must not disable it (it used to: the check was skipped entirely)."""
+        code, out = run_probe(FakeMT5(tick_stamp=0))
+        self.assertIn("newest bar still forming?", out)
+        self.assertNotIn("forming-bar check skipped", out)
 
     def test_impossible_offset_escalates(self):
         """A feed that is not UTC+2/+3 breaks the NY+7 model outright."""
@@ -407,6 +413,123 @@ class TestProbeVerdicts(unittest.TestCase):
         fake = FakeMT5()
         run_probe(fake)
         self.assertTrue(fake.shutdown_called)
+
+
+class TestStalenessGuard(unittest.TestCase):
+    """TRD §4.1.1 rule 5: a stale tick measures the closure, not the offset.
+
+    This is the second live-run regression. The probe was run on a Sunday with
+    the venue shut since Friday 16:59 NY; it diffed the 43-hour-old Friday tick
+    against the current clock and reported a −43h "broker offset" as an
+    ESCALATE. It was a measurement error, not a feed defect.
+    """
+
+    #: Sunday 2026-10-25 16:54 UTC — the actual second-run moment.
+    SUNDAY_NOW = datetime(2026, 10, 25, 16, 54, tzinfo=timezone.utc).timestamp()
+
+    def _stale_tick(self):
+        """The Friday 16:59 NY close, as a broker label (23:59 broker)."""
+        return broker_stamp_for_ny(2026, 10, 23, 16, 59)
+
+    def test_a_weekend_tick_is_not_scored_as_a_timezone_defect(self):
+        mt5 = FakeMT5(tick_stamp=self._stale_tick())
+        code, out = run_probe(mt5, now_fn=lambda: self.SUNDAY_NOW)
+        self.assertEqual(code, 0, out)                 # no false ESCALATE
+        self.assertNotIn("ESCALATE", out)
+        self.assertIn("market closed — cannot measure live offset", out)
+        self.assertIn("last tick is 4", out)           # ~43h, formatted
+        self.assertNotIn("measured broker - UTC", out) # no bogus number emitted
+        self.assertNotIn("CONSISTENT with a US-DST broker", out)
+
+    def test_stale_tick_records_a_note_not_a_problem(self):
+        code, out = run_probe(FakeMT5(tick_stamp=self._stale_tick()),
+                              now_fn=lambda: self.SUNDAY_NOW)
+        self.assertEqual(code, 0)
+        self.assertIn("live broker offset NOT measured", out)
+        self.assertIn("re-run while the market is open", out)
+
+    def test_stale_tick_during_open_hours_warns_about_liveness(self):
+        """Same staleness, but the calendar says the venue should be trading:
+        that is a feed problem, and the probe says so without silently
+        escalating on the timezone."""
+        monday_open = datetime(2026, 10, 26, 15, 0, tzinfo=timezone.utc).timestamp()
+        code, out = run_probe(FakeMT5(tick_stamp=self._stale_tick()),
+                              now_fn=lambda: monday_open)
+        self.assertEqual(code, 0)
+        self.assertIn("market closed — cannot measure live offset", out)
+        self.assertIn("SHOULD be open", out)
+        self.assertIn("feed-liveness", out)
+
+    def test_a_fresh_tick_still_measures_the_offset(self):
+        now = datetime(2026, 10, 26, 15, 0, tzinfo=timezone.utc).timestamp()
+        fresh = broker_stamp_for_ny(2026, 10, 26, 10, 59)   # 11:00 NY, market open
+        code, out = run_probe(FakeMT5(tick_stamp=fresh), now_fn=lambda: now)
+        self.assertEqual(code, 0, out)
+        self.assertIn("measured broker - UTC", out)
+        self.assertIn("-> fresh", out)
+        self.assertIn("CONSISTENT with a US-DST broker", out)
+
+    def test_age_is_measured_in_the_most_generous_direction(self):
+        """Taking UTC+3 as the broker offset gives the smallest possible age, so
+        a tick is only ever called stale when it is stale under every reading."""
+        now = 1_780_000_000.0
+        # A tick 130s old under UTC+3 (+3h) is 3730s old under UTC+2.
+        fresh_under_plus3 = int(now - 130 + 3 * 3600)
+        self.assertAlmostEqual(probe.tick_age_seconds(fresh_under_plus3, now), 130.0)
+        self.assertGreater(probe.tick_age_seconds(fresh_under_plus3, now), 120)  # stale
+        just_fresh = int(now - 60 + 3 * 3600)
+        self.assertLessEqual(probe.tick_age_seconds(just_fresh, now), 120)
+
+    def test_forming_bar_uses_the_system_clock_not_the_frozen_tick(self):
+        """The contaminated finding. On a closed market the last tick is the
+        closing tick; using it as "now" makes the final bar look unfinished and
+        the adapter would wrongly believe every session ends mid-bar."""
+        mt5 = FakeMT5(tick_stamp=self._stale_tick())
+        code, out = run_probe(mt5, now_fn=lambda: self.SUNDAY_NOW)
+        self.assertEqual(code, 0, out)
+        self.assertIn("newest bar still forming?   : no", out)
+
+
+class TestVenueOpenAt(unittest.TestCase):
+    """The session calendar used only to explain a stale tick."""
+
+    def test_saturday_is_closed(self):
+        self.assertFalse(probe.venue_open_at(datetime(2026, 10, 24, 12, 0))[0])
+
+    def test_sunday_before_1800_is_closed(self):
+        self.assertFalse(probe.venue_open_at(datetime(2026, 10, 25, 17, 59))[0])
+
+    def test_sunday_after_1800_is_open(self):
+        self.assertTrue(probe.venue_open_at(datetime(2026, 10, 25, 18, 0))[0])
+
+    def test_monday_midday_is_open(self):
+        self.assertTrue(probe.venue_open_at(datetime(2026, 10, 26, 12, 0))[0])
+
+    def test_daily_break_is_closed(self):
+        self.assertFalse(probe.venue_open_at(datetime(2026, 10, 26, 17, 30))[0])
+
+    def test_friday_after_close_is_closed(self):
+        self.assertFalse(probe.venue_open_at(datetime(2026, 10, 23, 17, 0))[0])
+        self.assertTrue(probe.venue_open_at(datetime(2026, 10, 23, 16, 59))[0])
+
+    def test_reason_string_is_always_populated(self):
+        for spec in ((2026, 10, 24, 12, 0), (2026, 10, 26, 17, 30), (2026, 10, 26, 9, 0)):
+            self.assertTrue(probe.venue_open_at(datetime(*spec))[1])
+
+
+class TestEnvironmentSection(unittest.TestCase):
+    """Windows has no IANA tz database; Phase 2 cannot start without one."""
+
+    def test_environment_section_is_reported(self):
+        code, out = run_probe(FakeMT5())
+        self.assertIn("--- python environment ---", out)
+        self.assertIn("zoneinfo", out)
+        self.assertEqual(code, 0, out)
+
+    def test_environment_runs_before_the_terminal_is_touched(self):
+        code, out = run_probe(FakeMT5())
+        self.assertLess(out.index("python environment"),
+                        out.index("terminal and account"))
 
 
 class TestNoOrderSurface(unittest.TestCase):

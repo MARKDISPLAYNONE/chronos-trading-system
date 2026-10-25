@@ -10,5 +10,23 @@
 #     # or, if pytest is installed:
 #     cd bot && python3 -m pytest tests -q
 #
-# Everything below is free / open-source. No paid services are required.
+# ---------------------------------------------------------------------------
+# Phase 2 (live dry-run) — Windows
+# ---------------------------------------------------------------------------
+# Strategy code needs an IANA timezone database: window localisation, the
+# DST guards, and the system-clock -> New York conversion all use `zoneinfo`.
+# Linux/macOS read it from the OS; **Windows ships none**, so `zoneinfo` raises
+# there unless this free package is installed. `mt5_live_source.ensure_environment()`
+# checks for it at startup and fails with an actionable message rather than a
+# traceback.
+tzdata>=2024.1  # IANA timezone database (free, PyPI)
+
+# MT5 Python package. Windows-only, installed with the terminal's own Python or
+# via `pip install MetaTrader5`. Listed here as documentation of the dependency;
+# the engine never imports it — only the Phase 2 runner's source adapter does.
+# MetaTrader5>=5.0.45
+
+# ---------------------------------------------------------------------------
+# Development
+# ---------------------------------------------------------------------------
 pytest>=8.0  # test runner only; not imported by the bot engine

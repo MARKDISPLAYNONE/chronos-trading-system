@@ -44,6 +44,20 @@ make that class of bug impossible to repeat:
 A section that raises is still reported as an escalation — the point is that the
 rest of the evidence is collected first.
 
+STALENESS (fixed after the second live run)
+-------------------------------------------
+The second run was done on a Sunday, with the venue shut since Friday 16:59 NY.
+It compared a 43-hour-old Friday tick against the current clock and reported a
+43-hour "broker offset" as an escalation. That was a measurement error, not a
+feed defect: a closed market's last tick is the *closing* tick, so the
+difference measures the closure duration (TRD §4.1.1 rule 5). The offset is now
+only reported when the tick is younger than `config.STALE_TICK_SECONDS`;
+otherwise the probe prints "market closed — cannot measure live offset" and
+escalates nothing. The current broker time used for forming-bar detection is
+likewise taken from the system clock, never from that frozen tick — otherwise
+every bar on a closed market looks unfinished, which is exactly the wrong
+conclusion to hand an adapter that must drop forming bars.
+
 SAFETY
 ------
 This script only reads. It calls `initialize`, `terminal_info`, `account_info`,
@@ -69,6 +83,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -77,6 +92,11 @@ from pathlib import Path
 # disagreement is the bug.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src import config  # noqa: E402
+
+#: The broker runs UTC+2 in northern winter and UTC+3 in northern summer. The
+#: *generous* end (+3h) is used when judging tick staleness, so a tick is only
+#: called stale when it is stale under every assumption.
+MAX_BROKER_UTC_OFFSET_HOURS = 3
 
 DAILY_BREAK_HOUR = 17          # 17:00-18:00 NY, Mon-Thu (TRD §4.1.1)
 FRIDAY_CLOSE = "16:59"         # last M1 bar of the week
@@ -150,6 +170,66 @@ def forming_bar_index(bar_times: list[int], now_broker: int) -> int | None:
     if not bar_times:
         return None
     return len(bar_times) - 1 if bar_times[-1] + 60 > now_broker else None
+
+
+def tick_age_seconds(tick_epoch: int, now_utc_stamp: float) -> float:
+    """How old the last tick is, in real seconds — without knowing the offset.
+
+    `symbol_info_tick().time` is a broker wall clock stamped on the last
+    trade/quote, and the broker runs UTC+2 (winter) or UTC+3 (summer). We cannot
+    subtract an offset we are still trying to measure, so we take the **most
+    generous** candidate (+3h gives the freshest possible reading of the tick)
+    and report age on that basis. If even that reading is stale, the tick is
+    stale under every assumption — which is the only conclusion needed here.
+    """
+    freshest_possible_utc = tick_epoch - MAX_BROKER_UTC_OFFSET_HOURS * 3600
+    return now_utc_stamp - freshest_possible_utc
+
+
+def venue_open_at(ny_now: datetime) -> tuple[bool, str]:
+    """Is the venue trading at this New York wall-clock instant?
+
+    Derived from the session invariants in TRD §4.1.1: Sunday open 18:00,
+    Mon-Thu with a 17:00-18:00 maintenance break, Friday close 16:59, shut at
+    weekends. Exchange holidays are **not** modelled here (they are not in the
+    data we have), so this can say "open" on a holiday — it is used only to
+    explain a stale tick, never to decide that a window should have traded.
+    """
+    wd, hm = ny_now.weekday(), ny_now.strftime("%H:%M")
+    if wd == 5:
+        return False, "Saturday — weekend closure"
+    if wd == 6:
+        if hm < "18:00":
+            return False, f"Sunday {hm} NY — before the 18:00 NY open"
+        return True, "Sunday after the 18:00 NY open"
+    if hm < "17:00":
+        return True, f"{ny_now.strftime('%A')} {hm} NY — session open"
+    if hm < "18:00":
+        return False, f"{ny_now.strftime('%A')} {hm} NY — daily 17:00-18:00 maintenance break"
+    if wd == 4:
+        return False, f"Friday {hm} NY — after the 16:59 NY close"
+    return True, f"{ny_now.strftime('%A')} {hm} NY — session open"
+
+
+def broker_now_from_system_clock(now_utc_stamp: float | None = None) -> datetime:
+    """The broker's *current* wall clock, from this machine's clock.
+
+    Deliberately NOT derived from the last tick: on a closed market that stamp
+    is frozen at the close, and treating it as "now" makes every bar look
+    unfinished. New York wall clock comes from the system tz database, and
+    broker = NY + 7h (TRD §4.1.1).
+    """
+    if now_utc_stamp is None:
+        now_utc_stamp = time.time()
+    utc_now = datetime.fromtimestamp(now_utc_stamp, timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        ny_now = utc_now.astimezone(ZoneInfo(config.NY_TZ)).replace(tzinfo=None)
+    except Exception:
+        # No tzdata: fall back to the latest known US rule rather than guessing
+        # a different offset. Reported as a note by the caller.
+        ny_now = utc_now.replace(tzinfo=None) - timedelta(hours=4)
+    return ny_now + timedelta(hours=config.BROKER_OFFSET_HOURS)
 
 
 def session_invariants(ny_times: list[datetime]) -> list[tuple[str, bool, str]]:
@@ -251,11 +331,13 @@ def section(title: str, findings: Findings):
 # ---------------------------------------------------------------------------
 # Sections (all MT5 access lives here)
 # ---------------------------------------------------------------------------
-def main(argv: list[str] | None = None, mt5_module=None) -> int:
+def main(argv: list[str] | None = None, mt5_module=None, now_fn=None) -> int:
     ap = argparse.ArgumentParser(description="Read-only MT5 probe for Phase 2")
     ap.add_argument("--symbol", default=config.INSTRUMENT_SYMBOL)
     ap.add_argument("--bars", type=int, default=3000, help="how many M1 bars to pull")
     args = ap.parse_args(argv)
+    if now_fn is None:
+        now_fn = time.time
 
     if mt5_module is not None:
         mt5 = mt5_module            # injected by the tests
@@ -281,6 +363,39 @@ def main(argv: list[str] | None = None, mt5_module=None) -> int:
         return 1
 
     state: dict = {}
+
+    # ---- 0. python environment ------------------------------------------
+    @section("python environment", findings)
+    def read_environment_python():
+        import platform
+
+        print(f"python                      : {platform.python_version()} "
+              f"({platform.system()} {platform.machine()})")
+        try:
+            from zoneinfo import ZoneInfo
+
+            ny = ZoneInfo(config.NY_TZ)
+            utc = ZoneInfo(config.UTC_TZ)
+            print(f"zoneinfo                    : OK  ({config.NY_TZ!r}, "
+                  f"{config.UTC_TZ!r} resolved; NY key {ny.key})")
+            del utc
+        except Exception as exc:
+            print(f"zoneinfo                    : MISSING -> {type(exc).__name__}: {exc}")
+            findings.problem(
+                "this machine has no IANA timezone database, so Phase 2 cannot "
+                "run: window localisation and the clock conversion both need it. "
+                "Windows ships none — install the free package with "
+                "`pip install tzdata`, then re-run."
+            )
+            return
+        try:
+            from importlib.metadata import version
+
+            print(f"tzdata package              : {version('tzdata')}")
+        except Exception:
+            print("tzdata package              : not installed as a package "
+                  "(using the OS database) — fine on Linux/macOS, "
+                  "NOT fine on Windows")
 
     # ---- 1. terminal + account ------------------------------------------
     @section("terminal and account", findings)
@@ -375,7 +490,17 @@ def main(argv: list[str] | None = None, mt5_module=None) -> int:
     # ---- 3. clock: measured, not inferred --------------------------------
     @section("clock (the load-bearing assumption)", findings)
     def read_clock():
-        import time as _time
+        now_utc = now_fn()
+        # The *current* broker time always comes from the system clock, never
+        # from the last tick: on a closed market the tick is frozen at the close
+        # and would make every bar look unfinished (TRD §4.1.1 rule 5).
+        broker_now = broker_now_from_system_clock(now_utc)
+        state["now_broker"] = int(calendar.timegm(broker_now.timetuple()))
+        ny_now = to_ny(state["now_broker"])
+        is_open, open_reason = venue_open_at(ny_now)
+        state["venue_open"] = is_open
+        print(f"system clock -> NY          : {ny_now}   ({open_reason})")
+
         tick = mt5.symbol_info_tick(args.symbol)
         ts = field(tick, "time", None) if tick is not None else None
         if not ts:
@@ -384,8 +509,37 @@ def main(argv: list[str] | None = None, mt5_module=None) -> int:
                 "be measured, which is the one check the CSV cannot substitute for"
             )
             return
-        state["now_broker"] = int(ts)
-        now_utc = _time.time()
+
+        age = tick_age_seconds(int(ts), now_utc)
+        age_h = age / 3600.0
+        print(f"last tick, broker stamp     : {decode_broker_label(ts)} (raw broker label)")
+
+        # ---- staleness guard -------------------------------------------------
+        # A closed market's last tick is the CLOSING tick, so `tick - now` is the
+        # closure duration, not a UTC offset. Scoring that as a timezone defect
+        # produced a false ESCALATE on a Sunday run (43h "offset"). Measured in
+        # the most generous direction: if it is stale even assuming UTC+3, it is
+        # stale, full stop.
+        if age > config.STALE_TICK_SECONDS:
+            print(f"tick age                    : {age_h:.1f} h  -> STALE "
+                  f"(> {config.STALE_TICK_SECONDS} s)")
+            print("")
+            print(f"  market closed — cannot measure live offset, last tick is {age_h:.1f}h old")
+            print("")
+            if is_open:
+                print("  NOTE: the session calendar says the venue SHOULD be open now.")
+                print("        A tick this cold during trading hours is a feed-liveness")
+                print("        problem, not a timezone one. Re-run before escalating.")
+            findings.note(
+                f"live broker offset NOT measured: last tick is {age_h:.1f}h old "
+                f"({open_reason}). A stale tick measures how long the venue has been "
+                f"shut, not the broker's UTC offset (TRD 4.1.1 rule 5). The offset is "
+                f"still only confirmed against historical data; re-run while the "
+                f"market is open for a genuine live confirmation."
+            )
+            return
+
+        print(f"tick age                    : {age:.0f} s  -> fresh")
         off = measure_offset_hours(int(ts), now_utc)
         print(f"last tick, broker stamp     : {decode_broker_label(ts)} (raw broker label)")
         print(f"true UTC now (system clock) : "
@@ -394,7 +548,10 @@ def main(argv: list[str] | None = None, mt5_module=None) -> int:
         print(f"NY now, per TRD 4.1.1 (-7h) : {to_ny(ts)}")
         try:
             from zoneinfo import ZoneInfo
-            ny_true = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York")).replace(tzinfo=None)
+            # Same clock as everything else in the probe (injectable, so the
+            # comparison is testable), never a second, independent `now`.
+            ny_true = (datetime.fromtimestamp(now_utc, timezone.utc)
+                       .astimezone(ZoneInfo("America/New_York")).replace(tzinfo=None))
             drift = abs((to_ny(ts) - ny_true).total_seconds())
             print(f"NY now, per system tz       : {ny_true}   (EST/EDT cross-check only)")
             print(f"agreement, -7h rule vs system tz: {drift:.0f} s"
@@ -482,7 +639,8 @@ def main(argv: list[str] | None = None, mt5_module=None) -> int:
         print("\nweekday coverage in this window: "
               + "  ".join(f"{k}:{v}" for k, v in sorted(seen.items())))
 
-    for fn in (read_environment, read_symbol, read_clock, read_rates, check_invariants):
+    for fn in (read_environment_python, read_environment, read_symbol,
+               read_clock, read_rates, check_invariants):
         fn()
 
     try:

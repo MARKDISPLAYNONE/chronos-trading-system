@@ -154,7 +154,7 @@ part that makes the numbers trustworthy — do the same on any re-run):
 ## 8. What's NOT Done
 
 - **No live bot, no dashboard, no Supabase.** Phase 1 is historical replay only; `mt5_client`, `supabase_client`, `order_executor`, `trade_manager`, `main.py` and everything under `dashboard/` are later phases (Steps 8–16).
-- **Phase 2 is not built yet.** No `mt5_live_source`, no runner, no live DST monitor. Phase 2 is scoped but blocked on the live probe output (§15.4).
+- **Phase 2 is partly built.** `mt5_live_source.py` is done and offline-tested (§15.7). Still missing: the runner, the live DST monitor, the CSV emitter — blocked on Q13/Q14 (§15.4).
 - **DST coverage gap (narrowed, see §15.2):** the dataset ends 2026-10-22, so the
   **March 8 spring-forward** is exercised but the **November 1 fall-back** is not.
   Phase 2's live monitor is now the instrument intended to close this, and it is
@@ -178,9 +178,11 @@ part that makes the numbers trustworthy — do the same on any re-run):
    logged as `dry_run_gap_runner_down` and the run resumes forward-only.
    **Next action:** run the live probe (below) and return its output before the
    runner is built against the live API.
-2. 🔴 **Agent — build Phase 2** (`mt5_live_source`, the dry-run runner, the live
-   DST monitor, the structural no-order test) once the probe output is in hand.
-   Not started: see §15.4 for the two questions that need a ruling first.
+2. 🟡 **Agent — Phase 2 build, in progress.** ✅ `mt5_live_source.py` (adapter,
+   §15.7). ⏳ still to build: `dry_run_runner.py`, `dst_monitor.py`, the CSV row
+   emitter — blocked on Q13/Q14 (§15.4), which decide when a row may be written
+   and what a crash gap means.
+   **Live offset still unconfirmed** — needs a market-open probe run (§15.8).
 4. ✅ **DONE — tick-grid quantization applied** (Senior Dev instructed).
    `Decimal` throughout, post-calculation pessimistic snap, `raw_*` audit
    columns, PRD §6.7 + TRD §4.1.2, 128 tests. Any Phase 2 order path must reuse
@@ -332,6 +334,37 @@ at fault, not the feed. Rebuilt it so optional fields cannot raise and each
 section is isolated (§15.6), with 18 new tests that inject a fake terminal
 shaped like the real one. **Still needed from the Handler: a re-run**, to collect
 the rates dtype/epoch, forming-bar and offset-measurement sections.
+
+**Session 12, follow-up 2 (false ESCALATE + live source):** the Handler re-ran the
+probe on **Sunday 25 Oct**, market shut since Friday 16:59 NY. It reported a ~43h
+"broker offset" and escalated; that was the probe measuring weekend closure, not a
+timezone defect — confirmed by the four session invariants passing on the same
+run's bars, and by the calendar (this session's date is a Sunday).
+- **Fixed as TRD §4.1.1 rule 5 (new):** a stale tick is not a clock sample. The
+  offset is reported only when the tick is younger than `STALE_TICK_SECONDS`;
+  otherwise the probe prints `market closed — cannot measure live offset, last
+  tick is Xh old` and escalates nothing. TRD §4.1.1 needed no other change.
+- **Corrected an accepted finding.** "Newest bar still forming, must be dropped"
+  was an artefact of the *same* frozen tick: with the tick as "now", Friday's
+  closing bar looks unfinished forever. Current broker time is now derived from
+  the system clock (`America/New_York` + 7h) everywhere, including forming-bar
+  detection. Excluding forming bars is still correct — it rests on the API
+  contract — but the evidence behind it was contaminated, and that is now stated.
+- **Built `bot/src/mt5_live_source.py`** (§15.7): same `(BarSeries, LoadReport)`
+  contract as the CSV adapter, reusing `to_ny_wall`/`check_session_invariants`
+  rather than re-deriving them; drops forming bars with a one-sided safety margin;
+  rejects bad bars instead of repairing them; merges repeat poll rows; bounds
+  memory; refuses a non-demo account and a wrong tick size; gates on the four
+  session invariants. Phase 1 modules untouched — proven by an integration test
+  that runs a fake live feed into the real `evaluate_window` and gets a complete
+  PREMIUM → SHORT → partial → TP trade.
+- **Windows `tzdata` risk found and handled:** Windows ships no IANA database, so
+  `zoneinfo` raises and Phase 2 cannot start. Added to `requirements.txt`, checked
+  at startup with an actionable message, and reported by the probe's new
+  environment section (which runs before the terminal is touched).
+- **Tests: 161 → 219.**
+- **Still open:** live offset confirmation (needs a market-open run — must not be
+  described as "verified live" until then), Q13/Q14, and the runner itself.
 
 ---
 
@@ -722,4 +755,93 @@ injects a fake MT5 module shaped like the real terminal (no `session_quotes`) an
 asserts the probe still reaches the offset measurement and exits 0. There is a
 second test where an *entire section* raises and the following sections still
 run. Suite is now **161 tests**.
+
+### 15.7 Phase 2 progress: the live source adapter (built, tested offline)
+
+`bot/src/mt5_live_source.py` exists and is offline-tested. It is the live
+counterpart of `m1_csv_source.py` and deliberately exposes the same contract:
+
+| | Phase 1 (CSV) | Phase 2 (live) |
+|---|---|---|
+| Entry point | `load_bars(path)` | `load_history(mt5, symbol)` |
+| Returns | `(BarSeries, LoadReport)` | `(BarSeries, LoadReport)` |
+| Streaming | n/a (whole file) | `LiveBarSource.refresh()` |
+| Timestamp | `detect_convention()` then `to_ny_wall` | `epoch_to_label` then the **same** `to_ny_wall(..., "broker")` |
+| Gate | `check_session_invariants` | the **same** function |
+
+Downstream modules (`window_evaluator`, `candle_tracker`, `context_classifier`,
+`sweep_detector`, `trade_calculator`, `trade_simulator`) are untouched: they
+receive a `BarSeries` and cannot tell which feed produced it. An integration test
+runs a synthetic live feed through `LiveBarSource` into the real
+`evaluate_window` and asserts a complete PREMIUM → SHORT → partial → TP trade, so
+"the Phase 1 logic is reused" is a test result, not a claim.
+
+#### The three things the CSV never taught us
+
+1. **A forming bar exists.** `copy_rates_from_pos` returns the current,
+   unfinished minute. It is dropped, and the drop is counted
+   (`RefreshReport.forming_bars_dropped`) rather than silently ignored. A bar is
+   accepted only once `stamp + 60 + FORMING_BAR_SAFETY_SECONDS <= broker now`,
+   and the margin is one-sided: bars may be accepted late, never early.
+2. **"Now" is not the last tick.** Current broker time comes from the system
+   clock through `America/New_York` + 7h. Using the tick would freeze "now" at
+   the Friday close all weekend and make every bar look unfinished. This is the
+   same trap that produced the false ESCALATE (§15.8).
+3. **Polls repeat bars.** Every poll re-reads a trailing window, so bars are
+   merged by timestamp and the repeat count is reported.
+
+Bad data is **rejected, never repaired**: an off-tick or OHLC-invalid bar is
+dropped and counted, and the minute simply stays missing, which the evaluator
+already handles as incomplete data. The `check_session_invariants` gate runs on
+first build and refuses a feed whose clock cannot be trusted. Two of its four
+checks are boundary checks (a Friday close, a Sunday open) that a short trailing
+window cannot satisfy; those two are enforced only when the sample contains such
+a day, the other two always.
+
+#### Windows needs `tzdata`
+
+Strategy code needs an IANA timezone database and **Windows ships none**, so
+`zoneinfo` raises there unless the free `tzdata` package is installed. This is
+now in `bot/requirements.txt`, checked at startup by `ensure_environment()`
+(actionable error, not a traceback), and reported by the probe's new "python
+environment" section — which runs *before* the terminal is touched. If the probe
+reports `zoneinfo : MISSING`, install tzdata before anything else.
+
+#### Still not built, still deliberately
+
+`dry_run_runner.py` (the loop), `dst_monitor.py`, and the CSV row emitter. Q13
+and Q14 in §15.4 are unresolved and change the runner's shape, so building it
+now would mean guessing.
+
+### 15.8 Second live run — the false ESCALATE, and what it taught
+
+The probe was re-run on **Sunday 2026-10-25**, with the venue shut since Friday
+16:59 NY. It reported a ≈43-hour "broker offset" and escalated. **That was a
+measurement error in the probe, not a feed defect.** A closed market's last tick
+is the *closing* tick, so `tick.time − time.time()` measures how long the venue
+has been shut. The four session invariants passed on the same run's bar data,
+which is the independent evidence that the −7h rule was never in question.
+
+Fixed as TRD §4.1.1 rule 5:
+
+- the offset is only reported when the tick is younger than
+  `config.STALE_TICK_SECONDS`; otherwise the probe prints
+  `market closed — cannot measure live offset, last tick is Xh old` and escalates
+  nothing;
+- if the session calendar says the venue *should* be open, the same staleness is
+  flagged as a feed-liveness problem for a human to look at — but still not as a
+  timezone defect;
+- **the current broker time used for forming-bar detection no longer comes from
+  the tick at all.** This corrects a finding from the same run that had been
+  accepted: "the newest bar is still forming, must be dropped" was an artefact of
+  the frozen tick, not a property of the feed. On a closed market the last bar is
+  simply the last bar. The conclusion "exclude forming bars" is still right — it
+  stands on the API contract, not on that observation — but the evidence for it
+  was contaminated, and the adapter now derives "now" from the system clock.
+
+Status of the offset: **confirmed against 287,746 historical bars, NOT yet
+confirmed live.** A genuine live confirmation needs a run while the market is
+open (Monday during NY hours). Until then no report may describe it as
+"verified live". The suite pins all of this: a Sunday fake terminal must produce
+exit 0 with no offset number, and a Monday-mid-session fake must produce one.
 

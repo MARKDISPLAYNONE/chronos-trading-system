@@ -185,6 +185,17 @@ verification on demand, against a live terminal or an exported CSV.
 4. **Any new data source must pass the same invariant gate before use.** A feed
    that stores true UTC would need an explicit, different adapter — never a
    silent reinterpretation of the existing one.
+5. **A stale tick is not a clock sample.** `symbol_info_tick().time` is the
+   broker's stamp on the *last trade/quote*, not the broker's current time. When
+   the venue is closed it stops advancing, so subtracting it from `time.time()`
+   measures the **closure duration**, not the broker's UTC offset. Any code that
+   derives an offset from a tick must first establish that the tick is fresh
+   (a couple of minutes at most); otherwise it must report "cannot measure" and
+   say why. The same trap applies to the *current* broker time used for
+   forming-bar detection: derive it from the system clock through
+   `America/New_York` + 7h, never from the last tick, or every bar on a closed
+   market looks unfinished. Detected the hard way on a Sunday probe run, when a
+   43-hour-old Friday tick was scored as a −43h timezone defect.
 
 ### 4.1.2 Price Quantization — Tick Grid (Added in Phase 1)
 

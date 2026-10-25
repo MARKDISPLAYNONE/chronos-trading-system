@@ -132,6 +132,18 @@ def _parse_timestamp(value: str) -> tuple[dt.datetime, str]:
 # ---------------------------------------------------------------------------
 # Convention conversion
 # ---------------------------------------------------------------------------
+def epoch_to_label(epoch: int) -> dt.datetime:
+    """Decode a raw MT5/CSV epoch as a naive *label* — no timezone semantics.
+
+    MT5's `time` field and the CSV's `timestamp_utc` column both carry broker
+    wall-clock time encoded as if it were Unix UTC. Decoding it "as UTC" is a
+    reading device only; the result is a label, not an instant, and must still
+    go through `to_ny_wall()` to become strategy time. `utc` is used here purely
+    because that is how the number is stored on disk.
+    """
+    return dt.datetime.fromtimestamp(int(epoch), UTC).replace(tzinfo=None)
+
+
 def to_ny_wall(naive_utc_from_label: dt.datetime, convention: str) -> dt.datetime:
     """Convert the file's timestamp label to a naive New York wall clock."""
     if convention == CONVENTION_BROKER:
