@@ -16,9 +16,18 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from live.audit_triage import (  # noqa: E402
+    ABSENT_AWAITING_DATA,
+    ABSENT_AWAITING_TRADE,
+    ABSENT_MISSING,
+    ABSENT_NOT_DUE,
     CERTIFIABLE_OUTCOMES,
+    CERTIFY_FAIL,
+    CERTIFY_INCOMPLETE,
+    CERTIFY_NOT_APPLICABLE,
+    CERTIFY_PASS,
     LIVE_LEGAL_REASONS,
     certify,
+    load_certify_state,
     main,
     monitor_gaps,
     parse_period,
@@ -281,10 +290,34 @@ class TestMonitorEvidence(unittest.TestCase):
         self.assertAlmostEqual((gaps[0][1] - gaps[0][0]).total_seconds() / 60, 324.0)
 
 
+def ny_ts(day, hour=0, minute=0):
+    """A NY wall-clock instant as a POSIX timestamp."""
+    from zoneinfo import ZoneInfo
+
+    from src import config
+
+    return dt.datetime(day.year, day.month, day.day, hour, minute,
+                       tzinfo=ZoneInfo(config.NY_TZ)).timestamp()
+
+
 class TestCertify(unittest.TestCase):
-    """The four-part clean-day rule, as a function rather than a judgement."""
+    """The four-part clean-day rule, as a function rather than a judgement.
+
+    Every test pins `now`. Leaving it to the real clock is what made the first
+    version unusable: certifying the current date at 09:30 reported twelve
+    "missing" windows that had simply not happened yet.
+    """
 
     DAY = dt.date(2026, 10, 28)
+
+    def after_close(self, day=None):
+        """A moment when every window of the date has closed (final 00:15 next day)."""
+        day = day or self.DAY
+        return ny_ts(day + dt.timedelta(days=1), 1, 0)
+
+    def mid_morning(self):
+        """09:30 NY: only the windows closing by 09:15 exist."""
+        return ny_ts(self.DAY, 9, 30)
 
     def rows(self, **overrides):
         from src import time_windows
@@ -301,111 +334,335 @@ class TestCertify(unittest.TestCase):
             out.append(row)
         return out
 
-    def test_a_clean_day_passes(self):
-        result = certify(self.DAY, self.rows())
-        self.assertTrue(result["passed"], result["failures"])
-        self.assertEqual(result["counts"]["rows"], 21)
-        self.assertEqual(result["counts"]["scheduled"], 21)
+    def labels_closed_by(self, when):
+        """Scheduled windows whose close is at or before `when`, in NY terms."""
+        from zoneinfo import ZoneInfo
 
-    def test_a_missing_window_fails_coverage_and_names_it(self):
-        rows = [r for r in self.rows() if r["window_label"] != "09:45-10:15"]
-        result = certify(self.DAY, rows)
+        from src import config
+        from src import time_windows
+
+        cutoff = (dt.datetime.fromtimestamp(when, ZoneInfo(config.NY_TZ))
+                  .replace(tzinfo=None))
+        return [w.label for w in time_windows.windows_for_day(self.DAY)
+                if w.end <= cutoff]
+
+    # --- the happy path ---------------------------------------------------
+    def test_a_clean_day_passes(self):
+        result = certify(self.DAY, self.rows(), now=self.after_close())
+        self.assertEqual(result["status"], CERTIFY_PASS, result["failures"])
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["counts"]["rows"], 21)
+
+    def test_rows_for_other_dates_are_ignored(self):
+        rows = self.rows()
+        rows.append({"trading_date": "2026-10-27", "window_label": "00:45-01:15",
+                     "outcome": "WIN", "reason": "take profit hit"})
+        result = certify(self.DAY, rows, now=self.after_close())
+        self.assertEqual(result["status"], CERTIFY_PASS)
+
+    # --- the case that prompted this: a day still in progress -------------
+    def test_a_day_still_in_progress_is_incomplete_not_a_failure(self):
+        closed = self.labels_closed_by(self.mid_morning())
+        rows = [r for r in self.rows() if r["window_label"] in closed]
+        result = certify(self.DAY, rows, now=self.mid_morning())
+        self.assertEqual(result["status"], CERTIFY_INCOMPLETE)
+        self.assertEqual(result["failures"], [])
         self.assertFalse(result["passed"])
+        kinds = {p["kind"] for p in result["pending"]}
+        self.assertEqual(kinds, {ABSENT_NOT_DUE})
+        self.assertEqual(result["counts"]["rows"], len(closed))
+
+    def test_the_first_unclosed_window_is_the_live_reported_one(self):
+        """09:45-10:15 was flagged as 'missing' at 09:30 NY on 28 Oct."""
+        closed = self.labels_closed_by(self.mid_morning())
+        rows = [r for r in self.rows() if r["window_label"] in closed]
+        result = certify(self.DAY, rows, now=self.mid_morning())
+        not_due = {p["label"] for p in result["pending"] if p["kind"] == ABSENT_NOT_DUE}
+        self.assertIn("09:45-10:15", not_due)
+        self.assertNotIn("09:45-10:15", {p["label"] for p in result["pending"]
+                                         if p["kind"] == ABSENT_MISSING})
+
+    def test_the_same_rows_become_a_failure_once_the_day_is_over(self):
+        """Determinism: only the clock differs between these two verdicts."""
+        closed = self.labels_closed_by(self.mid_morning())
+        rows = [r for r in self.rows() if r["window_label"] in closed]
+        self.assertEqual(certify(self.DAY, rows, now=self.mid_morning())["status"],
+                         CERTIFY_INCOMPLETE)
+        later = certify(self.DAY, rows, now=self.after_close())
+        self.assertEqual(later["status"], CERTIFY_FAIL)
+        self.assertTrue(any(c == "coverage" for c, _ in later["failures"]))
+
+    def test_a_just_closed_window_gets_a_grace_period(self):
+        """A row lands on the first poll after the close, not at the close."""
+        close = ny_ts(self.DAY, 10, 15)          # 09:45-10:15 closes here
+        closed = self.labels_closed_by(close + 30)
+        # Everything closed is present, EXCEPT the window that closed 30 s ago:
+        # its row cannot have been written yet.
+        rows = [r for r in self.rows()
+                if r["window_label"] in closed and r["window_label"] != "09:45-10:15"]
+        result = certify(self.DAY, rows, now=close + 30)
+        self.assertNotIn("09:45-10:15",
+                         {p["label"] for p in result["pending"]
+                          if p["kind"] == ABSENT_MISSING})
+        self.assertIn("09:45-10:15",
+                      {p["label"] for p in result["pending"]
+                       if p["kind"] == ABSENT_NOT_DUE})
+
+    def test_a_date_that_has_not_begun_is_incomplete(self):
+        """Certifying a future date from today: nothing has happened, no failure."""
+        future = dt.date(2026, 12, 1)
+        result = certify(future, [], now=ny_ts(self.DAY, 9, 30))
+        self.assertEqual(result["status"], CERTIFY_INCOMPLETE, result["failures"])
+        self.assertEqual(result["counts"]["rows"], 0)
+        self.assertEqual({p["kind"] for p in result["pending"]}, {ABSENT_NOT_DUE})
+
+    # --- the three legitimate reasons a closed window has no row ----------
+    def test_a_closed_window_with_an_open_trade_is_waiting_not_missing(self):
+        rows = [r for r in self.rows() if r["window_label"] != "13:45-14:15"]
+        result = certify(self.DAY, rows, now=self.after_close(),
+                         pending={"2026-10-28|13:45-14:15"})
+        self.assertEqual(result["status"], CERTIFY_INCOMPLETE, result["failures"])
+        kinds = {(p["label"], p["kind"]) for p in result["pending"]}
+        self.assertEqual(kinds, {("13:45-14:15", ABSENT_AWAITING_TRADE)})
+
+    def test_a_deferred_window_is_waiting_not_missing(self):
+        rows = [r for r in self.rows() if r["window_label"] != "13:45-14:15"]
+        result = certify(self.DAY, rows, now=self.after_close(),
+                         deferred={"2026-10-28|13:45-14:15"})
+        self.assertEqual(result["status"], CERTIFY_INCOMPLETE)
+        self.assertIn(ABSENT_AWAITING_DATA,
+                      {p["kind"] for p in result["pending"]})
+
+    def test_without_state_an_absent_closed_window_is_missing(self):
+        """Conservative: no evidence of an open trade means no excuse."""
+        rows = [r for r in self.rows() if r["window_label"] != "13:45-14:15"]
+        result = certify(self.DAY, rows, now=self.after_close())
+        self.assertEqual(result["status"], CERTIFY_FAIL)
+        self.assertIn(ABSENT_MISSING, {p["kind"] for p in result["pending"]})
+
+    def test_a_pending_key_for_a_different_window_does_not_excuse_anything(self):
+        rows = [r for r in self.rows() if r["window_label"] != "13:45-14:15"]
+        result = certify(self.DAY, rows, now=self.after_close(),
+                         pending={"2026-10-28|09:45-10:15"})
+        self.assertEqual(result["status"], CERTIFY_FAIL)
+
+    # --- real failures are still failures, mid-day or not -----------------
+    def test_a_genuine_gap_mid_day_is_reported_as_a_gap_not_as_coverage(self):
+        """The live 28 Oct shape: restart gaps plus windows not yet closed."""
+        closed = self.labels_closed_by(self.mid_morning())
+        gap_labels = {"04:45-05:15", "05:45-06:15", "06:45-07:15", "07:45-08:15"}
+        rows = [dict(r, reason="dry_run_gap_runner_down")
+                if r["window_label"] in gap_labels else dict(r)
+                for r in self.rows() if r["window_label"] in closed]
+        result = certify(self.DAY, rows, now=self.mid_morning())
+        self.assertEqual(result["status"], CERTIFY_FAIL)
+        conditions = [c for c, _ in result["failures"]]
+        self.assertEqual(conditions, ["gaps"],
+                         "mid-day absences must not be blamed on coverage")
+
+    def test_missing_window_names_it(self):
+        rows = [r for r in self.rows() if r["window_label"] != "09:45-10:15"]
+        result = certify(self.DAY, rows, now=self.after_close())
+        self.assertEqual(result["status"], CERTIFY_FAIL)
         coverage = [d for c, d in result["failures"] if c == "coverage"]
         self.assertTrue(any("09:45-10:15" in d for d in coverage), coverage)
 
     def test_a_duplicate_window_fails_coverage(self):
         rows = self.rows()
         rows.append(dict(rows[0]))
-        result = certify(self.DAY, rows)
-        self.assertFalse(result["passed"])
+        result = certify(self.DAY, rows, now=self.after_close())
+        self.assertEqual(result["status"], CERTIFY_FAIL)
         self.assertTrue(any("duplicated" in d for c, d in result["failures"]
                             if c == "coverage"))
 
     def test_an_undecided_outcome_fails(self):
         rows = self.rows(**{"13:45-14:15": {"outcome": "MISSING_EVALUATION",
                                             "reason": "data_ends_before_trade_closed"}})
-        result = certify(self.DAY, rows)
-        self.assertFalse(result["passed"])
+        result = certify(self.DAY, rows, now=self.after_close())
+        self.assertEqual(result["status"], CERTIFY_FAIL)
         self.assertIn("MISSING_EVALUATION",
                       " ".join(d for c, d in result["failures"] if c == "outcome"))
 
     def test_a_blank_reason_fails(self):
         rows = self.rows(**{"13:45-14:15": {"outcome": "WIN", "reason": ""}})
-        result = certify(self.DAY, rows)
-        self.assertFalse(result["passed"])
+        result = certify(self.DAY, rows, now=self.after_close())
+        self.assertEqual(result["status"], CERTIFY_FAIL)
         self.assertTrue(any("empty reason" in d for c, d in result["failures"]))
 
     def test_range_and_stall_rows_fail(self):
         for reason in ("outside_data_range", "live_feed_stalled"):
             rows = self.rows(**{"04:45-05:15": {"reason": reason}})
-            result = certify(self.DAY, rows)
-            self.assertFalse(result["passed"], reason)
-            self.assertTrue(any(reason in d for c, d in result["failures"]),
-                            result["failures"])
+            result = certify(self.DAY, rows, now=self.after_close())
+            self.assertEqual(result["status"], CERTIFY_FAIL, reason)
+            self.assertTrue(any(reason in d for c, d in result["failures"]))
 
     def test_gap_rows_fail(self):
         rows = self.rows(**{"04:45-05:15": {"reason": "dry_run_gap_runner_down"}})
-        result = certify(self.DAY, rows)
-        self.assertFalse(result["passed"])
+        result = certify(self.DAY, rows, now=self.after_close())
+        self.assertEqual(result["status"], CERTIFY_FAIL)
         self.assertTrue(any(c == "gaps" for c, _ in result["failures"]))
 
     def test_every_failing_condition_is_reported_together(self):
-        """One run must list all the reasons, not just the first."""
         rows = self.rows(**{
             "04:45-05:15": {"reason": "outside_data_range"},
             "13:45-14:15": {"reason": "dry_run_gap_runner_down"},
         })
         rows = [r for r in rows if r["window_label"] != "09:45-10:15"]
-        result = certify(self.DAY, rows)
-        conditions = {c for c, _ in result["failures"]}
-        self.assertEqual(conditions, {"coverage", "range", "gaps"})
+        result = certify(self.DAY, rows, now=self.after_close())
+        self.assertEqual({c for c, _ in result["failures"]},
+                         {"coverage", "range", "gaps"})
 
     def test_a_weekend_is_not_applicable(self):
-        result = certify(dt.date(2026, 11, 1), [])
-        self.assertFalse(result["applicable"])
+        result = certify(dt.date(2026, 11, 1), [], now=self.after_close())
+        self.assertEqual(result["status"], CERTIFY_NOT_APPLICABLE)
         self.assertIn("Sunday", result["detail"])
-
-    def test_rows_for_other_dates_are_ignored(self):
-        rows = self.rows()
-        rows.append({"trading_date": "2026-10-27", "window_label": "00:45-01:15",
-                     "outcome": "WIN", "reason": "take profit hit"})
-        self.assertTrue(certify(self.DAY, rows)["passed"])
 
     def test_missing_evaluation_is_not_certifiable(self):
         self.assertNotIn("MISSING_EVALUATION", CERTIFIABLE_OUTCOMES)
 
-    def test_cli_prints_pass_and_exit_zero(self):
-        import csv
-        cols = ["trading_date", "window_label", "outcome", "reason"]
-        with tempfile.TemporaryDirectory() as tmp:
-            out = pathlib.Path(tmp)
-            for name in ("window_evaluations.csv", "window_evaluations_audit.csv"):
-                with (out / name).open("w", newline="", encoding="utf-8") as fh:
-                    w = csv.DictWriter(fh, fieldnames=cols)
-                    w.writeheader()
-                    for r in self.rows():
-                        w.writerow({k: r[k] for k in cols})
-            self.assertEqual(main(["--certify", self.DAY.isoformat(),
-                                   "--out-dir", str(out)]), 0)
+    def test_the_completion_time_is_the_next_morning(self):
+        """The date's last window closes 00:15 the following NY day."""
+        result = certify(self.DAY, self.rows(), now=self.after_close())
+        self.assertEqual(result["complete_after_ny"],
+                         dt.datetime(2026, 10, 29, 0, 15))
 
-    def test_cli_prints_fail_and_exit_one(self):
-        import csv
-        cols = ["trading_date", "window_label", "outcome", "reason"]
-        rows = self.rows(**{"04:45-05:15": {"reason": "live_feed_stalled"}})
-        with tempfile.TemporaryDirectory() as tmp:
-            out = pathlib.Path(tmp)
-            for name in ("window_evaluations.csv", "window_evaluations_audit.csv"):
-                with (out / name).open("w", newline="", encoding="utf-8") as fh:
-                    w = csv.DictWriter(fh, fieldnames=cols)
-                    w.writeheader()
-                    for r in rows:
-                        w.writerow({k: r[k] for k in cols})
-            self.assertEqual(main(["--certify", self.DAY.isoformat(),
-                                   "--out-dir", str(out)]), 1)
 
-    def test_cli_rejects_a_bad_date(self):
-        self.assertEqual(main(["--certify", "28-10-2026", "--out-dir", "/tmp"]), 2)
+class TestCertifyStateFile(unittest.TestCase):
+    def test_a_missing_state_file_yields_empty_sets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pending, deferred = load_certify_state(pathlib.Path(tmp) / "nope.json")
+        self.assertEqual((pending, deferred), (set(), set()))
+
+    def test_an_unreadable_state_file_yields_empty_sets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "runner_state.json"
+            path.write_text("{not json")
+            pending, deferred = load_certify_state(path)
+        self.assertEqual((pending, deferred), (set(), set()))
+
+    def test_keys_are_read_from_both_ledgers(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "runner_state.json"
+            path.write_text(json.dumps({
+                "pending": {"2026-10-28|13:45-14:15": {"direction": "PREMIUM"}},
+                "deferred": {"2026-10-28|09:45-10:15": {}},
+            }))
+            pending, deferred = load_certify_state(path)
+        self.assertEqual(pending, {"2026-10-28|13:45-14:15"})
+        self.assertEqual(deferred, {"2026-10-28|09:45-10:15"})
+
+
+class TestCertifyCli(unittest.TestCase):
+    DAY = dt.date(2026, 10, 28)
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.out = pathlib.Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def write(self, rows, *, state=None):
+        import csv
+
+        cols = ["trading_date", "window_label", "outcome", "reason"]
+        if rows:
+            cols = list(rows[0].keys())
+        for name in ("window_evaluations.csv", "window_evaluations_audit.csv"):
+            with (self.out / name).open("w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
+                w.writeheader()
+                for r in rows:
+                    w.writerow({k: r.get(k, "") for k in cols})
+        if state is not None:
+            import json
+            (self.out / "runner_state.json").write_text(json.dumps(state))
+
+    def clean_rows(self):
+        from src import time_windows
+
+        return [{"trading_date": self.DAY.isoformat(), "window_label": w.label,
+                 "outcome": "NO_SETUP", "reason": "no sweep"}
+                for w in time_windows.windows_for_day(self.DAY)]
+
+    def run_certify(self, *extra):
+        return main(["--certify", self.DAY.isoformat(), "--out-dir", str(self.out),
+                     *extra])
+
+    def test_pass_is_exit_zero(self):
+        self.write(self.clean_rows())
+        self.assertEqual(self.run_certify("--now", "2026-10-29T01:00"), 0)
+
+    def test_fail_is_exit_one(self):
+        rows = self.clean_rows()
+        rows[0] = dict(rows[0], reason="live_feed_stalled")
+        self.write(rows)
+        self.assertEqual(self.run_certify("--now", "2026-10-29T01:00"), 1)
+
+    def closed_rows(self, now_iso):
+        """Clean rows for exactly the windows that have closed by `now_iso`."""
+        from zoneinfo import ZoneInfo
+
+        from src import config
+        from src import time_windows
+
+        stamp = dt.datetime.fromisoformat(now_iso)
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=ZoneInfo(config.NY_TZ))
+        cutoff = stamp.replace(tzinfo=None)
+        return [{"trading_date": self.DAY.isoformat(), "window_label": w.label,
+                 "outcome": "NO_SETUP", "reason": "no sweep"}
+                for w in time_windows.windows_for_day(self.DAY) if w.end <= cutoff]
+
+    def test_incomplete_is_exit_three(self):
+        """Distinct from FAIL: the day is not over, nothing is wrong."""
+        self.write(self.closed_rows("2026-10-28T09:30"))
+        self.assertEqual(self.run_certify("--now", "2026-10-28T09:30"), 3)
+
+    def test_an_already_closed_window_with_no_row_is_still_a_failure(self):
+        """The distinction must not become a way to hide a real gap."""
+        rows = self.closed_rows("2026-10-28T09:30")
+        self.write([r for r in rows if r["window_label"] != "02:45-03:15"])
+        self.assertEqual(self.run_certify("--now", "2026-10-28T09:30"), 1)
+
+    def test_not_applicable_is_exit_two(self):
+        self.write([])
+        self.assertEqual(main(["--certify", "2026-11-01", "--out-dir", str(self.out),
+                               "--now", "2026-11-02T01:00"]), 2)
+
+    def test_a_bad_date_is_exit_two(self):
+        self.assertEqual(main(["--certify", "28-10-2026", "--out-dir",
+                               str(self.out)]), 2)
+
+    def test_an_open_trade_in_the_state_file_changes_fail_into_incomplete(self):
+        rows = [r for r in self.clean_rows() if r["window_label"] != "13:45-14:15"]
+        self.write(rows)
+        self.assertEqual(self.run_certify("--now", "2026-10-29T01:00"), 1)
+
+        self.write(rows, state={"pending": {"2026-10-28|13:45-14:15": {}}})
+        self.assertEqual(self.run_certify("--now", "2026-10-29T01:00"), 3)
+
+    def test_naive_now_means_new_york_wall_clock(self):
+        """09:30 means 09:30 NY, not 09:30 UTC — which would be 05:30 NY."""
+        from live.audit_triage import _parse_now
+
+        expected = ny_ts(self.DAY, 9, 30)
+        self.assertEqual(_parse_now("2026-10-28T09:30"), expected)
+        self.assertEqual(_parse_now("2026-10-28T13:30+00:00"), expected)
+
+    def test_an_offset_is_honoured(self):
+        self.write(self.closed_rows("2026-10-28T09:30"))
+        self.assertEqual(self.run_certify("--now", "2026-10-28T13:30+00:00"), 3)
+
+    def test_a_bad_now_is_exit_two(self):
+        self.write([])
+        self.assertEqual(self.run_certify("--now", "this morning"), 2)
+
+    def test_no_log_files_at_all_is_exit_two(self):
+        """A missing log is a usage error; an empty one is a verdict."""
+        self.assertEqual(self.run_certify("--now", "2026-10-28T09:30"), 2)
 
 
 class TestKnownBadFile(unittest.TestCase):

@@ -28,14 +28,27 @@ rewritten. The reconciliation lives beside the log, not on top of it.
 
 Usage (on the machine that ran the dry run, from `bot/`):
 
+    python live/audit_triage.py --certify 2026-10-28
     python live/audit_triage.py --self-check
-    python live/audit_triage.py --outside-range --outages 2026-10-26T14:22/2026-10-27T01:48
+    python live/audit_triage.py --outside-range --monitor live/output/dst_monitor.csv
     python live/audit_triage.py --show 2026-10-26 04:45-05:15
+    python live/audit_triage.py --state live/output/runner_state.json
     python live/audit_triage.py --annotate --known-bad known_bad.txt
 
 Exit codes: 0 = nothing found, 1 = the check found a contradiction or an
 unexplained row. Non-zero is the point: this is meant to be run in CI onto the
 log, not read casually.
+
+`--certify` adds a third verdict and a third exit code, because "the day is not
+over" is not a defect and must not be reported as one:
+
+    0  PASS         all four conditions hold; the day counts
+    1  FAIL         a condition broke; the day does not count
+    2  NOT APPLICABLE / bad usage (e.g. a weekend, or an unparseable date)
+    3  INCOMPLETE   nothing is wrong, the day simply is not finished: a window
+                    has not closed, or a trade is still open awaiting its exit
+                    (Q13). Re-run later; the day is final after its last window
+                    closes at 00:15 NY the following morning.
 """
 
 from __future__ import annotations
@@ -109,6 +122,26 @@ OPERATIONAL_REASONS = frozenset({
     csv_emitter.REASON_RUNNER_DOWN,
     csv_emitter.REASON_LIVE_FEED_STALLED,
 })
+
+
+def _parse_now(text: str | None) -> float | None:
+    """`--now` in NY wall clock (naive) or with an explicit offset."""
+    if not text:
+        import time as _time
+
+        return _time.time()
+    try:
+        stamp = dt.datetime.fromisoformat(text)
+    except ValueError:
+        print(f"--now needs ISO-8601, got {text!r}", file=sys.stderr)
+        return None
+    if stamp.tzinfo is None:                     # naive means New York wall clock
+        from zoneinfo import ZoneInfo
+
+        from src import config
+
+        stamp = stamp.replace(tzinfo=ZoneInfo(config.NY_TZ))
+    return stamp.timestamp()
 
 
 def _dec(value: str) -> Decimal | None:
@@ -497,56 +530,166 @@ CERTIFY_CONDITIONS = [
     ("gaps", "no dry_run_gap_runner_down rows"),
 ]
 
+#: The four verdicts. INCOMPLETE exists because "the day has not finished yet"
+#: and "a window is genuinely missing" are different facts and used to be
+#: reported identically — which made the tool unusable unattended, since every
+#: mid-day run looked like a defect.
+CERTIFY_PASS = "PASS"
+CERTIFY_FAIL = "FAIL"
+CERTIFY_INCOMPLETE = "INCOMPLETE"
+CERTIFY_NOT_APPLICABLE = "NOT_APPLICABLE"
 
-def certify(day: dt.date, rows: list[dict]) -> dict:
+#: Why a scheduled window has no row yet.
+ABSENT_NOT_DUE = "not_due"                    # the window has not closed
+ABSENT_AWAITING_TRADE = "awaiting_trade"      # Q13: the row comes when simulate() resolves
+ABSENT_AWAITING_DATA = "awaiting_data"        # held for late bars, still inside the grace
+ABSENT_MISSING = "missing"                    # nothing explains it: a real defect
+
+#: A row appears on the first poll after a window closes, so for a few seconds
+#: after the close its absence means nothing. 90 s is several polls and longer
+#: than any publication lag, and it only ever delays a verdict, never hides one.
+ROW_GRACE_SECONDS = 90.0
+
+
+def _window_bounds(window):
+    """UTC start/close for a window, via the DST-tested helper.
+
+    Imported lazily: this tool must stay runnable on a machine with no MT5 and no
+    terminal, and `live.dry_run_runner` pulls in the live source.
+    """
+    from live.dry_run_runner import window_utc_bounds
+
+    start_utc, end_utc, _flags = window_utc_bounds(window)
+    return start_utc, end_utc
+
+
+def load_certify_state(path: pathlib.Path) -> tuple[set[str], set[str]]:
+    """`(pending, deferred)` window keys from `runner_state.json`.
+
+    These are the two legitimate reasons a *closed* window has no row yet, and
+    without them every open trade would be reported as a missing window. A
+    missing or unreadable file yields empty sets: the tool then treats unexplained
+    absences as failures, which is the conservative direction.
+    """
+    import json
+
+    if not path.exists():
+        return set(), set()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return set(), set()
+    return set((raw.get("pending") or {}).keys()), set((raw.get("deferred") or {}).keys())
+
+
+def classify_absent(day: dt.date, present: set[str], *, now: float,
+                    pending: set[str], deferred: set[str]) -> list[dict]:
+    """For every scheduled window with no row, say why it has no row.
+
+    Order matters, and it is deliberate:
+
+    1. **not closed yet** — the window's own close is in the future (plus a small
+       publication grace). Nothing is missing; the day is simply not over.
+    2. **awaiting a trade** — the window closed, the runner saw it, and the trade
+       it opened has not resolved. Q13 says the row is written when `simulate()`
+       decides, which can be days later. Not a defect.
+    3. **awaiting data** — held for late bars, still inside the grace window.
+    4. **missing** — anything else. This is the only case that is a failure, and
+       the only one that used to be indistinguishable from case 1.
+    """
+    import time as _time
+
+    from src import time_windows
+
+    out = []
+    for window in time_windows.windows_for_day(day):
+        if window.label in present:
+            continue
+        key = f"{day.isoformat()}|{window.label}"
+        _start, close = _window_bounds(window)
+        closes_at = close.timestamp()
+        if closes_at + ROW_GRACE_SECONDS > now:
+            kind = ABSENT_NOT_DUE
+        elif key in pending:
+            kind = ABSENT_AWAITING_TRADE
+        elif key in deferred:
+            kind = ABSENT_AWAITING_DATA
+        else:
+            kind = ABSENT_MISSING
+        out.append({
+            "label": window.label,
+            "kind": kind,
+            "closes_ny": window.end,
+            "closes_utc": close,
+            "is_failure": kind == ABSENT_MISSING,
+        })
+    # Chronological by close, not by start_hour: `windows_for_day` begins at
+    # 23:45 because that slot belongs to this trading date but opens last, and a
+    # human reading a list of missing windows expects time order.
+    out.sort(key=lambda item: item["closes_utc"])
+    return out
+
+
+def certify(day: dt.date, rows: list[dict], *,
+            now: float | None = None,
+            pending: set[str] | None = None,
+            deferred: set[str] | None = None) -> dict:
     """Apply the four-part clean-day rule to one New York trading date.
 
-    The rule, and why each part is there:
-
-    1. **Coverage** — 21 rows, one per scheduled window, no duplicates. A missing
-       row means the runner never decided that window, however good the other 20
-       look.
-    2. **Outcome** — every row carries a real decision and says why. Catches a
-       schema leak, an empty reason, or an unresolved trade written past its
-       deadline.
+    1. **Coverage** — every scheduled window is accounted for: it has a row, or it
+       has a stated reason for not having one yet (see `classify_absent`). A
+       window with no row and no explanation is a failure.
+    2. **Outcome** — every row carries a real decision and says why.
     3. **No range/stall rows** — `outside_data_range` was the defect that made
        this rule necessary; `live_feed_stalled` means the terminal gave no data
-       for a window we were watching. Either makes the day's evidence partial.
+       for a window we were watching.
     4. **No gap rows** — the runner must have watched all of it.
 
-    Returns a dict with `passed`, `failures` (list of (condition, detail)),
-    `warnings`, and the counts, so a caller can render it however it likes.
+    The verdict is one of PASS / FAIL / INCOMPLETE / NOT_APPLICABLE. INCOMPLETE
+    means the day cannot be judged yet — a window has not closed, or a trade is
+    still open — and is *not* a failure. That distinction is the whole point:
+    a daily tool run unsupervised must not report "missing window" for a window
+    that has not happened.
     """
+    import time as _time
+
     from src import time_windows
+
+    now = _time.time() if now is None else now
+    pending = pending or set()
+    deferred = deferred or set()
+
+    if not time_windows.is_trading_day(day):
+        return {
+            "date": day, "status": CERTIFY_NOT_APPLICABLE, "applicable": False,
+            "passed": False, "failures": [], "warnings": [], "pending": [],
+            "detail": f"{day} is a {day.strftime('%A')} - not a trading day, nothing to certify",
+            "counts": {},
+        }
 
     scheduled = [w.label for w in time_windows.windows_for_day(day)]
     on_day = [r for r in rows if r.get("trading_date") == day.isoformat()]
     failures: list[tuple[str, str]] = []
     warnings: list[str] = []
 
-    if not time_windows.is_trading_day(day):
-        return {
-            "date": day, "applicable": False, "passed": False,
-            "failures": [], "warnings": [],
-            "detail": f"{day} is a {day.strftime('%A')} - not a trading day, nothing to certify",
-            "counts": {},
-        }
-
-    # --- 1. coverage ------------------------------------------------------
+    # --- 1. coverage, with the reasons a window may legitimately be absent ---
     labels = [r.get("window_label", "") for r in on_day]
     seen: dict[str, int] = {}
     for label in labels:
         seen[label] = seen.get(label, 0) + 1
     duplicates = sorted(l for l, n in seen.items() if n > 1)
-    missing = [l for l in scheduled if l not in seen]
     unexpected = sorted(l for l in seen if l not in scheduled)
-    if len(on_day) != len(scheduled):
+    absent = classify_absent(day, set(seen), now=now,
+                             pending=pending, deferred=deferred)
+    missing = [a for a in absent if a["is_failure"]]
+
+    if missing:
         failures.append((
             "coverage",
-            f"{len(on_day)} row(s) for {len(scheduled)} scheduled windows",
+            f"{len(missing)} closed window(s) with no row and no explanation: "
+            + ", ".join(f"{a['label']} (closed {a['closes_ny']:%H:%M} NY)"
+                        for a in missing),
         ))
-    if missing:
-        failures.append(("coverage", f"missing windows: {', '.join(missing)}"))
     if duplicates:
         failures.append(("coverage", f"duplicated windows: {', '.join(duplicates)}"))
     if unexpected:
@@ -566,11 +709,6 @@ def certify(day: dt.date, rows: list[dict]) -> dict:
             failures.append((
                 "outcome", f"{r.get('window_label')}: {outcome} with an empty reason",
             ))
-    if not failures and on_day:
-        # NO_SETUP with a market reason is fine; note the trade count for context.
-        traded = sum(1 for r in on_day if (r.get("outcome") or "") in ("WIN", "LOSS"))
-        warnings.append(f"{traded} traded window(s), "
-                        f"{len(on_day) - traded} NO_SETUP")
 
     # --- 3. range / stall rows -------------------------------------------
     for row_reason, label in ((REASON_OUTSIDE_RANGE, "outside_data_range"),
@@ -593,12 +731,27 @@ def certify(day: dt.date, rows: list[dict]) -> dict:
             f"{', '.join(r.get('window_label', '?') for r in gaps)}",
         ))
 
+    # --- verdict ----------------------------------------------------------
+    if failures:
+        status = CERTIFY_FAIL
+    elif absent:
+        status = CERTIFY_INCOMPLETE
+    else:
+        status = CERTIFY_PASS
+
+    if status == CERTIFY_PASS:
+        traded = sum(1 for r in on_day if (r.get("outcome") or "") in ("WIN", "LOSS"))
+        warnings.append(f"{traded} traded window(s), "
+                        f"{len(on_day) - traded} NO_SETUP")
+
     return {
         "date": day,
         "applicable": True,
-        "passed": not failures,
+        "status": status,
+        "passed": status == CERTIFY_PASS,
         "failures": failures,
         "warnings": warnings,
+        "pending": absent,
         "detail": "",
         "counts": {
             "rows": len(on_day),
@@ -607,27 +760,71 @@ def certify(day: dt.date, rows: list[dict]) -> dict:
             "loss": sum(1 for r in on_day if (r.get("outcome") or "") == "LOSS"),
             "no_setup": sum(1 for r in on_day if (r.get("outcome") or "") == "NO_SETUP"),
         },
+        #: The honest answer to "when can I certify this?". The date's last
+        #: window closes at 00:15 the following NY day, which is exactly the
+        #: detail a person gets wrong when judging a day by its calendar date.
+        "complete_after_ny": _last_close(day),
     }
+
+
+def _last_close(day: dt.date):
+    """NY naive wall clock at which every window of `day` has closed."""
+    from src import time_windows
+
+    return max(w.end for w in time_windows.windows_for_day(day))
 
 
 def render_certification(result: dict) -> str:
     day = result["date"]
-    if not result["applicable"]:
+    if result["status"] == CERTIFY_NOT_APPLICABLE:
         return f"{day}: NOT APPLICABLE - {result['detail']}"
+
     c = result["counts"]
-    lines = [
-        f"{day}  {'PASS' if result['passed'] else 'FAIL'}",
+    pending = result["pending"]
+    not_due = [p for p in pending if p["kind"] == ABSENT_NOT_DUE]
+    trades = [p for p in pending if p["kind"] == ABSENT_AWAITING_TRADE]
+    data = [p for p in pending if p["kind"] == ABSENT_AWAITING_DATA]
+    missing = [p for p in pending if p["kind"] == ABSENT_MISSING]
+
+    lines = [f"{day}  {result['status']}"]
+    if result["status"] == CERTIFY_INCOMPLETE:
+        if c["rows"] == 0 and len(not_due) == c["scheduled"]:
+            lines[0] += " - this day has not started yet"
+        else:
+            lines[0] += " - too early to certify, this is not a failure"
+    lines += [
         f"  rows            : {c['rows']}/{c['scheduled']} scheduled windows",
         f"  outcomes        : {c['win']} WIN, {c['loss']} LOSS, {c['no_setup']} NO_SETUP",
     ]
     for name, detail in result["failures"]:
         lines.append(f"  [FAIL] {name:<8} {detail}")
-    if result["passed"]:
+    if result["status"] == CERTIFY_PASS:
         for name, desc in CERTIFY_CONDITIONS:
             lines.append(f"  [ok]   {name:<8} {desc}")
         for w in result["warnings"]:
             lines.append(f"  note:  {w}")
         lines.append("  -> this day counts toward the five consecutive clean days")
+    elif result["status"] == CERTIFY_INCOMPLETE:
+        for name, desc in CERTIFY_CONDITIONS:
+            lines.append(f"  [ok]   {name:<8} {desc} (nothing found against it yet)")
+        if not_due:
+            first = min(not_due, key=lambda p: p["closes_ny"])
+            lines.append(
+                f"  wait:  {len(not_due)} window(s) have not closed yet "
+                f"(next: {first['label']}, closes {first['closes_ny']:%H:%M} NY)")
+        if trades:
+            lines.append(
+                f"  wait:  {len(trades)} window(s) have an open trade still to "
+                f"resolve: {', '.join(p['label'] for p in trades)}")
+        if data:
+            lines.append(
+                f"  wait:  {len(data)} window(s) are holding for late bars: "
+                f"{', '.join(p['label'] for p in data)}")
+        if not missing:
+            lines.append("  -> NOT a defect. Re-run when the day is complete.")
+        last_close = result.get("complete_after_ny")
+        if last_close and not_due:
+            lines.append(f"  -> the day is final after {last_close:%Y-%m-%d %H:%M} NY")
     else:
         lines.append("  -> this day does NOT count; the consecutive run restarts here")
     return "\n".join(lines)
@@ -704,8 +901,13 @@ def inspect_state(path: pathlib.Path) -> int:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def main(argv: list[str] | None = None, out_dir: str | pathlib.Path = "output"
-         ) -> int:
+#: Same directory `dry_run_runner.py` writes to by default, so an unsupervised
+#: `python live/audit_triage.py --certify DATE` reads the files it is meant to.
+DEFAULT_OUT_DIR = pathlib.Path(__file__).resolve().parent / "output"
+
+
+def main(argv: list[str] | None = None,
+         out_dir: str | pathlib.Path = DEFAULT_OUT_DIR) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", default=str(out_dir))
@@ -729,8 +931,13 @@ def main(argv: list[str] | None = None, out_dir: str | pathlib.Path = "output"
     ap.add_argument("--known-bad", help="file of DATE LABEL lines to reconcile")
     ap.add_argument("--certify", default=None, metavar="DATE",
                     help="apply the 4-part clean-day rule to one NY trading date "
-                         "(YYYY-MM-DD) and print PASS/FAIL with the failing "
-                         "condition(s)")
+                         "(YYYY-MM-DD). Prints PASS / FAIL / INCOMPLETE with the "
+                         "failing condition(s). INCOMPLETE means the day is not "
+                         "over yet, and is not a defect.")
+    ap.add_argument("--now", default=None, metavar="ISO",
+                    help="treat this as the current NY wall clock (naive = New "
+                         "York, or include an offset). Default: the real clock. "
+                         "For replaying a past moment.")
     ap.add_argument("--state", default=None, metavar="PATH",
                     help="inspect runner_state.json before a restart (read-only)")
     ap.add_argument("--illegal-reasons", action="store_true",
@@ -797,22 +1004,34 @@ def main(argv: list[str] | None = None, out_dir: str | pathlib.Path = "output"
             print(f"--certify needs a date as YYYY-MM-DD, got {args.certify!r}",
                   file=sys.stderr)
             return 2
+        now = _parse_now(args.now)
+        if now is None:
+            return 2
         # Certification reads the schema-mirror file; the audit CSV carries the
         # same columns, so a missing first choice degrades rather than lies.
         source = flat or audit
-        if not source:
-            print(f"no rows to certify from in {base}", file=sys.stderr)
+        # A *missing log file* is a usage error. A log file with no rows yet for
+        # this date is not: on the morning of a trading day the runner may not
+        # have written one, and that is INCOMPLETE, not a broken command.
+        if not (base / "window_evaluations.csv").exists() and \
+                not (base / "window_evaluations_audit.csv").exists():
+            print(f"no dry-run log at {base} — nothing to certify from",
+                  file=sys.stderr)
             return 2
-        result = certify(day, source)
+        # The runner's own state file is what distinguishes "still open" from
+        # "missing"; without it every unresolved trade would look like a defect.
+        pending, deferred = load_certify_state(base / "runner_state.json")
+        result = certify(day, source, now=now, pending=pending, deferred=deferred)
         print(render_certification(result))
         if not result["applicable"]:
             return 2
-        if not result["passed"]:
+        if not flat:
+            print("\nnote: certified from window_evaluations_audit.csv "
+                  "(window_evaluations.csv absent)")
+        if result["status"] == CERTIFY_FAIL:
             rc = 1
-        else:
-            if not flat:
-                print("\nnote: certified from window_evaluations_audit.csv "
-                      "(window_evaluations.csv absent)")
+        elif result["status"] == CERTIFY_INCOMPLETE:
+            rc = 3
 
     if args.illegal_reasons:
         # The audit CSV carries the same reason column, so fall back to it: a

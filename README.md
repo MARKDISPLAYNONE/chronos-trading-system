@@ -35,7 +35,7 @@ introductory/               role prompts for the Handler/Senior Dev/Agent
 data/nas100_m1_history.csv  Phase 1 input: NAS100 M1, Jan-Oct 2026 (~13 MB)
 bot/
   src/                      engine: windows, candles, context, sweep, sizing
-  tests/                    367 unit tests (stdlib unittest)
+  tests/                    389 unit tests (stdlib unittest)
   historical_validation/
     validate_against_history.py   Phase 1 driver
     export_history_csv.py         MT5 export (Windows-only, Handler runs it)
@@ -47,6 +47,8 @@ bot/
     csv_emitter.py              append-only log writer (Phase 1 schema)
     audit_triage.py             read-only log analysis: --certify, --outside-range,
                                 --self-check, --state, --illegal-reasons
+                                (--certify: PASS/FAIL/INCOMPLETE/NOT_APPLICABLE,
+                                 exit 0/1/3/2; --now pins the clock)
     output/                     generated logs (git-ignored)
     output/                       generated report + schema-mirror CSVs
 ```

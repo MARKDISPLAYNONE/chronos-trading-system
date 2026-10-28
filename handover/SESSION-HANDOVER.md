@@ -180,8 +180,11 @@ part that makes the numbers trustworthy — do the same on any re-run):
    runner is built against the live API.
 2. 🟠 **Phase 2 running. Clean-day clock started at the 28 Oct 08:47 NY restart.**
    No fixed end date (§15.16). Each day is judged with
-   `python live/audit_triage.py --certify DATE`; five consecutive PASSes close the
-   phase. Days before the restart are excluded, not rewritten.
+   `python live/audit_triage.py --certify DATE` — five consecutive PASSes close
+   the phase. Days before the restart are excluded, not rewritten.
+   **The first day that can pass is 29 Oct**: 28 Oct has nine windows before the
+   restart and so always contains gap rows (§15.17). Expect `INCOMPLETE` (exit 3)
+   if `--certify` is run before a day's last window closes at 00:15 NY.
    The `outside_data_range` defect is understood and fixed (§15.11); the running
    runner still has the old code. Next: run `live/audit_triage.py` against the
    live log, then restart the runner to pick up the fix — the restart is what
@@ -468,6 +471,21 @@ the restart. **367 tests pass.**
 - `audit_triage.py --certify DATE`: the four-part rule as a command. No more
   relay-and-interpret.
 - **Clean-day clock starts at the 28 Oct 08:47 NY restart; no fixed end date.**
+
+**Session 17 (certify hardening — this session):** `--certify` reported a
+"missing window" that had simply not happened yet. **389 tests pass.**
+- Confirmed against the schedule: at 09:30 NY on 28 Oct, `09:45-10:15` is the
+  first window that has not closed. Not a defect.
+- `--certify` now returns **PASS / FAIL / INCOMPLETE / NOT_APPLICABLE** (exit
+  0/1/3/2) and classifies every absent window as not-due, awaiting-trade,
+  awaiting-data or genuinely missing. Only the last one fails.
+- `runner_state.json` is read automatically for the awaiting-trade case;
+  removing it falls back to FAIL rather than excusing an unexplained absence.
+- `--now ISO` pins the clock (naive = NY) for replay and deterministic tests.
+  Default `--out-dir` now matches the runner's.
+- **28 Oct can never itself PASS** — nine of its windows precede the 08:47
+  restart, so it always carries gap rows. The first certifiable day is 29 Oct;
+  the clock still starts at the restart (§15.16, now qualified in §15.17).
 
 ---
 
@@ -1554,4 +1572,96 @@ not secret — §15.11-15.15 explain every row — but they are not candidates.
 A day counts only if `--certify` says PASS. Run it at the end of each session; the
 five-day count is the number of consecutive PASSes, and any FAIL restarts the run
 at that date.
+
+### 15.17 `--certify` could not tell "not yet" from "missing" (fixed)
+
+`--certify 2026-10-28` reported `coverage missing windows: 09:45-10:15, ...`. That
+was **not a defect**. Verified against the schedule: the runner restarted at
+08:47 NY, nine of that day's windows had closed by 09:30, and `09:45-10:15` is
+exactly the **first window that had not closed yet** (it closes at 10:15). The day
+was in progress.
+
+The tool was wrong to call it a failure. It compared rows against all 21 scheduled
+windows with no notion of the current time, so *every* mid-run certification would
+report phantom missing windows — which made it unfit to run unsupervised, the one
+thing it exists for.
+
+**Now it distinguishes four verdicts, with four exit codes:**
+
+| verdict | meaning | exit |
+|---|---|---|
+| `PASS` | all four conditions hold; the day counts | 0 |
+| `FAIL` | a condition broke; the day does not count | 1 |
+| `NOT_APPLICABLE` | a weekend, or bad usage | 2 |
+| `INCOMPLETE` | nothing is wrong; the day is not finished | 3 |
+
+`INCOMPLETE` is the new one, and it is not a soft failure — it is a statement that
+no verdict is yet possible. A window with no row is now classified by *why*:
+
+1. **not due** — its close is still in the future, plus a 90-second grace (a row
+   lands on the first poll after the close, not at the close);
+2. **awaiting trade** — the window closed and its trade has not resolved. Q13 says
+   the row is written when `simulate()` decides, which can be days later. The
+   evidence is `runner_state.json`'s `pending`, read automatically from the
+   `--out-dir`;
+3. **awaiting data** — held for late bars, still inside the grace (`deferred`);
+4. **missing** — none of the above. The only one that fails.
+
+Case 2 matters as much as case 1: without the state file, *every open trade* would
+be reported as a missing window. Removing the state file is tested to fall back to
+`FAIL`, because an unexplained absence should not be excused by optimism.
+
+**What it prints now** (the reported case, replayed at 09:30 NY):
+
+```
+2026-10-28  FAIL
+  rows            : 9/21 scheduled windows
+  [FAIL] gaps     4 row(s) the runner did not observe: 04:45-05:15, ... 07:45-08:15
+  -> this day does NOT count; the consecutive run restarts here
+```
+
+The phantom coverage failure is gone. What remains is real: those four windows
+fall inside the 04:57-08:47 downtime and are gap rows by construction.
+
+And with those four windows absent from the log instead of logged as gaps:
+
+```
+2026-10-28  INCOMPLETE - too early to certify, this is not a failure
+  rows            : 9/21 scheduled windows
+  [ok]   coverage all scheduled windows logged exactly once (nothing found against it yet)
+  wait:  12 window(s) have not closed yet (next: 09:45-10:15, closes 10:15 NY)
+  -> NOT a defect. Re-run when the day is complete.
+  -> the day is final after 2026-10-29 00:15 NY
+```
+
+That last line is the answer to a question people get wrong: a trading date's
+final window closes at **00:15 the following NY day**, so "is 28 Oct done?" is not
+answered by the calendar date.
+
+`--now ISO` pins the clock (naive = New York wall clock), so a past moment can be
+replayed exactly — which is how the reported case was reproduced and how the tests
+stay deterministic. Leaving the real clock in a test is what let the first version
+pass by luck: the sandbox happened to sit at 11:21 NY.
+
+Two smaller fixes in the same pass:
+
+* the tool's default `--out-dir` was `./output`, while the runner writes to
+  `bot/live/output`. Running `python live/audit_triage.py --certify DATE` with no
+  arguments — the unsupervised case — read the wrong directory. It now defaults to
+  the runner's own directory.
+* a missing log *file* is a usage error (exit 2), but a log file with no rows yet
+  for the date is a legitimate `INCOMPLETE`. Those were the same branch.
+
+#### Consequence for the clean-day clock: 28 Oct cannot itself PASS
+
+The §15.16 decision — clock starts at the 28 Oct 08:47 restart — is right about
+excluding earlier days, but **28 Oct is not a candidate day in its own right**:
+nine of its windows opened before the restart, so it necessarily contains gap rows
+and `--certify` can never pass it. The first day that can be certified is
+**29 Oct**.
+
+That is a scheduling fact, not a change to the decision: the restart is still the
+moment the clock starts, and the first eligible day is the first full day after it.
+Five consecutive clean days therefore means 29-30 Oct and 2-4 Nov at the earliest,
+subject to `--certify` saying PASS for each.
 
