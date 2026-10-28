@@ -1319,6 +1319,27 @@ the state file's heartbeat is under 90 s old, overridable with `--force`.
 A window cannot get permanently stuck in `deferred`: the retry always terminates
 once `DATA_LAG_GRACE_SECONDS` passes.
 
+**A second hole, found in the same data and fixed the same way.** The monitor has
+two multi-hour sampling gaps (27 Oct 20:20 → 28 Oct 01:44, and 01:44 → 03:36) with
+**no `start` or `stop` event anywhere near them**. So the runner was not restarted
+— it was alive and not polling, most likely blocked inside an MT5 call on a dead
+socket, which is consistent with both processes freezing at the same moment.
+
+An interval left open *in memory* has the identical effect to one left open in the
+file: `_intervals` extends it to now, so the hole counted as watched. Seven windows
+closing inside those gaps were therefore evaluated rather than logged as gaps.
+`step()` now detects a hole longer than `POLL_GAP_SECONDS` (300 s), closes the
+interval at the previous heartbeat, and opens a new one — so the hole becomes
+unobserved and its windows become gaps. A `polling_gap` event records it.
+
+This also means the "22 stalls" breakdown is right about the *feed* and
+incomplete about the *runner*: for the seven windows inside those gaps the runner
+was neither watching nor awake, so they are **both** a feed stall and an
+observation gap. The reconciliation keeps `live_feed_stalled` for them because
+that is what the row's own shape shows, but the honest one-line summary is
+"stalled feed, unwatched runner". Neither label is scored as market behaviour,
+which is the property that matters.
+
 **(b) Nothing needs clearing. Keep `runner_state.json` and every CSV.**
 
 The state file self-heals: unreadable → treated as a first start (cost: some

@@ -126,6 +126,13 @@ DATA_LAG_GRACE_SECONDS = 300.0
 #: this clears itself within two minutes.
 DOUBLE_RUNNER_GUARD_SECONDS = 90.0
 
+#: If two polls are further apart than this, the runner was not watching in
+#: between — the machine slept, or an MT5 call blocked on a dead socket. The
+#: observation interval is split rather than extended across the hole. Five
+#: minutes is far longer than any healthy poll (20 s), so this cannot fire during
+#: normal operation, and it is the same threshold as DATA_LAG_GRACE_SECONDS.
+POLL_GAP_SECONDS = 300.0
+
 
 # ---------------------------------------------------------------------------
 # Window <-> UTC, with the DST guard
@@ -464,6 +471,7 @@ class DryRunRunner:
         """One poll cycle: refresh, evaluate due windows, advance pending, gap-fill."""
         result = StepResult()
         now = self._now_fn()
+        previous_heartbeat = self.state.last_heartbeat_utc
 
         try:
             report = self.source.refresh()
@@ -491,6 +499,26 @@ class DryRunRunner:
             self.connected = True
             self.emitter.event("reconnect", "feed restored", when=broker_now_ny(now))
             self._log("feed restored")
+
+        # --- was there a hole between the last poll and this one? ------------
+        # A killed process leaves an interval open in the file (closed on load).
+        # A *suspended* or blocked one leaves it open in memory, and `_intervals`
+        # would extend it to now — claiming we watched minutes we were not even
+        # running for. Split the interval instead: the hole becomes unobserved,
+        # which is what turns those windows into gaps rather than evaluations.
+        if (previous_heartbeat is not None
+                and now - previous_heartbeat > POLL_GAP_SECONDS):
+            hole = now - previous_heartbeat
+            self._close_observation(previous_heartbeat)
+            self._open_observation(now)
+            self.emitter.event(
+                "polling_gap",
+                f"{hole / 60:.0f} min between polls (machine asleep or an MT5 "
+                f"call blocked). The interval is split, so windows closing in "
+                f"that hole are gaps, not evaluations.",
+                when=broker_now_ny(now),
+            )
+            self._log(f"polling gap of {hole / 60:.0f} min — interval split")
 
         self.state.last_heartbeat_utc = now
         series = self.source.series

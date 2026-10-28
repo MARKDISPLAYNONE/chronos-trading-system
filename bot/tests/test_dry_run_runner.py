@@ -614,18 +614,26 @@ class TestFullTradingDay(RunnerHarness):
     """≥5 consecutive days is the real exit criterion; this proves one full day,
     and the mechanism is identical for the rest."""
 
-    def _run_day(self, day=dt.date(2026, 10, 26), poll_minutes=15):
-        start = dt.datetime.combine(day - dt.timedelta(days=1), dt.time(18, 0))
-        end = dt.datetime.combine(day + dt.timedelta(days=1), dt.time(2, 0))
+    def _run_day(self, day=dt.date(2026, 10, 26), poll_seconds=240):
+        """Poll like the real loop does.
+
+        A 15-minute stride would be a runner that is asleep five-sixths of the
+        time, and the polling-gap detector now says so — correctly. Watching a
+        day means polling through it.
+        """
+        # Exactly the trading date: its first window opens at 00:45 and its last
+        # closes at 00:15 the next morning.
+        start = dt.datetime.combine(day, dt.time(0, 0))
+        end = dt.datetime.combine(day + dt.timedelta(days=1), dt.time(0, 30))
         rows = flat_feed(start, end)
-        runner = self.make_runner(rows=rows, start_at=utc_ts(2026, 10, 25, 18, 0))
-        self.clock = utc_ts(2026, 10, 25, 18, 0)
+        runner = self.make_runner(rows=rows, start_at=utc_ts(2026, 10, 26, 0, 0))
+        self.clock = utc_ts(2026, 10, 26, 0, 0)
 
         cur = start
         while cur <= end:
             self.clock = cur.replace(tzinfo=NY).timestamp()
             runner.step()
-            cur += dt.timedelta(minutes=poll_minutes)
+            cur += dt.timedelta(seconds=poll_seconds)
         runner.stop()
         return runner
 
@@ -915,6 +923,60 @@ class TestDeferredWindowAcrossACrash(RunnerHarness):
         self.assertIsNotNone(row)
         self.assertIn(row["outcome"], ("WIN", "LOSS"),
                       "the same process saw the bar arrive, so this is an observation")
+
+
+# ---------------------------------------------------------------------------
+# A suspended or blocked process must not count as watching
+# ---------------------------------------------------------------------------
+class TestPollingGap(RunnerHarness):
+    """The 28 Oct shape: alive, no start/stop event, but not polling.
+
+    dst_monitor has two multi-hour sampling gaps with no runner restart around
+    them, and windows closing inside them were evaluated anyway. A single `None`
+    interval end is read as "extends to now", so the hole silently counted as
+    observation — the same class of bug as a dangling interval after a kill, but
+    inside one living process.
+    """
+
+    def test_a_long_hole_splits_the_interval_and_makes_the_window_a_gap(self):
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        runner = self.make_runner(rows=rows)
+        runner.step()                                   # polling normally
+
+        # The machine sleeps (or an MT5 call blocks) for 5.5 hours, spanning the
+        # 13:45-14:15 window, then wakes up.
+        self.clock = utc_ts(2026, 10, 26, 14, 30) + 4 * 3600
+        runner.step()
+
+        self.assertEqual(len(runner.state.observations), 2,
+                         "the hole must be a gap between two intervals")
+        row = self.window_row(TRADE_LABEL)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["reason"], REASON_RUNNER_DOWN)
+        self.assertIn("polling_gap",
+                      [e["kind"] for e in self.read("runner_events.csv")])
+
+    def test_a_normal_poll_does_not_split_anything(self):
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        runner = self.make_runner(rows=rows)
+        for _ in range(5):
+            runner.step()
+            self.clock += 20
+        self.assertEqual(len(runner.state.observations), 1)
+        self.assertNotIn("polling_gap",
+                         [e["kind"] for e in self.read("runner_events.csv")])
+
+    def test_the_split_covers_exactly_up_to_the_last_poll(self):
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        runner = self.make_runner(rows=rows)
+        last_poll = self.clock
+        runner.step()
+        last_poll = self.clock
+        self.clock += 4 * 3600
+        runner.step()
+        lo, hi = runner.state.observations[0]
+        self.assertEqual(hi, last_poll)
+        self.assertEqual(runner.state.observations[1][0], self.clock)
 
 
 # ---------------------------------------------------------------------------
