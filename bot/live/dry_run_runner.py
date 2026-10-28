@@ -120,6 +120,12 @@ GAP_LOOKBACK_HOURS = 26
 #: boundary between a late bar and a dead feed.
 DATA_LAG_GRACE_SECONDS = 300.0
 
+#: How recent a heartbeat must be before a restart refuses to start without
+#: `--force`. Two runners writing to one append-only log would duplicate rows, so
+#: the guard is deliberately paranoid; a killed process stops heartbeating, so
+#: this clears itself within two minutes.
+DOUBLE_RUNNER_GUARD_SECONDS = 90.0
+
 
 # ---------------------------------------------------------------------------
 # Window <-> UTC, with the DST guard
@@ -208,6 +214,10 @@ class RunnerState:
     #: `pending`; the value records when the deferral started, which is what
     #: DATA_LAG_GRACE_SECONDS is measured against.
     deferred: dict[str, dict] = field(default_factory=dict)
+    #: True only when `stop()` ran. An unclean kill (closing the terminal, a
+    #: power cut) leaves this False, which is how the next launch knows the
+    #: previous session was not closed deliberately.
+    clean_stop: bool = False
 
     @classmethod
     def load(cls, path: pathlib.Path) -> "RunnerState":
@@ -226,7 +236,34 @@ class RunnerState:
         state.observations = [tuple(x) for x in raw.get("observations", [])]
         state.pending = raw.get("pending", {})
         state.deferred = raw.get("deferred", {})
+        state.clean_stop = bool(raw.get("clean_stop", False))
+        state._close_dangling_observation()
         return state
+
+    def _close_dangling_observation(self) -> None:
+        """An interval left open by a kill must NOT swallow the downtime.
+
+        `_open_observation` appends `(start, None)`, and `_intervals` reads a
+        trailing None as "still open, extends to now". If the process is killed —
+        closing the terminal window, a power cut — that `None` is never closed,
+        so on the next launch the interval silently stretches across the whole
+        outage. Every window inside it then passes the Q14 observation gate and
+        gets scored from back-filled broker history: exactly the thing the gate
+        exists to prevent, and invisible in the log because the rows look normal.
+
+        The last heartbeat is the last moment we know we were alive, so the
+        interval is closed there. If there is no heartbeat, we cannot say we were
+        watching at all, so the interval is dropped rather than guessed.
+        """
+        if not self.observations:
+            return
+        lo, hi = self.observations[-1]
+        if hi is not None:
+            return
+        if self.last_heartbeat_utc is not None and self.last_heartbeat_utc >= lo:
+            self.observations[-1] = (lo, self.last_heartbeat_utc)
+        else:
+            self.observations.pop()
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -236,6 +273,7 @@ class RunnerState:
             "observations": [list(x) for x in self.observations],
             "pending": self.pending,
             "deferred": self.deferred,
+            "clean_stop": self.clean_stop,
             "saved_utc": dt.datetime.now(UTC).isoformat(),
         }
         tmp = self.path.with_suffix(".tmp")
@@ -297,11 +335,32 @@ class DryRunRunner:
         self._warned_empty = False
 
     # -- lifecycle --------------------------------------------------------
-    def start(self, *, connect_terminal: bool = True) -> dict:
+    def start(self, *, connect_terminal: bool = True, force: bool = False,
+              preflight: bool = False) -> dict:
         """Connect, run the guards, reconcile the previous run. Idempotent-ish."""
         now = self._now_fn()
         if self.state.first_start_utc is None:
             self.state.first_start_utc = now
+
+        # --- was the previous session closed deliberately? -------------------
+        # A recent heartbeat with no clean stop means another copy may still be
+        # running. Two runners share one append-only log and would each emit the
+        # same window, which cannot be undone: `already_emitted` is per-process.
+        self.previous_shutdown = "first_start" if self.state.clean_stop is False and \
+            self.state.last_heartbeat_utc is None else (
+                "clean" if self.state.clean_stop else "unclean")
+        heartbeat_age = (now - self.state.last_heartbeat_utc
+                         if self.state.last_heartbeat_utc is not None else None)
+        if (heartbeat_age is not None and not self.state.clean_stop
+                and heartbeat_age < DOUBLE_RUNNER_GUARD_SECONDS and not force):
+            raise RuntimeError(
+                f"another runner may still be alive: the state file was last "
+                f"written {heartbeat_age:.0f}s ago without a clean shutdown. Two "
+                f"runners appending to the same CSVs would duplicate rows. If you "
+                f"are certain no runner is running, wait "
+                f"{DOUBLE_RUNNER_GUARD_SECONDS - heartbeat_age:.0f}s or pass "
+                f"--force."
+            )
 
         facts: dict = {}
         if connect_terminal and self._injected_source is None:
@@ -317,6 +376,19 @@ class DryRunRunner:
         days = self._days_in_planned_range(now)
         checked = assert_schedule_is_dst_safe(days)
         facts["dst_safe_dates"] = len(checked)
+
+        if preflight:
+            # `--check` must never write: no observation opened, no event, no
+            # state saved, no gap rows. A preflight that mutated the log would
+            # consume the very rows it is meant to warn you about.
+            facts["previous_shutdown"] = self.previous_shutdown
+            facts["bars_loaded"] = len(self.source.series)
+            facts["pending_at_last_stop"] = len(self.state.pending)
+            facts["deferred_at_last_stop"] = len(self.state.deferred)
+            facts["observation_intervals"] = len(self.state.observations)
+            facts["gap_scan_would_start_utc"] = dt.datetime.fromtimestamp(
+                self._gap_scan_lower_bound(now), UTC).isoformat(timespec="seconds")
+            return facts
 
         self._open_observation(now)
         self.connected = True
@@ -334,10 +406,59 @@ class DryRunRunner:
             f"{len(checked)} trading dates verified DST-safe"
         )
 
+        if self.previous_shutdown == "unclean":
+            self.emitter.event(
+                "unclean_shutdown_detected",
+                f"previous session did not log a clean stop; last heartbeat "
+                f"{heartbeat_age:.0f}s before this start. Any window after that "
+                f"heartbeat is a gap, not an evaluation.",
+                when=broker_now_ny(now),
+            )
+            self._log(f"previous shutdown was unclean ({heartbeat_age:.0f}s ago)")
+
         # --- reconcile anything that was pending when we died (Q14) ---------
         self._reconcile_pending_after_crash(now)
+        # A window deferred just before the kill has one honest description: we
+        # never saw its data while we were alive, so anything readable now came
+        # from broker back-fill. That is a gap, not an evaluation.
+        self._reconcile_deferred_after_crash(now)
+        self.state.clean_stop = False
         self.state.save()
         return facts
+
+    def _reconcile_deferred_after_crash(self, now: float) -> None:
+        """Deferrals carried across a restart become gaps, never scores.
+
+        While the process is alive, a deferral is resolved by the *next* poll —
+        the bar arriving late is still something the runner saw live. Across a
+        restart that is no longer true: whatever is in the terminal now arrived
+        while we were not watching, so scoring it would be reading broker history
+        and calling it an observation.
+        """
+        for key in list(self.state.deferred):
+            day_s, label = key.split("|")
+            window = next((w for w in time_windows.windows_for_day(
+                dt.date.fromisoformat(day_s)) if w.label == label), None)
+            self.state.deferred.pop(key, None)
+            if window is None:                      # pragma: no cover - defensive
+                continue
+            try:
+                ev = self._evaluate(window)
+            except Exception:
+                ev = None
+            gap = gap_evaluation(
+                window, detail="deferred_across_restart",
+                source=ev if (ev is not None and ev.plan is not None) else None,
+            )
+            if self._emit_checked(gap, now):
+                self.emitter.event(
+                    "gap",
+                    f"{key} was waiting on late bars when the runner stopped; "
+                    f"logged as {REASON_RUNNER_DOWN} rather than scored from "
+                    f"back-filled data",
+                    when=self._ny_now(now),
+                )
+                self._log(f"deferred across restart: {key} -> {REASON_RUNNER_DOWN}")
 
     def step(self) -> StepResult:
         """One poll cycle: refresh, evaluate due windows, advance pending, gap-fill."""
@@ -421,6 +542,7 @@ class DryRunRunner:
     def stop(self) -> None:
         now = self._now_fn()
         self._close_observation(now)
+        self.state.clean_stop = True
         self.state.save()
         self.emitter.event(
             "stop",
@@ -862,13 +984,17 @@ def main(argv: list[str] | None = None, mt5_module=None) -> int:
     try:
         facts = runner.start()
         if args.check:
-            print("\n--- startup checks ---")
+            print("\n--- startup checks (read-only: nothing written) ---")
             for k, v in facts.items():
                 print(f"  {k}: {v}")
-            print(f"  DST-safe dates verified: {facts.get('dst_safe_dates')}")
-            print(f"  bars loaded            : {len(runner.source.series)}")
+            if facts.get("pending_at_last_stop"):
+                print(f"\nNOTE: {facts['pending_at_last_stop']} trade(s) were open at "
+                      f"the last stop; they will be logged as {REASON_RUNNER_DOWN} "
+                      f"(never resolved from history) when the runner really starts.")
+            if facts.get("deferred_at_last_stop"):
+                print(f"NOTE: {facts['deferred_at_last_stop']} window(s) were waiting on "
+                      f"late bars; they will be logged as {REASON_RUNNER_DOWN} on start.")
             print("\nREADY: the runner can start. No orders are reachable from it.")
-            runner.stop()
             return 0
         rc = runner.run(max_seconds=args.max_runtime_seconds)
         return rc

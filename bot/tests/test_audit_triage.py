@@ -18,10 +18,12 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from live.audit_triage import (  # noqa: E402
     LIVE_LEGAL_REASONS,
     main,
+    monitor_gaps,
     parse_period,
     rederive,
     self_check,
     show_row,
+    stall_intervals,
     triage_outside_range,
 )
 
@@ -68,8 +70,8 @@ class TestOutsideRangeTriage(unittest.TestCase):
         rows = [audit_row(reason="outside_data_range",
                           flags="incomplete_candle", bars_b=14)]
         items, counts = triage_outside_range(rows, None)
-        self.assertEqual(items[0]["verdict"], "unknown_no_outage_data")
-        self.assertEqual(counts, {"unknown_no_outage_data": 1})
+        self.assertEqual(items[0]["verdict"], "unknown_no_evidence")
+        self.assertEqual(counts, {"unknown_no_evidence": 1})
 
     def test_only_outside_range_rows_are_returned(self):
         rows = [
@@ -151,46 +153,178 @@ class TestSelfConsistency(unittest.TestCase):
         self.assertIn("0.4", text)
 
 
+class TestAllowList(unittest.TestCase):
+    """The 43-of-46 false positive: the list omitted every WIN/LOSS reason."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.out = pathlib.Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_every_trade_exit_reason_is_legal(self):
+        from src import trade_simulator
+
+        for reason in (trade_simulator.REASON_TP, trade_simulator.REASON_SL,
+                       trade_simulator.REASON_BREAKEVEN_AFTER_PARTIAL,
+                       trade_simulator.REASON_TP_AFTER_PARTIAL,
+                       trade_simulator.REASON_UNRESOLVED):
+            self.assertIn(reason, LIVE_LEGAL_REASONS)
+
+    def test_the_allow_list_is_derived_not_hand_listed(self):
+        """A hand-written copy drifts; this one is built from the modules."""
+        from src import sweep_detector, trade_simulator
+
+        self.assertIn(trade_simulator.REASON_SL, LIVE_LEGAL_REASONS)
+        self.assertIn(sweep_detector.REASON_NO_SWEEP, LIVE_LEGAL_REASONS)
+
+    def test_outside_data_range_is_still_illegal(self):
+        self.assertNotIn("outside_data_range", LIVE_LEGAL_REASONS)
+
+    def test_a_clean_file_reports_no_illegal_reasons(self):
+        rows = [audit_row(reason="stop loss hit", context="DISCOUNT"),
+                audit_row(reason="take profit hit", context="PREMIUM"),
+                audit_row(reason="breakeven stop hit after partial", context="PREMIUM"),
+                audit_row(reason="target hit after partial", context="DISCOUNT"),
+                audit_row(reason="no sweep", context="PREMIUM"),
+                audit_row(reason="invalid open location")]
+        self._write_all(rows)
+        self.assertEqual(main(["--illegal-reasons", "--out-dir", str(self.out)]), 0)
+
+    def _write_all(self, rows, columns=None):
+        import csv
+        cols = columns or list(rows[0].keys())
+        for name in ("window_evaluations_audit.csv", "window_evaluations.csv"):
+            with (self.out / name).open("w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
+                w.writeheader()
+                for r in rows:
+                    w.writerow(r)
+
+    def test_it_falls_back_to_the_audit_csv_and_says_so(self):
+        """A missing window_evaluations.csv used to make the check pass silently."""
+        rows = [audit_row(reason="outside_data_range", flags="no_bars_in_window")]
+        import csv
+        with (self.out / "window_evaluations_audit.csv").open(
+                "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()),
+                               extrasaction="ignore")
+            w.writeheader()
+            w.writerow(rows[0])
+        self.assertEqual(main(["--illegal-reasons", "--out-dir", str(self.out)]), 1)
+
+
+class TestMonitorEvidence(unittest.TestCase):
+    """Classification by measured staleness, not by a pre-supplied outage list."""
+
+    def monitor(self, pairs):
+        return [(dt.datetime.fromisoformat(a), dt.datetime.fromisoformat(b))
+                for a, b in pairs]
+
+    def test_a_healthy_feed_makes_the_short_tail_case(self):
+        mon = self.monitor([("2026-10-26T10:15:30", "2026-10-26T10:15:00")])
+        rows = [audit_row(label="09:45-10:15", reason="outside_data_range",
+                          flags="incomplete_candle", bars_a=15, bars_b=14)]
+        items, counts = triage_outside_range(rows, None, mon)
+        self.assertEqual(items[0]["verdict"], "transient_tail")
+        self.assertEqual(items[0]["confidence"], "measured")
+        self.assertEqual(counts, {"transient_tail": 1})
+
+    def test_a_frozen_feed_makes_it_a_stall(self):
+        mon = self.monitor([("2026-10-27T07:15:30", "2026-10-27T06:37:00")])
+        rows = [audit_row(day="2026-10-27", label="06:45-07:15",
+                          reason="outside_data_range",
+                          flags="no_bars_in_window")]
+        items, _ = triage_outside_range(rows, None, mon)
+        self.assertEqual(items[0]["verdict"], "feed_stalled")
+        self.assertAlmostEqual(items[0]["staleness_minutes"], 38.0)
+
+    def test_a_freeze_is_proven_across_the_monitors_own_downtime(self):
+        """No sample during the window, but frozen before and after it."""
+        mon = self.monitor([("2026-10-27T20:20:00", "2026-10-27T13:13:00"),
+                            ("2026-10-28T01:44:00", "2026-10-27T13:13:00")])
+        rows = [audit_row(day="2026-10-27", label="21:45-22:15",
+                          reason="outside_data_range",
+                          flags="no_bars_in_window")]
+        items, _ = triage_outside_range(rows, None, mon)
+        self.assertEqual(items[0]["verdict"], "feed_stalled")
+        self.assertEqual(items[0]["confidence"], "bracketed")
+
+    def test_outage_range_only_still_works_without_a_monitor(self):
+        rows = [audit_row(label="14:45-15:15", reason="outside_data_range",
+                          flags="no_bars_in_window")]
+        items, _ = triage_outside_range(rows, [OUTAGE], None)
+        self.assertEqual(items[0]["verdict"], "connectivity")
+
+    def test_stall_intervals_finds_each_freeze(self):
+        mon = self.monitor([
+            ("2026-10-27T06:00:00", "2026-10-27T05:59:00"),   # healthy
+            ("2026-10-27T06:38:00", "2026-10-27T06:37:00"),   # freeze begins
+            ("2026-10-27T07:00:00", "2026-10-27T06:37:00"),
+            ("2026-10-27T09:35:00", "2026-10-27T06:37:00"),   # last frozen look
+            ("2026-10-27T09:36:00", "2026-10-27T09:36:00"),   # recovered
+        ])
+        spans = stall_intervals(mon)
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0]["stalled_bar_ny"],
+                         dt.datetime(2026, 10, 27, 6, 37))
+        self.assertAlmostEqual(spans[0]["minutes"], 177.0)
+
+    def test_monitor_gaps_are_reported_separately(self):
+        mon = self.monitor([("2026-10-27T20:20:00", "2026-10-27T13:13:00"),
+                            ("2026-10-28T01:44:00", "2026-10-27T13:13:00")])
+        gaps = monitor_gaps(mon)
+        self.assertEqual(len(gaps), 1)
+        self.assertAlmostEqual((gaps[0][1] - gaps[0][0]).total_seconds() / 60, 324.0)
+
+
 class TestKnownBadFile(unittest.TestCase):
     """The reconciliation list must name real windows, or it reconciles nothing."""
 
-    def test_every_listed_window_exists_in_the_schedule(self):
-        import datetime as dt
-
-        from src import time_windows
-
+    def entries(self):
         path = pathlib.Path(__file__).resolve().parents[1] / "live" / "known_bad_windows.txt"
-        entries = []
+        out = []
         for line in path.read_text().splitlines():
             line = line.strip()
             if line and not line.startswith("#"):
-                entries.append(line.split())
+                out.append(line.split())
+        return out
 
-        self.assertEqual(len(entries), 8, "the outage covered eight windows")
-        for day_s, label in entries:
+    def test_every_listed_window_exists_in_the_schedule(self):
+        from src import time_windows
+
+        for day_s, label, _category in self.entries():
             day = dt.date.fromisoformat(day_s)
             labels = [w.label for w in time_windows.windows_for_day(day)]
             self.assertIn(label, labels, f"{day} has no window {label}")
 
-    def test_the_listed_windows_are_consecutive_through_the_outage(self):
-        """14:45 Monday to 00:45 Tuesday: eight windows, no gaps in the sequence."""
-        import datetime as dt
+    def test_the_list_covers_all_29_outside_data_range_rows(self):
+        entries = self.entries()
+        self.assertEqual(len(entries), 29)
+        self.assertEqual(sum(1 for e in entries if e[2] == "stall"), 22)
+        self.assertEqual(sum(1 for e in entries if e[2] == "tail"), 7)
 
+    def test_no_window_is_listed_twice(self):
+        keys = [(e[0], e[1]) for e in self.entries()]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_the_eight_windows_of_the_first_stall_are_consecutive(self):
+        """14:45 Monday to 00:45 Tuesday: no 15:45/16:45/17:45 slot exists."""
         from src import time_windows
 
-        path = pathlib.Path(__file__).resolve().parents[1] / "live" / "known_bad_windows.txt"
-        entries = [line.split() for line in path.read_text().splitlines()
-                   if line.strip() and not line.startswith("#")]
-        # From 14:45 on the 26th, every remaining window of that trading day
-        # (the 17:00-18:00 break means there is no 15:45/16:45/17:45 slot), then
-        # the 00:45 window which belongs to the 27th.
-        day = dt.date(2026, 10, 26)
-        expected = [w.label for w in sorted(time_windows.windows_for_day(day),
-                                            key=lambda w: w.start_hour)
-                    if w.start_hour >= 14]
+        stall1 = [(d, l) for d, l, c in self.entries()
+                  if c == "stall" and (d, l) in {
+                      ("2026-10-26", "14:45-15:15"), ("2026-10-26", "18:45-19:15"),
+                      ("2026-10-26", "19:45-20:15"), ("2026-10-26", "20:45-21:15"),
+                      ("2026-10-26", "21:45-22:15"), ("2026-10-26", "22:45-23:15"),
+                      ("2026-10-26", "23:45-00:15"), ("2026-10-27", "00:45-01:15")}]
+        self.assertEqual(len(stall1), 8)
+        expected = [w.label for w in sorted(time_windows.windows_for_day(
+            dt.date(2026, 10, 26)), key=lambda w: w.start_hour) if w.start_hour >= 14]
         expected += [w.label for w in time_windows.windows_for_day(dt.date(2026, 10, 27))
                      if w.start_hour == 0]
-        self.assertEqual([e[1] for e in entries], expected)
+        self.assertEqual([l for _d, l in stall1], expected)
 
 
 class TestCli(unittest.TestCase):
@@ -238,14 +372,20 @@ class TestCli(unittest.TestCase):
         self._write([audit_row(label="14:45-15:15", reason="outside_data_range",
                                flags="no_bars_in_window")])
         known = self.out / "known_bad.txt"
-        known.write_text("# the 8 outage windows\n2026-10-26 14:45-15:15\n")
+        known.write_text("# a stall and a late tail\n"
+                         "2026-10-26 14:45-15:15 stall\n"
+                         "2026-10-26 00:45-01:15 tail\n")
         rc = main(["--annotate", "--known-bad", str(known), "--out-dir",
                    str(self.out)])
         self.assertEqual(rc, 0)
         recon = self.out / "window_evaluations_reconciliation.csv"
         text = recon.read_text()
         self.assertIn("14:45-15:15", text)
-        self.assertIn("dry_run_gap_runner_down", text)
+        # A stall is NOT runner downtime: we were watching.
+        self.assertIn("live_feed_stalled", text)
+        self.assertNotIn("dry_run_gap_runner_down", text)
+        # A late tail was never correctly evaluated, so no invented outcome.
+        self.assertIn("transient_lag_not_evaluated", text)
         original = (self.out / "window_evaluations_audit.csv").read_text()
         self.assertIn("outside_data_range", original,
                       "the original row must be left exactly as it was")

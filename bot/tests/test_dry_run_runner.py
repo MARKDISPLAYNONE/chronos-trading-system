@@ -849,19 +849,21 @@ class TestNoOrderPath(unittest.TestCase):
                     bad.append(f"{name}:{token}")
         self.assertEqual(bad, [], f"order-capable symbols reachable: {bad}")
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
+# ---------------------------------------------------------------------------
+# Deferral across a restart
+# ---------------------------------------------------------------------------
 class TestDeferredWindowAcrossACrash(RunnerHarness):
-    """Deferral is about *data*, not about attention — the two must not conflate.
+    """A deferral is only resolvable while the process that opened it is alive.
 
-    A window that was fully watched before the runner stopped stays scoreable
-    even though its bars only landed after the restart: we were looking, the feed
-    was late, and nothing about the window was missed. Q14's gate is about
-    windows the runner did not watch, and it must not be widened to cover this
-    case by accident (that would throw away a real, observed evaluation).
+    A deferral exists because *no data arrived* for the window while the runner
+    was running. So if the entry is still there at the next launch, everything
+    readable in the terminal now arrived while we were not watching — and scoring
+    it would be reading broker back-fill and calling it an observation. That is
+    Q14's prohibition, so it becomes a gap.
+
+    (An earlier cut scored such a window because its own span had been watched
+    end to end. That was wrong: the span being watched says nothing about whether
+    the window's *content* was ever seen.)
     """
 
     def lagging_runner(self, rows):
@@ -875,7 +877,7 @@ class TestDeferredWindowAcrossACrash(RunnerHarness):
         runner.start(connect_terminal=False)
         return runner
 
-    def test_a_fully_watched_window_is_still_scored_across_a_restart(self):
+    def test_a_deferral_that_survives_a_restart_becomes_a_gap(self):
         rows = build_feed(up_to=dt.datetime(2026, 10, 26, 15, 30))
         runner = self.lagging_runner(rows)
         self.clock = dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp()
@@ -883,18 +885,142 @@ class TestDeferredWindowAcrossACrash(RunnerHarness):
         key = window_key(time_windows.Window(dt.date(2026, 10, 26), 13))
         self.assertIn(key, runner.state.deferred)
 
-        runner.stop()
+        runner.stop()                       # or: the terminal window is closed
         revived = DryRunRunner(
             self.mt5, self.out, source=self.source, now_fn=lambda: self.clock,
             log=self.logs.append,
         )
         self.clock = dt.datetime(2026, 10, 26, 16, 0, tzinfo=NY).timestamp()
         revived.start(connect_terminal=False)
-        revived.step()
 
+        row = self.window_row(TRADE_LABEL)
+        self.assertIsNotNone(row, "the window must not be left unwritten")
+        self.assertEqual(row["reason"], REASON_RUNNER_DOWN)
+        self.assertNotIn(key, revived.state.deferred)
+        audit = [r for r in self.read("window_evaluations_audit.csv")
+                 if r["window_label"] == TRADE_LABEL][0]
+        self.assertIn("deferred_across_restart", audit["flags"])
+
+    def test_a_deferral_resolved_before_any_restart_is_still_scored(self):
+        """The contrast that keeps the rule from being over-applied."""
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 15, 30))
+        runner = self.lagging_runner(rows)
+        self.clock = dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp()
+        runner.step()
+        self.assertIsNone(self.window_row(TRADE_LABEL))
+
+        self.clock = dt.datetime(2026, 10, 26, 16, 0, tzinfo=NY).timestamp()
+        runner.step()
         row = self.window_row(TRADE_LABEL)
         self.assertIsNotNone(row)
         self.assertIn(row["outcome"], ("WIN", "LOSS"),
-                      "the window was watched end to end; it is not a gap")
-        self.assertNotEqual(row["reason"], REASON_RUNNER_DOWN)
-        self.assertNotIn(key, revived.state.deferred)
+                      "the same process saw the bar arrive, so this is an observation")
+
+
+# ---------------------------------------------------------------------------
+# Restart safety: an unclean kill must not become an observation
+# ---------------------------------------------------------------------------
+class TestUncleanRestart(RunnerHarness):
+    def state_file(self, **overrides):
+        import json
+
+        payload = {
+            "first_start_utc": utc_ts(2026, 10, 26, 13, 0),
+            "last_heartbeat_utc": utc_ts(2026, 10, 26, 13, 55),
+            "observations": [[utc_ts(2026, 10, 26, 13, 0), None]],
+            "pending": {},
+            "deferred": {},
+            "clean_stop": False,
+            "saved_utc": "2026-10-26T13:55:00+00:00",
+        }
+        payload.update(overrides)
+        (self.out / "runner_state.json").write_text(json.dumps(payload))
+        return payload
+
+    def test_a_dangling_interval_is_closed_at_the_last_heartbeat(self):
+        """The hole this test exists for: `None` would stretch to mean 'now'."""
+        self.state_file()
+        state = RunnerState.load(self.out / "runner_state.json")
+        self.assertEqual(state.observations[-1][1], utc_ts(2026, 10, 26, 13, 55))
+
+    def test_a_dangling_interval_without_a_heartbeat_is_dropped(self):
+        self.state_file(last_heartbeat_utc=None, clean_stop=False,
+                        observations=[[utc_ts(2026, 10, 26, 13, 0), None]])
+        state = RunnerState.load(self.out / "runner_state.json")
+        self.assertEqual(state.observations, [],
+                         "nothing to vouch for the interval: drop it, do not guess")
+
+    def test_the_downtime_after_a_kill_is_not_observed(self):
+        self.state_file()
+        state = RunnerState.load(self.out / "runner_state.json")
+        restart = utc_ts(2026, 10, 26, 20, 0)
+        intervals = [(lo, restart if hi is None else hi)
+                     for lo, hi in state.observations]
+        self.assertFalse(observed(intervals, utc_ts(2026, 10, 26, 18, 45),
+                                  utc_ts(2026, 10, 26, 19, 15), 120),
+                         "a window that closed during the outage must not count "
+                         "as watched")
+
+    def test_a_fresh_heartbeat_blocks_a_second_runner(self):
+        self.state_file(last_heartbeat_utc=self.START_CLOCK - 30)
+        self.clock = self.START_CLOCK
+        runner = DryRunRunner(None, self.out, source=None,
+                              now_fn=lambda: self.clock, log=self.logs.append)
+        with self.assertRaises(RuntimeError) as ctx:
+            runner.start(connect_terminal=False, preflight=True)
+        self.assertIn("another runner may still be alive", str(ctx.exception))
+
+    def test_force_overrides_the_guard(self):
+        self.state_file(last_heartbeat_utc=self.START_CLOCK - 30)
+        self.clock = self.START_CLOCK
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        runner = DryRunRunner(FakeMT5(rows), self.out,
+                              source=FakeSource(rows, lambda: self.clock),
+                              now_fn=lambda: self.clock, log=self.logs.append)
+        facts = runner.start(connect_terminal=False, force=True, preflight=True)
+        self.assertEqual(facts["previous_shutdown"], "unclean")
+
+    def test_an_unclean_shutdown_is_recorded_in_the_event_log(self):
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        self.state_file()
+        self.clock = utc_ts(2026, 10, 26, 20, 0)
+        runner = DryRunRunner(FakeMT5(rows), self.out,
+                              source=FakeSource(rows, lambda: self.clock),
+                              now_fn=lambda: self.clock, log=self.logs.append)
+        runner.start(connect_terminal=False)
+        kinds = [r["kind"] for r in self.read("runner_events.csv")]
+        self.assertIn("unclean_shutdown_detected", kinds)
+
+    def test_a_clean_stop_is_not_reported_as_unclean(self):
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        runner = DryRunRunner(FakeMT5(rows), self.out,
+                              source=FakeSource(rows, lambda: self.clock),
+                              now_fn=lambda: self.clock, log=self.logs.append)
+        runner.start(connect_terminal=False)
+        runner.stop()
+
+        self.clock = utc_ts(2026, 10, 26, 20, 0)
+        again = DryRunRunner(FakeMT5(rows), self.out,
+                             source=FakeSource(rows, lambda: self.clock),
+                             now_fn=lambda: self.clock, log=self.logs.append)
+        facts = again.start(connect_terminal=False, preflight=True)
+        self.assertEqual(facts["previous_shutdown"], "clean")
+
+    def test_preflight_writes_nothing_at_all(self):
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        self.state_file(pending={"2026-10-26|13": {"direction": "SHORT"}})
+        self.clock = utc_ts(2026, 10, 26, 20, 0)
+        before = (self.out / "runner_state.json").read_text()
+        runner = DryRunRunner(FakeMT5(rows), self.out,
+                              source=FakeSource(rows, lambda: self.clock),
+                              now_fn=lambda: self.clock, log=self.logs.append)
+        facts = runner.start(connect_terminal=False, preflight=True)
+        self.assertEqual(facts["pending_at_last_stop"], 1)
+        self.assertEqual(self.read("window_evaluations.csv"), [])
+        self.assertEqual(self.read("runner_events.csv"), [])
+        self.assertEqual((self.out / "runner_state.json").read_text(), before,
+                         "a preflight must not touch the state file")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -51,6 +51,9 @@ from decimal import Decimal, InvalidOperation
 #: `bot/`, so the `src` package would not be importable without this.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+from live import csv_emitter  # noqa: E402
+from src import context_classifier, sweep_detector, trade_simulator  # noqa: E402
+from src import window_evaluator  # noqa: E402
 from src.context_classifier import PREMIUM, VOID, classify  # noqa: E402
 from src.window_evaluator import REASON_OUTSIDE_RANGE  # noqa: E402
 
@@ -65,19 +68,47 @@ RECONCILIATION_COLUMNS = [
     "note",
 ]
 
-#: Reason strings a live row may legitimately carry. Anything else in the log is
-#: a vocabulary leak from the backtest code paths.
-LIVE_LEGAL_REASONS = {
-    "no sweep",
-    "sweep not reversed",
-    "ambiguous_same_bar_insufficient_granularity",
-    "invalid open location",
-    "market_closed_no_data",
-    "missing_market_data",
-    "data_ends_before_trade_closed",
-    "dry_run_gap_runner_down",
-    "live_feed_stalled",
-}
+#: Every reason string a live row may legitimately carry.
+#:
+#: This is DERIVED from the modules that produce the strings, not hand-listed.
+#: The hand-listed version had a real defect: it contained the NO_SETUP and gap
+#: vocabulary but omitted the WIN/LOSS exit reasons, so `--illegal-reasons` flagged
+#: 43 of 46 live rows — including `stop loss hit` and `take profit hit`, which are
+#: the *most* legitimate strings in the file. A checker that cries wolf on the
+#: normal case is worse than no checker, because it trains you to ignore it.
+#:
+#: Importing the constants means the check cannot drift again: adding an exit
+#: reason to `trade_simulator` extends the allow-list automatically, and a typo in
+#: a reason string is still caught.
+LIVE_LEGAL_REASONS = frozenset({
+    # --- trade exits (src/trade_simulator.py) -----------------------------
+    trade_simulator.REASON_TP,
+    trade_simulator.REASON_SL,
+    trade_simulator.REASON_BREAKEVEN_AFTER_PARTIAL,
+    trade_simulator.REASON_TP_AFTER_PARTIAL,
+    trade_simulator.REASON_UNRESOLVED,
+    # --- no-setup / void (src/window_evaluator.py, src/context_classifier.py)
+    context_classifier.REASON_INVALID_OPEN_LOCATION,
+    window_evaluator.REASON_MARKET_CLOSED,
+    window_evaluator.REASON_MISSING_DATA,
+    window_evaluator.REASON_NONEXISTENT_LOCAL_TIME,
+    # `outside_data_range` is deliberately ABSENT: it is a backtest verdict that
+    # live code must never write. Its absence from this set is the assertion.
+    # --- sweep (src/sweep_detector.py) ------------------------------------
+    sweep_detector.REASON_NO_SWEEP,
+    sweep_detector.REASON_SWEEP_NOT_REVERSED,
+    sweep_detector.REASON_AMBIGUOUS_SAME_BAR,
+    # --- phase 2 operational (live/csv_emitter.py) -------------------------
+    csv_emitter.REASON_RUNNER_DOWN,
+    csv_emitter.REASON_LIVE_FEED_STALLED,
+})
+
+#: The gap/stall reasons occupy the same column as market reasons, so a consumer
+#: must be able to tell "the market did this" from "we failed to watch it".
+OPERATIONAL_REASONS = frozenset({
+    csv_emitter.REASON_RUNNER_DOWN,
+    csv_emitter.REASON_LIVE_FEED_STALLED,
+})
 
 
 def _dec(value: str) -> Decimal | None:
@@ -110,21 +141,115 @@ def within(day: str, label: str, lo: dt.datetime, hi: dt.datetime) -> bool:
 # ---------------------------------------------------------------------------
 # 1. outside_data_range triage
 # ---------------------------------------------------------------------------
+def load_monitor(path: pathlib.Path) -> list[tuple[dt.datetime, dt.datetime]]:
+    """(sample NY wall clock, newest bar NY) pairs from `dst_monitor.csv`."""
+    out = []
+    for row in read_rows(path):
+        try:
+            when = dt.datetime.fromisoformat(row["ny_wall"])
+            newest = dt.datetime.fromisoformat(row["window_last_ny"])
+        except (KeyError, ValueError):
+            continue
+        out.append((when, newest))
+    return out
+
+
+def newest_bar_at(monitor, when: dt.datetime,
+                  tolerance_seconds: float = 120.0) -> dt.datetime | None:
+    """The newest bar the monitor could see at `when`, or None if it was down."""
+    for sample_at, newest in monitor:
+        delta = (sample_at - when).total_seconds()
+        if 0 <= delta <= tolerance_seconds:
+            return newest
+    return None
+
+
+def first_sample_after(monitor, when: dt.datetime):
+    """The next monitor sample at/after `when`, however far away it is.
+
+    Used for bracketing: a sample taken *later* still tells us what the terminal
+    did not have. If at 01:44 the newest bar is 13:13 and the wing closed at
+    21:00, the wing had nothing, regardless of the monitor being silent at 21:00.
+    """
+    for sample_at, newest in monitor:
+        if sample_at >= when:
+            return sample_at, newest
+    return None, None
+
+
+def feed_staleness(monitor, window_end: dt.datetime) -> float | None:
+    """Minutes between the newest bar and the window's close. None = no sample."""
+    newest = newest_bar_at(monitor, window_end)
+    if newest is None:
+        return None
+    return (window_end - newest).total_seconds() / 60.0
+
+
+def stale_before(monitor, start: dt.datetime, close: dt.datetime) -> bool:
+    """Was the terminal already behind the window at its own close?
+
+    The last monitor sample at or before `close` is a direct look at what the
+    terminal had while the window was open. If its newest bar predates the
+    window's start, the window could not have contained a single bar.
+    """
+    last = None
+    for sample_at, newest in monitor:
+        if sample_at <= close:
+            last = newest
+        else:
+            break
+    return last is not None and last <= start
+
+
+def _freeze_brackets(monitor, start: dt.datetime,
+                     close: dt.datetime) -> bool:
+    """Is this window inside a freeze proven by the samples on either side?
+
+    Both halves must hold, or this is not evidence:
+
+    * the newest bar at the next available sample is still older than the
+      window's start (nothing for the window existed when the monitor looked
+      next), and
+    * the freeze is not contradicted by a sample inside the window showing fresh
+      bars.
+    """
+    sample_at, newest = first_sample_after(monitor, close)
+    if newest is None:
+        return False
+    if newest > start:
+        return False                      # bars for this window did exist
+    inside = [n for s, n in monitor if start <= s < close]
+    return all(n <= start for n in inside) if inside else True
+
+
+#: A window whose newest available bar is this far behind its close cannot have
+#: had bars in it. Thirty minutes is one full window, so the two cases do not
+#: overlap: below it, the feed had data *inside* the window (a late tail); above
+#: it, the feed had no data for the window at all (a stall).
+STALL_STALENESS_MINUTES = 30.0
+
+
 def triage_outside_range(rows: list[dict],
-                         outages: list[tuple[dt.datetime, dt.datetime]] | None = None
-                         ) -> tuple[list[dict], dict]:
+                         outages: list[tuple[dt.datetime, dt.datetime]] | None = None,
+                         monitor=None) -> tuple[list[dict], dict]:
     """Classify each `outside_data_range` row.
 
-    The discriminator is the row's own shape, which is exact:
+    Two independent sources of evidence, in order of strength:
 
-    * `no_bars_in_window` — nothing arrived for the window at all.
-    * `incomplete_candle` with `bars_candle_b` < 15 — the window had bars but
-      the tail was short. A complete window can never produce
-      `outside_data_range`, so this reason *only* arises from a short tail.
+    1. **The monitor's own newest bar** (`--monitor dst_monitor.csv`). This is the
+       direct measurement: if the newest bar at the window's close is older than
+       the window itself, the feed had nothing for that window, full stop. If it
+       is current to within a minute or two, the feed was healthy and only the
+       final bar was late.
+    2. **The row's shape**, which is a weaker but always-available proxy:
+       `no_bars_in_window` is the shape of a stall, `incomplete_candle` with
+       `bars_candle_b` < 15 is the shape of a late tail.
 
-    Then, and only then, the outage periods decide attribution: a short tail
-    during a known outage is connectivity; the same shape outside every outage is
-    the transient-lag defect.
+    Shape alone is not enough, and this is the trap the first pass fell into: a
+    single `--outages` range only accounts for outages you already knew about, so
+    every *other* stall lands in the unexplained bucket and looks like a bug. The
+    monitor is what distinguishes "a fourth outage we had not noticed" from "the
+    late-tail bug", and it does so by measurement rather than by my assumption.
     """
     out = []
     for row in rows:
@@ -140,29 +265,116 @@ def triage_outside_range(rows: list[dict],
         else:
             shape = "unexplained_shape"
 
+        day = dt.date.fromisoformat(row["trading_date"])
+        start_hour = int(row["window_label"].split(":")[0])
+        start = dt.datetime.combine(day, dt.time(start_hour, 45))
+        close = start + dt.timedelta(minutes=30)
+
+        staleness = feed_staleness(monitor, close) if monitor else None
         in_outage = bool(outages) and any(
             within(row["trading_date"], row["window_label"], lo, hi)
             for lo, hi in outages
         )
-        if outages is None:
-            verdict = "unknown_no_outage_data"
-        elif in_outage:
-            verdict = "connectivity"
+
+        if staleness is not None:
+            # Measured. This is the answer when the monitor was up.
+            verdict = ("feed_stalled" if staleness >= STALL_STALENESS_MINUTES
+                       else "transient_tail")
+            basis = f"monitor: newest bar {staleness:.0f} min behind close"
+            confidence = "measured"
+        elif monitor and _freeze_brackets(monitor, start, close):
+            # The monitor was down for this window, but it recorded the newest
+            # bar before and after the gap and in both cases it was older than
+            # this window. The freeze is therefore proven across the blind spot.
+            verdict = "feed_stalled"
+            basis = "monitor: freeze bracketed across its own downtime"
+            confidence = "bracketed"
+        elif monitor and shape == "no_bars_in_window" and stale_before(monitor, start, close):
+            # No sample during this window, but the last one before it closed
+            # already showed the terminal behind the window's own start, and the
+            # runner independently reported zero bars. Two sources, one answer.
+            verdict = "feed_stalled"
+            basis = ("runner reported zero bars; monitor's last pre-close sample "
+                     "was already behind this window")
+            confidence = "corroborated"
+        elif monitor and outages is not None:
+            verdict = "connectivity" if in_outage else "unexplained_no_monitor_sample"
+            basis = ("monitor down for this window; classified on the supplied outage range"
+                     if in_outage else "monitor down and outside every supplied outage")
+            confidence = "outage_range"
+        elif outages is not None:
+            verdict = "connectivity" if in_outage else "unexplained_transient_lag"
+            basis = "outage range only (no monitor supplied)"
+            confidence = "outage_range"
         else:
-            verdict = "unexplained_transient_lag"
+            verdict = "unknown_no_evidence"
+            basis = "no monitor and no outage range supplied"
+            confidence = "none"
+
         out.append({
             "trading_date": row["trading_date"],
             "window_label": row["window_label"],
             "shape": shape,
             "bars_a": bars_a,
             "bars_b": bars_b,
+            "staleness_minutes": staleness,
             "verdict": verdict,
-            "evaluated_at": row.get("evaluated_at", ""),
+            "confidence": confidence,
+            "basis": basis,
         })
     counts: dict[str, int] = {}
     for item in out:
         counts[item["verdict"]] = counts.get(item["verdict"], 0) + 1
     return out, counts
+
+
+def stall_intervals(monitor, *, min_minutes: float = 10.0) -> list[dict]:
+    """Spans where the monitor's newest bar stopped advancing.
+
+    This is how a second, unnoticed outage is found: the newest bar freezes at a
+    time and does not move for tens of minutes. The span is reported in NY wall
+    clock, from the moment the freeze begins to the last sample that still showed
+    it (so the recovery is bounded, not invented).
+    """
+    spans = []
+    run_start = run_last = prev_sample = None
+    for sample_at, newest in monitor:
+        if run_last is None or newest != run_last:
+            if run_start is not None:
+                spans.append((run_start, run_last, prev_sample))
+            run_start, run_last = sample_at, newest
+        prev_sample = sample_at
+    if run_start is not None:
+        spans.append((run_start, run_last, prev_sample))
+
+    out = []
+    for began, frozen_bar, ended in spans:
+        minutes = (ended - began).total_seconds() / 60.0
+        if minutes < min_minutes:
+            continue
+        out.append({
+            "stalled_bar_ny": frozen_bar,
+            "frozen_from_ny": began,
+            "observed_until_ny": ended,
+            "minutes": minutes,
+            "recovery_lag_minutes": (ended - frozen_bar).total_seconds() / 60.0,
+        })
+    return out
+
+
+def monitor_gaps(monitor, *, min_minutes: float = 3.0) -> list[tuple[dt.datetime, dt.datetime]]:
+    """Spans with no monitor sample at all — the monitor process itself was down.
+
+    Worth separating from a feed freeze: a monitor gap is not evidence that the
+    feed was healthy, it is absence of evidence, and rows inside one must not be
+    silently counted either way.
+    """
+    gaps = []
+    for (prev, _), (cur, _n) in zip(monitor, monitor[1:]):
+        minutes = (cur - prev).total_seconds() / 60.0
+        if minutes >= min_minutes:
+            gaps.append((prev, cur))
+    return gaps
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +481,74 @@ def show_row(row: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 4. pre-restart state inspection
+# ---------------------------------------------------------------------------
+def inspect_state(path: pathlib.Path) -> int:
+    """Summarise `runner_state.json` and say what the next start will do with it.
+
+    Written for the moment after an unclean kill, when the question is "is this
+    file safe to restart on?" The answer is a property of what is inside it, not
+    of a policy, so it is worth reading rather than guessing. Read-only.
+    """
+    import json
+
+    if not path.exists():
+        print(f"no state file at {path} — a first start will be treated as such")
+        return 0
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"UNREADABLE state file ({type(exc).__name__}: {exc})")
+        print("  The runner treats this as a first start: it will not crash, but")
+        print("  the observation ledger is lost, so windows it had already watched")
+        print("  may be logged as gaps. Conservative, never fabricated.")
+        return 1
+
+    def ts(key):
+        v = raw.get(key)
+        return (dt.datetime.fromtimestamp(v, dt.timezone.utc).isoformat()
+                if v is not None else None)
+
+    observations = [tuple(x) for x in raw.get("observations", [])]
+    open_interval = bool(observations) and observations[-1][1] is None
+    clean = bool(raw.get("clean_stop", False))
+    pending = raw.get("pending", {}) or {}
+    deferred = raw.get("deferred", {})
+
+    print(f"state file            : {path}")
+    print(f"first start utc       : {ts('first_start_utc')}")
+    print(f"last heartbeat utc    : {ts('last_heartbeat_utc')}")
+    print(f"clean_stop            : {clean}")
+    print(f"observation intervals : {len(observations)}"
+          f"{'  (last is OPEN -> a kill, not a stop)' if open_interval else ''}")
+    print(f"pending trades        : {len(pending)}")
+    for key in sorted(pending):
+        print(f"    {key}")
+    print(f"deferred windows      : {len(deferred)}")
+    for key in sorted(deferred):
+        print(f"    {key}")
+    print()
+    if clean:
+        print("VERDICT: closed cleanly. Safe to restart; no gap rows expected from")
+        print("         the previous session.")
+    else:
+        print("VERDICT: not closed cleanly. On the next start the runner will:")
+        if open_interval:
+            print("  - close the open observation interval at the last heartbeat, so")
+            print("    the downtime is NOT counted as watched (this is what stops the")
+            print("    outage being scored from back-filled history)")
+        for key in sorted(pending):
+            print(f"  - log {key} as dry_run_gap_runner_down: the trade was open when")
+            print("    the process died and its exit is never inferred (Q14)")
+        for key in sorted(deferred):
+            print(f"  - log {key} as dry_run_gap_runner_down: its bars never arrived")
+            print("    while the runner was alive")
+        print("  This is expected and correct. Do not edit or delete this file:")
+        print("  it is how the runner knows what it owed the log.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None, out_dir: str | pathlib.Path = "output"
@@ -281,6 +561,12 @@ def main(argv: list[str] | None = None, out_dir: str | pathlib.Path = "output"
     ap.add_argument("--outages", action="append", default=None,
                     metavar="LO/HI",
                     help="known NY outage, e.g. 2026-10-26T14:22/2026-10-27T01:48")
+    ap.add_argument("--monitor", default=None,
+                    metavar="PATH",
+                    help="dst_monitor.csv; classifies each row by measured feed "
+                         "staleness instead of by a pre-supplied outage range")
+    ap.add_argument("--stalls", action="store_true",
+                    help="list every feed freeze visible in --monitor")
     ap.add_argument("--self-check", action="store_true",
                     help="re-derive every row's verdict from its own candles")
     ap.add_argument("--show", nargs=2, metavar=("DATE", "LABEL"),
@@ -288,9 +574,14 @@ def main(argv: list[str] | None = None, out_dir: str | pathlib.Path = "output"
     ap.add_argument("--annotate", action="store_true",
                     help="append reconciled rows for --known-bad")
     ap.add_argument("--known-bad", help="file of DATE LABEL lines to reconcile")
+    ap.add_argument("--state", default=None, metavar="PATH",
+                    help="inspect runner_state.json before a restart (read-only)")
     ap.add_argument("--illegal-reasons", action="store_true",
                     help="flag any reason string that live code must never write")
     args = ap.parse_args(argv)
+
+    if args.state:
+        return inspect_state(pathlib.Path(args.state))
 
     base = pathlib.Path(args.out_dir)
     audit = read_rows(base / "window_evaluations_audit.csv")
@@ -301,24 +592,65 @@ def main(argv: list[str] | None = None, out_dir: str | pathlib.Path = "output"
 
     rc = 0
     outages = [parse_period(x) for x in args.outages] if args.outages else None
+    monitor = None
+    if args.monitor:
+        monitor = load_monitor(pathlib.Path(args.monitor))
+        if not monitor:
+            print(f"no usable rows in {args.monitor}", file=sys.stderr)
+            return 2
+
+    if args.stalls and monitor is not None:
+        print("=== feed freezes visible in the monitor (newest bar not advancing) ===")
+        for s in stall_intervals(monitor):
+            print(f"  bar frozen at {s['stalled_bar_ny']:%m-%d %H:%M} NY; "
+                  f"observed frozen {s['frozen_from_ny']:%m-%d %H:%M} -> "
+                  f"{s['observed_until_ny']:%m-%d %H:%M} "
+                  f"({s['minutes']:.0f} min); newest bar "
+                  f"{s['recovery_lag_minutes']:.0f} min behind wall clock")
+        gaps = monitor_gaps(monitor)
+        if gaps:
+            print(f"\n=== monitor itself was down ({len(gaps)} span(s)) ===")
+            for lo, hi in gaps:
+                print(f"  {lo:%m-%d %H:%M} -> {hi:%m-%d %H:%M} "
+                      f"({(hi - lo).total_seconds() / 60:.0f} min): "
+                      f"no evidence either way for windows inside this span")
 
     if args.outside_range:
-        rows, counts = triage_outside_range(audit, outages)
-        print(f"{'date':>12} {'window':>13} {'shape':>20} {'a/b':>7}  verdict")
+        rows, counts = triage_outside_range(audit, outages, monitor)
+        print(f"{'date':>12} {'window':>13} {'shape':>17} {'a/b':>6} {'stale':>7}  verdict")
         for r in rows:
+            stale = (f"{r['staleness_minutes']:.0f}m"
+                     if r["staleness_minutes"] is not None else "?")
             print(f"{r['trading_date']:>12} {r['window_label']:>13} "
-                  f"{r['shape']:>20} {r['bars_a']:>2}/{r['bars_b']:<2}  {r['verdict']}")
+                  f"{r['shape']:>17} {r['bars_a']:>2}/{r['bars_b']:<2} {stale:>7}  "
+                  f"{r['verdict']}")
         print(f"\ntotal {REASON_OUTSIDE_RANGE} rows: {len(rows)}")
         for verdict, n in sorted(counts.items()):
-            print(f"  {verdict:<28} {n}")
-        if counts.get("unexplained_transient_lag"):
+            print(f"  {verdict:<30} {n}")
+        unexplained = sum(n for v, n in counts.items() if v.startswith("unexplained"))
+        if unexplained:
+            print(f"\n{unexplained} row(s) are not accounted for by the feed. "
+                  f"Investigate before certifying any day.")
             rc = 1
 
     if args.illegal_reasons:
-        bad = [r for r in flat if (r.get("reason") or "") not in LIVE_LEGAL_REASONS]
-        print(f"\nrows with a reason live code must never write: {len(bad)}")
+        # The audit CSV carries the same reason column, so fall back to it: a
+        # missing window_evaluations.csv used to make this check examine nothing
+        # and print a clean "0", which is the worst possible failure mode for a
+        # checker whose whole job is to catch a vocabulary leak.
+        source = flat or audit
+        origin = ("window_evaluations.csv" if flat
+                  else "window_evaluations_audit.csv (window_evaluations.csv absent)")
+        bad = [r for r in source
+               if (r.get("reason") or "").strip() not in LIVE_LEGAL_REASONS]
+        print(f"\nexamined {len(source)} rows from {origin}")
+        print(f"rows with a reason live code must never write: {len(bad)}")
+        by_reason: dict[str, int] = {}
         for r in bad:
-            print(f"  {r['trading_date']} {r['window_label']} -> {r.get('reason')!r}")
+            by_reason[(r.get("reason") or "").strip()] = (
+                by_reason.get((r.get("reason") or "").strip(), 0) + 1)
+        for reason, n in sorted(by_reason.items(), key=lambda kv: -kv[1]):
+            print(f"  {n:>3}x {reason!r}")
         if bad:
             rc = 1
 
@@ -350,11 +682,19 @@ def main(argv: list[str] | None = None, out_dir: str | pathlib.Path = "output"
             print("--annotate needs --known-bad", file=sys.stderr)
             return 2
         wanted = []
-        for line in pathlib.Path(args.known_bad).read_text().splitlines():
+        for lineno, line in enumerate(
+                pathlib.Path(args.known_bad).read_text().splitlines(), 1):
             line = line.strip()
-            if line and not line.startswith("#"):
-                day, label = line.split()
-                wanted.append((day, label))
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) not in (2, 3):
+                print(f"{args.known_bad}:{lineno}: expected DATE LABEL [CATEGORY]",
+                      file=sys.stderr)
+                return 2
+            day, label = parts[0], parts[1]
+            category = parts[2] if len(parts) == 3 else "stall"
+            wanted.append((day, label, category))
         stamp = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
         path = base / "window_evaluations_reconciliation.csv"
         written = 0
@@ -366,21 +706,43 @@ def main(argv: list[str] | None = None, out_dir: str | pathlib.Path = "output"
                                     extrasaction="ignore")
             if new:
                 writer.writeheader()
-            for day, label in wanted:
+            for day, label, category in wanted:
                 if (day, label) in existing:
                     continue
                 match = [r for r in audit
                          if r["trading_date"] == day and r["window_label"] == label]
                 original = match[0]["reason"] if match else ""
+                if category == "stall":
+                    # We were watching and the feed delivered nothing. Naming it
+                    # `dry_run_gap_runner_down` here would claim we were blind,
+                    # which is the one thing that was not true.
+                    corrected = csv_emitter.REASON_LIVE_FEED_STALLED
+                    classification = "feed_stall_not_strategy"
+                    note = ("reconciled append-only; the original row is unchanged. "
+                            "Runner was connected and watching; the terminal "
+                            "supplied no bars for this window.")
+                elif category == "tail":
+                    # The feed was healthy and the final bar was merely late. The
+                    # correct evaluation was never performed and cannot be
+                    # reconstructed without re-reading history, which Q14 forbids.
+                    corrected = ""
+                    classification = "transient_lag_not_evaluated"
+                    note = ("reconciled append-only; the original row is unchanged. "
+                            "Do not treat this window as an outcome — it was never "
+                            "correctly evaluated.")
+                else:
+                    print(f"unknown category {category!r} for {day} {label}",
+                          file=sys.stderr)
+                    return 2
                 writer.writerow({
                     "annotated_utc": stamp,
                     "trading_date": day,
                     "window_label": label,
                     "original_reason": original,
-                    "corrected_reason": "dry_run_gap_runner_down",
-                    "classification": "connectivity_outage_not_strategy",
-                    "evidence": "journal disconnect interval corroborated by dst_monitor",
-                    "note": "reconciled append-only; the original row is unchanged",
+                    "corrected_reason": corrected,
+                    "classification": classification,
+                    "evidence": match[0].get("flags", "") if match else "",
+                    "note": note,
                 })
                 written += 1
         print(f"\nreconciliation: {written} new row(s) appended to {path}")

@@ -3,31 +3,70 @@
 #
 #   python live/audit_triage.py --annotate --known-bad live/known_bad_windows.txt
 #
-# Format: "TRADING_DATE WINDOW_LABEL", one per line, # for comments.
-# Every entry must be a window that actually exists in the schedule — the venue
-# has no 15:45, 16:45 or 17:45 slot (it is shut 17:00-18:00 NY), so the eight
-# consecutive windows below run 14:45 -> 00:45 with a gap in the labelling, not
-# in the outage.
+# Format: "TRADING_DATE WINDOW_LABEL CATEGORY", one per line, # for comments.
+# Every date/label pair must exist in the schedule — a test asserts it.
 #
-# --- Connectivity: Monday 2026-10-26 14:22 NY -> 2026-10-27 01:48 NY ----------
-# One disconnect, per the MT5 Journal and corroborated by dst_monitor. Every
-# window it covered was logged `outside_data_range`; the correct classification
-# is `dry_run_gap_runner_down`, because the runner was not watching.
-2026-10-26 14:45-15:15
-2026-10-26 18:45-19:15
-2026-10-26 19:45-20:15
-2026-10-26 20:45-21:15
-2026-10-26 21:45-22:15
-2026-10-26 22:45-23:15
-2026-10-26 23:45-00:15
-2026-10-27 00:45-01:15
+# Categories, and why there are two:
 #
-# --- Transient lag: the separate defect, NOT listed here yet -------------------
-# 2026-10-26 02:45-03:15 / 09:45-10:15 / 11:45-12:15 were logged
-# `outside_data_range` with the connection stable. Those are not outages and are
-# deliberately absent from this file: they cannot be corrected to
-# `dry_run_gap_runner_down` (the runner was watching), and the honest correction
-# depends on what the bars actually were, which the audit row's own OHLC settles.
-# Run `--outside-range` and `--self-check` first, then annotate them with
-# whatever the re-derivation supports. Guessing here would be the same error the
-# runner made.
+#   stall  the feed delivered nothing for this window. The runner was up and
+#          watching; the terminal had no bars. Correct reason is
+#          `live_feed_stalled` — NOT `dry_run_gap_runner_down`, which would claim
+#          we were blind when in fact we were looking.
+#
+#   tail   the feed was healthy and the window's final bar had not been published
+#          yet when the window was evaluated. Nothing was wrong with the market or
+#          the connection; the runner treated "not yet" as "never". The row cannot
+#          be retro-fitted: the correct evaluation was never performed and
+#          reconstructing it from today's history is exactly the back-fill Q14
+#          forbids. Corrected reason is therefore left empty, and the row is marked
+#          not_evaluated rather than given an invented outcome.
+#
+# Evidence for each: `python live/audit_triage.py --monitor dst_monitor.csv --outside-range`
+# classifies all of them from the monitor's own newest-bar column.
+#
+# --- Stall 1 — bar frozen 2026-10-26 14:21 NY (8 windows) ---
+# Journal disconnect 14:22; dst_monitor froze from 14:21 and recovered
+# after 01:47. The outage you already identified.
+2026-10-26 14:45-15:15 stall
+2026-10-26 18:45-19:15 stall
+2026-10-26 19:45-20:15 stall
+2026-10-26 20:45-21:15 stall
+2026-10-26 21:45-22:15 stall
+2026-10-26 22:45-23:15 stall
+2026-10-26 23:45-00:15 stall
+2026-10-27 00:45-01:15 stall
+#
+# --- Stall 2 — bar frozen 2026-10-27 06:37 NY (3 windows) ---
+# Not previously accounted for. Frozen 06:37 -> 09:35 (monitor's own tick-age
+# flag: 06:39 -> 09:35). Three windows.
+2026-10-27 06:45-07:15 stall
+2026-10-27 07:45-08:15 stall
+2026-10-27 08:45-09:15 stall
+#
+# --- Stall 3 — bar frozen 2026-10-27 13:13 NY (11 windows) ---
+# Not previously accounted for. Frozen 13:13 -> recovery between 03:16 and
+# 03:36 on 28 Oct; dst_monitor itself was down 20:20 -> 01:44 so the freeze is
+# bracketed, and the runner's own zero-bar reports narrow the recovery bound.
+# Eleven windows.
+2026-10-27 13:45-14:15 stall
+2026-10-27 14:45-15:15 stall
+2026-10-27 18:45-19:15 stall
+2026-10-27 19:45-20:15 stall
+2026-10-27 20:45-21:15 stall
+2026-10-27 21:45-22:15 stall
+2026-10-27 22:45-23:15 stall
+2026-10-27 23:45-00:15 stall
+2026-10-28 00:45-01:15 stall
+2026-10-28 01:45-02:15 stall
+2026-10-28 02:45-03:15 stall
+#
+# --- Transient tail: feed healthy, final bar not yet published (7 windows) ---
+# Mitigated in code (late tails are now deferred and re-checked), but these
+# rows cannot be corrected in place. See the note at the top of this file.
+2026-10-26 00:45-01:15 tail
+2026-10-26 02:45-03:15 tail
+2026-10-26 09:45-10:15 tail
+2026-10-26 11:45-12:15 tail
+2026-10-27 03:45-04:15 tail
+2026-10-27 05:45-06:15 tail
+2026-10-27 12:45-13:15 tail

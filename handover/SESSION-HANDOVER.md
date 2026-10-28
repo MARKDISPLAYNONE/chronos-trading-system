@@ -178,7 +178,9 @@ part that makes the numbers trustworthy — do the same on any re-run):
    logged as `dry_run_gap_runner_down` and the run resumes forward-only.
    **Next action:** run the live probe (below) and return its output before the
    runner is built against the live API.
-2. 🟠 **Phase 2 dry run is running but cannot produce a certifiable day yet.**
+2. 🟠 **Phase 2 dry run is stopped (terminals force-closed 28 Oct ~04:57 NY).**
+   Not restarted, by instruction. Everything needed to restart is in §15.14 and
+   the fix is on this branch. The clean-day count restarts when it does.
    The `outside_data_range` defect is understood and fixed (§15.11); the running
    runner still has the old code. Next: run `live/audit_triage.py` against the
    live log, then restart the runner to pick up the fix — the restart is what
@@ -427,6 +429,25 @@ permanent wrong entry. Fixed both (§15.11). **309 tests, all passing.**
   §15.11 and the clean-day clock restarts at the restart, not at launch.
 - The live runner was **not** restarted or patched (per instruction): the fix is
   committed and inert until the Handler restarts it.
+
+**Session 15 (29-row reclassification + forced kill — this session):** the
+`outside_data_range` breakdown is corrected from 8/21 to **22 feed stalls / 7
+late tails / 0 unexplained**, across three separate outages. **331 tests pass.**
+- Two of the three outages (27 Oct 06:37-09:35 and 27 Oct 13:13 to 28 Oct
+  ~03:20) were not previously known. Both confirmed in `dst_monitor.csv`.
+- The Handler's "0/0 is a different failure mode" instinct was right about the
+  *shape* and wrong about the cause being different: one line of code produces
+  both shapes, depending only on how stale the newest bar is.
+- `--illegal-reasons` allow-list fixed (was flagging 43/46 by omitting every
+  WIN/LOSS reason; now derived from the modules) plus two silent-pass holes.
+- **The forced kill exposed a real bug**: an open observation interval is
+  persisted as `None`, i.e. "extends to now", so a restart would have counted
+  the entire downtime as watched and scored windows from back-filled history.
+  Fixed and tested. This would have fired on tonight's restart, not before.
+- `--check` now writes nothing; `--state` prints what the next start will do.
+- 04:45-05:15 confirmed correct: `open - Low_A = -1.6`, VOID stands.
+- `known_bad_windows.txt` rewritten with all 29 rows and two categories (`stall`
+  → `live_feed_stalled`, `tail` → not recoverable, no invented outcome).
 
 ---
 
@@ -1159,4 +1180,184 @@ manifested as exactly that string.
 **The clean-day clock therefore restarts at the restart**, not at launch. Days
 already logged cannot count toward the five consecutive clean days, and the
 Handler's restart to pick up this fix is the event that starts the count.
+
+### 15.12 The 29 `outside_data_range` rows, resolved (28 Oct, second pass)
+
+The first pass classified 8 as connectivity and 21 as "unexplained transient
+lag". **That was wrong, and the error was mine**: I classified against the single
+`--outages` range I was given, so any outage *outside* that range fell into the
+unexplained bucket. The rows were never unexplained — they were a second and
+third outage nobody had cross-referenced yet.
+
+Re-classified against `dst_monitor.csv`'s own `window_last_ny` (the newest bar
+the terminal would give up) instead of against a supplied range:
+
+| | windows | verdict | evidence |
+|---|---|---|---|
+| Stall 1 | 8 | feed stall | bar frozen 26 Oct 14:21, recovered after 27 Oct 01:47 |
+| Stall 2 | 3 | feed stall | bar frozen 27 Oct 06:37, recovered 09:35 |
+| Stall 3 | 11 | feed stall | bar frozen 27 Oct 13:13, recovered between 03:16 and 03:36 on 28 Oct |
+| Late tail | 7 | transient lag | feed healthy; newest bar 0–2 min behind the close |
+| **Total** | **29** | | 22 stall, 7 lag, **0 unexplained** |
+
+Both stalls 2 and 3 are new. Neither is a bug in the bot.
+
+#### How each row was attributed
+
+The discriminator is **how far behind the newest bar was at the window's close**,
+not the row's shape:
+
+* **≤ 2 minutes behind** → the feed was live and only the final bar was late. The
+  window's own data was there to be read a poll later. That is the late-tail
+  defect, and the 7 rows show it exactly (six at 0 min, one at 2 min).
+* **≥ 38 minutes behind** → the terminal had no bars for the window at all. That
+  is a feed stall, and `0/0` is simply what a stall looks like from inside the
+  evaluator when the freeze is longer than a window.
+
+`dst_monitor` was down for part of stall 3 (20:20 → 01:44 and 01:44 → 03:36), but
+it bracketed the freeze anyway: the newest bar was still 27 Oct 13:13 at both
+01:44 *and* its last sample before the gap. A sample taken later still tells you
+what the terminal did not have. The runner's own zero-bar reports (at ~02:16 and
+~03:16) narrow recovery to between 03:16 and 03:36.
+
+#### Answering the "0/0 is a different mechanism" question
+
+**It is the same mechanism, and the shape difference is only how deep the lag is.**
+Both shapes come from the single line `if end > series.last_time:
+return REASON_OUTSIDE_RANGE`:
+
+* last bar 13:14 for a 12:45–13:15 window → Candle B has 14 of 15 bars → `15/14`,
+  `incomplete_candle`
+* last bar 13:13 for a 14:45–15:15 window → zero bars in the window → `0/0`,
+  `no_bars_in_window`
+
+One condition, two pictures. Which is why the fix does not branch on shape: it
+asks "is the newest bar older than this window", and defers if so. A 20-second
+lateness and a 14-hour stall are the same question with different answers, and
+the 300-second grace is what separates them.
+
+#### Sanity check from the monitor's own liveness channel
+
+`dst_monitor` independently flagged all three, in real time, via `tick_age_seconds`
+and the note `venue should be OPEN — feed liveness problem` — 1180 samples, in
+spans matching each stall (26 Oct 14:24 → 27 Oct 01:47, 27 Oct 06:39 → 09:35,
+27 Oct 13:16 → 20:20). Its `invariant_all_passed` column stayed **True**
+throughout, which is correct: those four invariants test NY/DST correctness, not
+whether data is flowing. **The monitor's liveness evidence is in `notes` and
+`tick_age_seconds`, not in the FAIL column** — the only 82 FAIL rows in the file
+are one benign weekend-boundary note, appearing only after recovery (03:36–04:57
+on 28 Oct).
+
+Worth stating plainly: **the stalls raised no error.** `refresh()` never threw —
+the terminal kept returning the same trailing 3000 bars — so `runner_events.csv`
+contains no `feed_error` row between 25 Oct 18:32 and the kill. That is exactly
+why the fix detects stalls by "no bars for this window after 300 s" rather than
+by catching an exception: there was no exception to catch.
+
+#### 04:45-05:15 — closed, agreed
+
+`candle_a_low = 29006.0`, `candle_b_open = 29004.4`, so `open - Low_A = -1.6`.
+The open is *below* Low_A, i.e. on the VOID side by 16 ticks — not "0.4 inside
+the discount zone". **`invalid open location` was correct.** The Handler's manual
+reconstruction was off; the stored numbers settle it and no further action is
+needed. (The other VOID row, 05:45-06:15, has `open == Mid_A` exactly, also a
+correct VOID.)
+
+### 15.13 `--illegal-reasons` was wrong, and is fixed
+
+It flagged **43 of 46** rows. The allow-list held the NO_SETUP and gap vocabulary
+but **omitted every WIN/LOSS exit reason**, so `stop loss hit`, `take profit hit`,
+`breakeven stop hit after partial` and `target hit after partial` were reported as
+illegal. Those are the most legitimate strings in the file. A checker that cries
+wolf on the normal case trains you to ignore it, so this was worse than no check.
+
+Fixed by **deriving** the list from the modules that own the strings
+(`trade_simulator`, `sweep_detector`, `window_evaluator`, `context_classifier`,
+`csv_emitter`) instead of hand-listing it. Adding an exit reason now extends the
+allow-list automatically; a typo is still caught; and `outside_data_range` is
+deliberately absent, which is the assertion.
+
+Re-run on the real log: **29 flagged, all of them `outside_data_range`, zero false
+positives.**
+
+Two further holes found while fixing it:
+
+* the check read `window_evaluations.csv`, which was **not in the dump**, so it
+  examined zero rows and printed a clean "0" — a silent pass. It now falls back to
+  the audit CSV and prints how many rows it examined.
+* `--check` called `start()`, which reconciles and *writes* gap rows. A preflight
+  that consumes the rows it is meant to warn you about is worse than useless. It
+  now runs the guards read-only and writes nothing at all.
+
+### 15.14 The forced kill: what it did, and one real bug it exposed
+
+The Handler closed the terminal windows; `runner_events.csv` confirms it — the
+last event is a `start` at 25 Oct 18:32 NY and there is no matching `stop`. The
+run ended around 28 Oct 04:57 NY (last monitor sample 04:57:42, last audit row
+03:45-04:15).
+
+**(a) Corruption: no. Something worse, and it was armed for the next restart.**
+`RunnerState.save()` writes to `.tmp` and `os.replace`s it, so a kill cannot leave
+a half-written JSON. But `_open_observation` appends `(start, None)`, and
+`_intervals` reads a trailing `None` as *"still open, extends to now"*. Nothing
+closes it if the process is killed — so the next launch would have stretched that
+one interval across the **entire downtime**, counted the outage as watched, and
+scored every window inside it from back-filled history. Q14's prohibition, done
+silently, with rows that look completely normal.
+
+The old code never had to face this because the process survived the whole run.
+**Tonight's restart would have been the first time.** Fixed: `RunnerState.load()`
+closes a dangling interval at `last_heartbeat_utc` (the last moment we know we
+were alive), or drops it if there is no heartbeat. Tested directly, including the
+case where the interval is closed and a window that fell inside the downtime is
+then correctly *not* observed.
+
+A second, smaller risk: two runners on one log would each emit the same window,
+because `already_emitted` is per-process — permanent duplicates. Now refused when
+the state file's heartbeat is under 90 s old, overridable with `--force`.
+
+A window cannot get permanently stuck in `deferred`: the retry always terminates
+once `DATA_LAG_GRACE_SECONDS` passes.
+
+**(b) Nothing needs clearing. Keep `runner_state.json` and every CSV.**
+
+The state file self-heals: unreadable → treated as a first start (cost: some
+windows logged as gaps, never fabricated); dangling interval → closed at the
+heartbeat; `pending` → gap rows at startup. **Do not delete it** — it is how the
+runner knows which windows it owes the log. Deleting it would not corrupt
+anything, but windows whose trades were open would lose their gap rows entirely
+and could be scored later from back-fill.
+
+Check before restarting:
+
+```
+python live/audit_triage.py --state live/output/runner_state.json
+```
+
+That prints the heartbeat, whether the last interval is still open, the pending
+trades and the deferred windows, and states what the next start will do with each.
+Expect `clean_stop: False`, one open interval, and the trade that was open at
+04:57 to be logged as a gap.
+
+Also confirm in Task Manager that no `python.exe` running `dry_run_runner.py`
+survives, or simply wait 90 seconds after the kill.
+
+**(c) Restart, from `bot/` — monitor first, so its evidence covers the start:**
+
+```
+python -m pip install tzdata
+python live/probe_mt5_live.py
+python live/audit_triage.py --state live/output/runner_state.json
+python live/dry_run_runner.py --check
+```
+
+then, in two separate terminals:
+
+```
+python live/dst_monitor.py          :: leave running, independent of the runner
+python live/dry_run_runner.py       :: the loop
+```
+
+`--check` writes nothing and is safe to run repeatedly. Do not start the runner
+until the state inspection and `--check` both look sane.
 
