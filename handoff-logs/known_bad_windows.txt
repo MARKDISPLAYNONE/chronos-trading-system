@@ -1,0 +1,33 @@
+# Windows whose logged reason is wrong, recorded so the log can be reconciled
+# without rewriting it (Q13/Q14: append-only, nothing is ever edited).
+#
+#   python live/audit_triage.py --annotate --known-bad live/known_bad_windows.txt
+#
+# Format: "TRADING_DATE WINDOW_LABEL", one per line, # for comments.
+# Every entry must be a window that actually exists in the schedule — the venue
+# has no 15:45, 16:45 or 17:45 slot (it is shut 17:00-18:00 NY), so the eight
+# consecutive windows below run 14:45 -> 00:45 with a gap in the labelling, not
+# in the outage.
+#
+# --- Connectivity: Monday 2026-10-26 14:22 NY -> 2026-10-27 01:48 NY ----------
+# One disconnect, per the MT5 Journal and corroborated by dst_monitor. Every
+# window it covered was logged `outside_data_range`; the correct classification
+# is `dry_run_gap_runner_down`, because the runner was not watching.
+2026-10-26 14:45-15:15
+2026-10-26 18:45-19:15
+2026-10-26 19:45-20:15
+2026-10-26 20:45-21:15
+2026-10-26 21:45-22:15
+2026-10-26 22:45-23:15
+2026-10-26 23:45-00:15
+2026-10-27 00:45-01:15
+#
+# --- Transient lag: the separate defect, NOT listed here yet -------------------
+# 2026-10-26 02:45-03:15 / 09:45-10:15 / 11:45-12:15 were logged
+# `outside_data_range` with the connection stable. Those are not outages and are
+# deliberately absent from this file: they cannot be corrected to
+# `dry_run_gap_runner_down` (the runner was watching), and the honest correction
+# depends on what the bars actually were, which the audit row's own OHLC settles.
+# Run `--outside-range` and `--self-check` first, then annotate them with
+# whatever the re-derivation supports. Guessing here would be the same error the
+# runner made.

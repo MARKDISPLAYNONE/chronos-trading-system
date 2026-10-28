@@ -1,0 +1,7 @@
+event_utc,ny_wall,kind,detail
+2026-10-25T22:12:28.546097+00:00,2026-10-25T18:12:28.546097-04:00,start,runner up; 10 schedule dates verified DST-safe; poll 20s; symbol NAS100; bars 2999
+2026-10-25T22:12:28.690505+00:00,2026-10-25T18:12:28.690505-04:00,stop,"clean shutdown after 0 steps, 0 evaluations"
+2026-10-25T22:14:21.278145+00:00,2026-10-25T18:14:21.278145-04:00,start,runner up; 10 schedule dates verified DST-safe; poll 20s; symbol NAS100; bars 2999
+2026-10-25T22:26:15.379433+00:00,2026-10-25T18:26:15.379433-04:00,start,runner up; 10 schedule dates verified DST-safe; poll 20s; symbol NAS100; bars 2999
+2026-10-25T22:26:15.513178+00:00,2026-10-25T18:26:15.513178-04:00,stop,"clean shutdown after 0 steps, 0 evaluations"
+2026-10-25T22:32:27.991423+00:00,2026-10-25T18:32:27.991423-04:00,start,runner up; 10 schedule dates verified DST-safe; poll 20s; symbol NAS100; bars 2999
