@@ -481,7 +481,160 @@ def show_row(row: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 4. pre-restart state inspection
+# 4. clean-day certification
+# ---------------------------------------------------------------------------
+#: Outcomes that are an actual decision about the window. `MISSING_EVALUATION` is
+#: excluded on purpose: it is the schema's "this window could not be evaluated",
+#: so it is the absence of an outcome, not one. A day containing it is not clean.
+CERTIFIABLE_OUTCOMES = {"WIN", "LOSS", "NO_SETUP"}
+
+#: Condition labels, in the order they are reported. Each is a separate gate so a
+#: failure says *which* property broke, not just "FAIL".
+CERTIFY_CONDITIONS = [
+    ("coverage", "all scheduled windows logged exactly once"),
+    ("outcome", "every row has a valid outcome and a reason"),
+    ("range", "no outside_data_range / live_feed_stalled rows"),
+    ("gaps", "no dry_run_gap_runner_down rows"),
+]
+
+
+def certify(day: dt.date, rows: list[dict]) -> dict:
+    """Apply the four-part clean-day rule to one New York trading date.
+
+    The rule, and why each part is there:
+
+    1. **Coverage** — 21 rows, one per scheduled window, no duplicates. A missing
+       row means the runner never decided that window, however good the other 20
+       look.
+    2. **Outcome** — every row carries a real decision and says why. Catches a
+       schema leak, an empty reason, or an unresolved trade written past its
+       deadline.
+    3. **No range/stall rows** — `outside_data_range` was the defect that made
+       this rule necessary; `live_feed_stalled` means the terminal gave no data
+       for a window we were watching. Either makes the day's evidence partial.
+    4. **No gap rows** — the runner must have watched all of it.
+
+    Returns a dict with `passed`, `failures` (list of (condition, detail)),
+    `warnings`, and the counts, so a caller can render it however it likes.
+    """
+    from src import time_windows
+
+    scheduled = [w.label for w in time_windows.windows_for_day(day)]
+    on_day = [r for r in rows if r.get("trading_date") == day.isoformat()]
+    failures: list[tuple[str, str]] = []
+    warnings: list[str] = []
+
+    if not time_windows.is_trading_day(day):
+        return {
+            "date": day, "applicable": False, "passed": False,
+            "failures": [], "warnings": [],
+            "detail": f"{day} is a {day.strftime('%A')} - not a trading day, nothing to certify",
+            "counts": {},
+        }
+
+    # --- 1. coverage ------------------------------------------------------
+    labels = [r.get("window_label", "") for r in on_day]
+    seen: dict[str, int] = {}
+    for label in labels:
+        seen[label] = seen.get(label, 0) + 1
+    duplicates = sorted(l for l, n in seen.items() if n > 1)
+    missing = [l for l in scheduled if l not in seen]
+    unexpected = sorted(l for l in seen if l not in scheduled)
+    if len(on_day) != len(scheduled):
+        failures.append((
+            "coverage",
+            f"{len(on_day)} row(s) for {len(scheduled)} scheduled windows",
+        ))
+    if missing:
+        failures.append(("coverage", f"missing windows: {', '.join(missing)}"))
+    if duplicates:
+        failures.append(("coverage", f"duplicated windows: {', '.join(duplicates)}"))
+    if unexpected:
+        failures.append(("coverage", f"windows not in the schedule: {', '.join(unexpected)}"))
+
+    # --- 2. outcome + reason ---------------------------------------------
+    for r in on_day:
+        outcome = (r.get("outcome") or "").strip()
+        reason = (r.get("reason") or "").strip()
+        if outcome not in CERTIFIABLE_OUTCOMES:
+            failures.append((
+                "outcome",
+                f"{r.get('window_label')}: outcome {outcome!r} is not a decided "
+                f"outcome ({'/'.join(sorted(CERTIFIABLE_OUTCOMES))})",
+            ))
+        elif not reason:
+            failures.append((
+                "outcome", f"{r.get('window_label')}: {outcome} with an empty reason",
+            ))
+    if not failures and on_day:
+        # NO_SETUP with a market reason is fine; note the trade count for context.
+        traded = sum(1 for r in on_day if (r.get("outcome") or "") in ("WIN", "LOSS"))
+        warnings.append(f"{traded} traded window(s), "
+                        f"{len(on_day) - traded} NO_SETUP")
+
+    # --- 3. range / stall rows -------------------------------------------
+    for row_reason, label in ((REASON_OUTSIDE_RANGE, "outside_data_range"),
+                              (csv_emitter.REASON_LIVE_FEED_STALLED, "live_feed_stalled")):
+        hits = [r for r in on_day if (r.get("reason") or "").strip() == row_reason]
+        if hits:
+            failures.append((
+                "range",
+                f"{len(hits)} row(s) with {label}: "
+                f"{', '.join(r.get('window_label', '?') for r in hits)}",
+            ))
+
+    # --- 4. gap rows ------------------------------------------------------
+    gaps = [r for r in on_day
+            if (r.get("reason") or "").strip() == csv_emitter.REASON_RUNNER_DOWN]
+    if gaps:
+        failures.append((
+            "gaps",
+            f"{len(gaps)} row(s) the runner did not observe: "
+            f"{', '.join(r.get('window_label', '?') for r in gaps)}",
+        ))
+
+    return {
+        "date": day,
+        "applicable": True,
+        "passed": not failures,
+        "failures": failures,
+        "warnings": warnings,
+        "detail": "",
+        "counts": {
+            "rows": len(on_day),
+            "scheduled": len(scheduled),
+            "win": sum(1 for r in on_day if (r.get("outcome") or "") == "WIN"),
+            "loss": sum(1 for r in on_day if (r.get("outcome") or "") == "LOSS"),
+            "no_setup": sum(1 for r in on_day if (r.get("outcome") or "") == "NO_SETUP"),
+        },
+    }
+
+
+def render_certification(result: dict) -> str:
+    day = result["date"]
+    if not result["applicable"]:
+        return f"{day}: NOT APPLICABLE - {result['detail']}"
+    c = result["counts"]
+    lines = [
+        f"{day}  {'PASS' if result['passed'] else 'FAIL'}",
+        f"  rows            : {c['rows']}/{c['scheduled']} scheduled windows",
+        f"  outcomes        : {c['win']} WIN, {c['loss']} LOSS, {c['no_setup']} NO_SETUP",
+    ]
+    for name, detail in result["failures"]:
+        lines.append(f"  [FAIL] {name:<8} {detail}")
+    if result["passed"]:
+        for name, desc in CERTIFY_CONDITIONS:
+            lines.append(f"  [ok]   {name:<8} {desc}")
+        for w in result["warnings"]:
+            lines.append(f"  note:  {w}")
+        lines.append("  -> this day counts toward the five consecutive clean days")
+    else:
+        lines.append("  -> this day does NOT count; the consecutive run restarts here")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 5. pre-restart state inspection
 # ---------------------------------------------------------------------------
 def inspect_state(path: pathlib.Path) -> int:
     """Summarise `runner_state.json` and say what the next start will do with it.
@@ -574,6 +727,10 @@ def main(argv: list[str] | None = None, out_dir: str | pathlib.Path = "output"
     ap.add_argument("--annotate", action="store_true",
                     help="append reconciled rows for --known-bad")
     ap.add_argument("--known-bad", help="file of DATE LABEL lines to reconcile")
+    ap.add_argument("--certify", default=None, metavar="DATE",
+                    help="apply the 4-part clean-day rule to one NY trading date "
+                         "(YYYY-MM-DD) and print PASS/FAIL with the failing "
+                         "condition(s)")
     ap.add_argument("--state", default=None, metavar="PATH",
                     help="inspect runner_state.json before a restart (read-only)")
     ap.add_argument("--illegal-reasons", action="store_true",
@@ -586,7 +743,7 @@ def main(argv: list[str] | None = None, out_dir: str | pathlib.Path = "output"
     base = pathlib.Path(args.out_dir)
     audit = read_rows(base / "window_evaluations_audit.csv")
     flat = read_rows(base / "window_evaluations.csv")
-    if not audit:
+    if not audit and not args.certify:
         print(f"no audit rows at {base / 'window_evaluations_audit.csv'}", file=sys.stderr)
         return 2
 
@@ -632,6 +789,30 @@ def main(argv: list[str] | None = None, out_dir: str | pathlib.Path = "output"
             print(f"\n{unexplained} row(s) are not accounted for by the feed. "
                   f"Investigate before certifying any day.")
             rc = 1
+
+    if args.certify:
+        try:
+            day = dt.date.fromisoformat(args.certify)
+        except ValueError:
+            print(f"--certify needs a date as YYYY-MM-DD, got {args.certify!r}",
+                  file=sys.stderr)
+            return 2
+        # Certification reads the schema-mirror file; the audit CSV carries the
+        # same columns, so a missing first choice degrades rather than lies.
+        source = flat or audit
+        if not source:
+            print(f"no rows to certify from in {base}", file=sys.stderr)
+            return 2
+        result = certify(day, source)
+        print(render_certification(result))
+        if not result["applicable"]:
+            return 2
+        if not result["passed"]:
+            rc = 1
+        else:
+            if not flat:
+                print("\nnote: certified from window_evaluations_audit.csv "
+                      "(window_evaluations.csv absent)")
 
     if args.illegal_reasons:
         # The audit CSV carries the same reason column, so fall back to it: a

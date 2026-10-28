@@ -284,7 +284,8 @@ class TestRunOnce(unittest.TestCase):
             rc = mon.run(mt5, out_dir=pathlib.Path(tmp), sample_seconds=1,
                          once=True, monitor=m)
             self.assertEqual(rc, 0)
-            rows = list(csv.DictReader((pathlib.Path(tmp) / "dst_monitor.csv").open()))
+            with (pathlib.Path(tmp) / "dst_monitor.csv").open() as fh:
+                rows = list(csv.DictReader(fh))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["invariant_all_passed"], "True")
 
@@ -297,6 +298,68 @@ class TestRunOnce(unittest.TestCase):
             rc = mon.run(mt5, out_dir=pathlib.Path(tmp), sample_seconds=1,
                          once=True, monitor=m)
             self.assertEqual(rc, 1)
+
+
+def weekday_only_rows(first_ny, last_ny):
+    """A contiguous run of bars in the real session shape, no weekend boundary."""
+    rows = []
+    cur = first_ny
+    while cur <= last_ny:
+        wd, hm = cur.weekday(), cur.strftime("%H:%M")
+        trading = not (
+            wd == 5
+            or (wd < 4 and "17:00" <= hm < "18:00")
+            or (wd == 4 and hm > "16:59")
+            or (wd == 6 and hm < "18:00")
+        )
+        if trading:
+            rows.append((broker_stamp(cur), 25400.0, 25401.0, 25399.0, 25400.5, 10))
+        cur += dt.timedelta(minutes=1)
+    return rows
+
+
+class TestVacuousWeekendChecksInTheMonitor(unittest.TestCase):
+    """Live regression: `[FAIL]` on every sample of a Wednesday morning.
+
+    The trailing 3000-bar window is about 50 hours, so most samples contain no
+    Friday close and no Sunday open. `verify()` reported the absent denominator as
+    a failure, which flagged 82 samples in the 28 Oct archive while the feed was
+    healthy. Absence of evidence is not evidence of failure.
+    """
+
+    def bars(self):
+        return weekday_only_rows(dt.datetime(2026, 10, 27, 6, 0),
+                                 dt.datetime(2026, 10, 27, 9, 0))   # Tuesday
+
+    def test_a_window_without_weekend_boundaries_reports_pass(self):
+        ok, out = mon.load_verifier().verify(self.bars())
+        self.assertTrue(ok, [r for r in out if not r[1]])
+        detail = {name: d for name, _p, d in out}
+        self.assertIn("not applicable", detail["Friday close 16:59 NY"])
+        self.assertIn("not applicable", detail["Sunday open 18:00 NY"])
+
+    def test_a_genuine_late_friday_bar_still_fails_through_the_monitor(self):
+        bars = self.bars()
+        bars.append((broker_stamp(dt.datetime(2026, 10, 30, 17, 30)),
+                     25400.0, 25401.0, 25399.0, 25400.5, 10))
+        ok, out = mon.load_verifier().verify(sorted(bars))
+        self.assertFalse(ok)
+        failed = {name for name, passed, _d in out if not passed}
+        self.assertIn("Friday close 16:59 NY", failed)
+
+    def test_the_sample_note_says_the_check_did_not_run(self):
+        bars = self.bars()
+        now = dt.datetime(2026, 10, 27, 9, 0, tzinfo=dt.timezone.utc).timestamp()
+        # A fresh tick so liveness is not the thing under test here. The stamp is
+        # a broker label, not a UTC epoch (see tick_age_seconds).
+        verifier = mon.Monitor(
+            FakeMT5(bars, tick_stamp=broker_stamp(dt.datetime(2026, 10, 27, 8, 59))),
+            now_fn=lambda: now,
+        )
+        sample = verifier.sample()
+        self.assertEqual(sample.invariant_all_passed, "True")
+        self.assertIn("not applicable", sample.notes)
+        self.assertEqual(verifier.failures, [])
 
 
 if __name__ == "__main__":

@@ -178,9 +178,10 @@ part that makes the numbers trustworthy — do the same on any re-run):
    logged as `dry_run_gap_runner_down` and the run resumes forward-only.
    **Next action:** run the live probe (below) and return its output before the
    runner is built against the live API.
-2. 🟠 **Phase 2 dry run is stopped (terminals force-closed 28 Oct ~04:57 NY).**
-   Not restarted, by instruction. Everything needed to restart is in §15.14 and
-   the fix is on this branch. The clean-day count restarts when it does.
+2. 🟠 **Phase 2 running. Clean-day clock started at the 28 Oct 08:47 NY restart.**
+   No fixed end date (§15.16). Each day is judged with
+   `python live/audit_triage.py --certify DATE`; five consecutive PASSes close the
+   phase. Days before the restart are excluded, not rewritten.
    The `outside_data_range` defect is understood and fixed (§15.11); the running
    runner still has the old code. Next: run `live/audit_triage.py` against the
    live log, then restart the runner to pick up the fix — the restart is what
@@ -448,6 +449,25 @@ late tails / 0 unexplained**, across three separate outages. **331 tests pass.**
 - 04:45-05:15 confirmed correct: `open - Low_A = -1.6`, VOID stands.
 - `known_bad_windows.txt` rewritten with all 29 rows and two categories (`stall`
   → `live_feed_stalled`, `tail` → not recoverable, no invented outcome).
+
+**Session 16 (live triage, 28 Oct — this session):** first real-data session since
+the restart. **367 tests pass.**
+- `[FAIL]` on every monitor sample was a **zero-denominator artefact**, plus a
+  second shape (a Sunday clipped by the window's left edge, `0/1`). Both now report
+  `not applicable` and pass, with the omission recorded in `notes`. Replaying all
+  3088 archived samples: 82 → 0 failures, and none of them contained a real
+  breach. **Nothing certification-facing read that column**; history needs no
+  annotation.
+- The 231-minute `polling_gap` at startup: the four gap rows were **correct** (Q14
+  working on real data), but the event was **mislabelled** and wrote an **inverted
+  interval** — my bug from session 15. Fixed.
+- "10 trading dates" is a rolling `today-3 … today+10`, **not** a fixed list; there
+  is no Nov 3 cutoff. The misleading comment that invited a hard-coded end is gone.
+- Ctrl+C / SIGTERM are now a clean stop (`CLEAN STOP —` line), documented for the
+  Handler together with when a force-kill is genuinely necessary.
+- `audit_triage.py --certify DATE`: the four-part rule as a command. No more
+  relay-and-interpret.
+- **Clean-day clock starts at the 28 Oct 08:47 NY restart; no fixed end date.**
 
 ---
 
@@ -1381,4 +1401,157 @@ python live/dry_run_runner.py       :: the loop
 
 `--check` writes nothing and is safe to run repeatedly. Do not start the runner
 until the state inspection and `--check` both look sane.
+
+### 15.15 Live findings, 28 Oct: two vacuous failures and one real fix
+
+#### 1. `[FAIL]` on every sample was a zero-denominator artefact
+
+`verify()` computed `bool(fri_last) and late == 0 and at_close / len(fri_last) >= 0.8`.
+When the trailing window contained no Friday, `bool(fri_last)` was False and the
+check reported **FAIL**. Same for Sunday. A "failure" that means *there was
+nothing to check*.
+
+The live window is ~50 hours, so on a Wednesday morning it contains neither
+boundary: 82 samples in the 28 Oct archive failed this way while the feed was
+healthy.
+
+There was a **second, less obvious shape** in the same archive: 23 samples read
+`Sundays 0/1`. One Sunday *was* visible — but clipped by the window's left edge,
+so its first bar in the window was 23:37 instead of the 18:00 open. The check
+compared a mid-session bar against the open minute and called it wrong. A window
+is a slice, not a history; it can miss a boundary at either edge.
+
+Both are the same error as the Session 12 stale-weekend-tick escalate: absence of
+evidence read as evidence of failure.
+
+**Fix.** A boundary is only judged if the window actually contains it
+(`window_first <= boundary <= window_last`). Otherwise the check reports
+`not applicable` and passes, and the monitor writes that fact into `notes` — so a
+check that did not run is distinguishable from one that ran and passed. The
+**positive** violations are untouched and still fail unconditionally: a bar later
+than Friday 16:59, or earlier than Sunday 18:00, is wrong however the window is
+clipped. Verified by replaying all 3088 archived samples through the corrected
+verifier: **82 → 0 failures, and 0 of them contained a genuine boundary breach**.
+Phase 1's verdict on the real 287,746-bar dataset is **unchanged** (39/42 Fridays,
+42/42 Sundays — the three being half-days).
+
+**Did it contaminate anything certification-facing? No.** `invariant_all_passed`
+and `failures` are read in exactly two places: the monitor's own console `[PASS]/
+[FAIL]` flag and its `--once` exit code. Nothing else reads them — not the runner,
+not `audit_triage.py`, not the certification rule. The stall attribution in §15.12
+used `window_last_ny`, `tick_age_seconds` and `notes`, all unaffected.
+
+**Does the history need reconciliation? No.** No decision was taken on those rows,
+so nothing downstream is wrong. And the CSV is self-explanatory without editing:
+the failing detail string carries the denominator (`0/0 Fridays...`), and the row
+carries `window_first_ny` / `window_last_ny`, which is precisely what proves the
+boundary sat outside the window. A reader can re-derive vacuity from the row
+itself. Rewriting it would break append-only for no gain, so: **no rewrite, no
+annotation file.**
+
+#### 2. The 231-minute `polling_gap` at startup: right rows, wrong event
+
+Confirmed — the substance of the Handler's reading is correct. The four
+`dry_run_gap_runner_down` rows (04:45, 05:45, 06:45, **07:45**-08:15 on 28 Oct) are
+the dead time between the 04:57 kill and the 08:47 restart, reconciled as
+unwatched rather than back-filled. That is the Q14 restart path working on real
+data for the first time.
+
+But the `polling_gap` *event* attached to it was wrong, and it was mine:
+
+* `start()` never adopted the new start as the heartbeat, so the first `step()`
+  measured `now - last_heartbeat_utc` = 231 minutes and reported a freeze that the
+  **state file had already reconciled**. The event text ("machine asleep or an MT5
+  call blocked") points the operator at the wrong cause.
+* Worse, closing the interval at that stale heartbeat wrote an **inverted
+  interval** into the ledger (start 12:48 UTC → end 08:57 UTC). Harmless — a
+  window can never match an interval whose end precedes its start — but it is
+  corrupt data.
+
+**Fix.** `start()` sets `last_heartbeat_utc = now` *after* the gap scan and the
+reconciliation have used the old value; `_close_observation` clamps so an interval
+can never invert. The restart now logs `start` → `unclean_shutdown_detected` → the
+four gap rows, and nothing else. The mid-run freeze detector still works for a
+genuinely suspended process (tested).
+
+#### 3. "10 trading dates" is not a fixed list — no Nov 3 cutoff exists
+
+`_days_in_planned_range` is computed on every start as
+`ny_today - 3 … ny_today + 10`, so it always yields 10 trading dates and rolls
+forward: on 28 Oct it covers 26 Oct - 6 Nov; on 10 Nov it covers 5 Nov - 20 Nov;
+on 20 Dec, 17 Dec - 30 Dec. **There is no end date to outlive, and the runner will
+not refuse to validate past 3 Nov.**
+
+What *was* wrong was the comment claiming the range "covers the planned 26 Oct-3
+Nov window" — the kind of comment that invites someone to hard-code it later.
+Replaced with named constants (`SCHEDULE_LOOKAHEAD_DAYS`, `SCHEDULE_LOOKBACK_DAYS`)
+and a docstring stating there is no fixed end, plus tests that assert the range
+still covers dates months later and that every such start passes the DST-safe
+check. Verified on a simulated 2026-11-10 start: `dst_safe_dates: 10`.
+
+#### 4. Ctrl+C is now a clean stop
+
+`SIGINT`, `SIGTERM`, `SIGHUP` and `SIGBREAK` are handled by setting a flag only —
+no I/O inside the handler, because the loop may be mid-append or mid-`os.replace`
+and a clean stop exists precisely to keep those consistent. The loop notices within
+one second (it sleeps in slices) and calls `stop()`, which closes the interval,
+writes `clean_stop: true`, appends a `stop` event and prints:
+
+```
+CLEAN STOP — state flushed, clean_stop=True after N steps and M evaluations.
+The next start will NOT log this session's downtime as a gap.
+```
+
+**What the Handler watches for:**
+
+* **Clean stop** — that `CLEAN STOP —` line appears, and `runner_events.csv` gains
+  a `stop` row. Closing the window afterwards is safe and the next start logs
+  nothing about a gap.
+* **Force-kill is genuinely necessary only when:** (a) the process is wedged inside
+  an MT5 call and does not respond to Ctrl+C within ~30 s (the call is blocking, so
+  the flag cannot be seen until it returns); or (b) the machine is being powered
+  off. Both are recoverable — see below — so a kill is a last resort, not a hazard.
+* **After a kill**, the next start prints `unclean_shutdown_detected` and logs the
+  affected windows as gaps. That is correct behaviour, not damage. Check with
+  `audit_triage.py --state` before restarting.
+
+#### 5. `--certify DATE` replaces relay-and-interpret
+
+```
+python live/audit_triage.py --certify 2026-10-28
+```
+
+Applies the four-part rule and prints PASS/FAIL with every failing condition
+named, not just the first:
+
+```
+2026-10-28  FAIL
+  rows            : 21/21 scheduled windows
+  outcomes        : 2 WIN, 0 LOSS, 18 NO_SETUP
+  [FAIL] coverage missing windows: 09:45-10:15
+  [FAIL] outcome  13:45-14:15: outcome 'MISSING_EVALUATION' is not a decided outcome
+  [FAIL] range    1 row(s) with outside_data_range: 04:45-05:15
+  [FAIL] gaps     1 row(s) the runner did not observe: 18:45-19:15
+  -> this day does NOT count; the consecutive run restarts here
+```
+
+Exit codes: `0` PASS, `1` FAIL, `2` not a trading day (e.g. Sunday) or bad usage.
+`MISSING_EVALUATION` counts as *not* a decided outcome — the schema value means
+"could not be evaluated", so a day containing one is not clean. It reads
+`window_evaluations.csv` and falls back to the audit CSV, saying so when it does.
+
+### 15.16 The clean-day clock starts at the 28 Oct 08:47 NY restart
+
+**Decision: Phase 2 has no fixed end date.** The run continues until five
+consecutive clean days are certified; the 26 Oct - 3 Nov window is dropped as a
+target.
+
+**The clock starts at the restart on 2026-10-28 08:47 NY (12:47 UTC).** Nothing
+logged before that can count: 26 Oct carries both defects, 27 Oct carries stalls 2
+and 3, and the 28 Oct session ended in an unclean kill. Those days are documented,
+not secret — §15.11-15.15 explain every row — but they are not candidates.
+
+A day counts only if `--certify` says PASS. Run it at the end of each session; the
+five-day count is the number of consecutive PASSes, and any FAIL restarts the run
+at that date.
 

@@ -65,7 +65,7 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 # ---------------------------------------------------------------------------
 # The single load-bearing constant. Broker clock = New York local + 7 hours.
@@ -104,6 +104,27 @@ def _hm(t: datetime) -> str:
     return t.strftime("%H:%M")
 
 
+def _boundary_visible(day: date, boundary: str,
+                      window_first: datetime, window_last: datetime) -> bool:
+    """Can this bar window actually see `boundary` on `day`?
+
+    A trailing window of N bars is a *slice*, not a history. Two of the four
+    invariants are statements about a specific minute (Friday 16:59, Sunday
+    18:00), and a slice can easily not contain that minute:
+
+    * no Friday/Sunday in the slice at all — nothing to judge;
+    * a Friday/Sunday clipped by the left edge — its first bar in the slice is
+      mid-session, so the *open* simply was not sampled;
+    * a Friday clipped by the right edge — the session has not closed yet.
+
+    In all three cases the check has no evidence, and "no evidence" is not
+    "failed". Reporting it as a failure is the same class of error as the stale
+    weekend tick that used to escalate: absence read as contradiction.
+    """
+    b = datetime.combine(day, time.fromisoformat(boundary))
+    return window_first <= b <= window_last
+
+
 # ---------------------------------------------------------------------------
 # Verification
 # ---------------------------------------------------------------------------
@@ -133,30 +154,45 @@ def verify(bars: list[tuple[int, float, float, float, float, int]]) -> tuple[boo
     by_date: dict[object, list[datetime]] = {}
     for _, n in ny:
         by_date.setdefault(n.date(), []).append(n)
+    window_first = ny[0][1]
+    window_last = ny[-1][1]
+
     fri_last = {d: ts[-1] for d, ts in by_date.items() if d.weekday() == 4}
+    # A bar later than 16:59 on a Friday is wrong no matter how the window is
+    # clipped, so this positive violation is always counted.
     late = sum(1 for n in (t for _, t in ny) if n.weekday() == 4 and _hm(n) > FRIDAY_CLOSE)
-    at_close = sum(1 for t in fri_last.values() if _hm(t) == FRIDAY_CLOSE)
-    ok = bool(fri_last) and late == 0 and at_close / len(fri_last) >= 0.8
-    rows.append(
-        (
-            f"Friday close {FRIDAY_CLOSE} NY",
-            ok,
-            f"{at_close}/{len(fri_last)} Fridays close at {FRIDAY_CLOSE}, {late} bars later than that",
-        )
-    )
+    fri_seen = sorted(d for d in fri_last
+                      if _boundary_visible(d, FRIDAY_CLOSE, window_first, window_last))
+    at_close = sum(1 for d in fri_seen if _hm(fri_last[d]) == FRIDAY_CLOSE)
+    if late:
+        ok, detail = False, f"{at_close}/{len(fri_seen)} Fridays close at {FRIDAY_CLOSE}, {late} bars later than that"
+    elif not fri_seen:
+        ok = True
+        detail = (f"not applicable: no Friday close inside this window "
+                  f"({len(fri_last)} Friday(s) visible, all clipped by an edge)")
+    else:
+        ok = at_close / len(fri_seen) >= 0.8
+        detail = (f"{at_close}/{len(fri_seen)} Fridays close at {FRIDAY_CLOSE}, "
+                  f"{late} bars later than that")
+    rows.append((f"Friday close {FRIDAY_CLOSE} NY", ok, detail))
 
     # 4. Sundays open at 18:00 NY.
     sun_first = {d: ts[0] for d, ts in by_date.items() if d.weekday() == 6}
     early = sum(1 for n in (t for _, t in ny) if n.weekday() == 6 and _hm(n) < SUNDAY_OPEN)
-    at_open = sum(1 for t in sun_first.values() if _hm(t) == SUNDAY_OPEN)
-    ok = bool(sun_first) and early == 0 and at_open / len(sun_first) >= 0.95
-    rows.append(
-        (
-            f"Sunday open {SUNDAY_OPEN} NY",
-            ok,
-            f"{at_open}/{len(sun_first)} Sundays open at {SUNDAY_OPEN}, {early} bars earlier than that",
-        )
-    )
+    sun_seen = sorted(d for d in sun_first
+                      if _boundary_visible(d, SUNDAY_OPEN, window_first, window_last))
+    at_open = sum(1 for d in sun_seen if _hm(sun_first[d]) == SUNDAY_OPEN)
+    if early:
+        ok, detail = False, f"{at_open}/{len(sun_seen)} Sundays open at {SUNDAY_OPEN}, {early} bars earlier than that"
+    elif not sun_seen:
+        ok = True
+        detail = (f"not applicable: no Sunday open inside this window "
+                  f"({len(sun_first)} Sunday(s) visible, all clipped by an edge)")
+    else:
+        ok = at_open / len(sun_seen) >= 0.95
+        detail = (f"{at_open}/{len(sun_seen)} Sundays open at {SUNDAY_OPEN}, "
+                  f"{early} bars earlier than that")
+    rows.append((f"Sunday open {SUNDAY_OPEN} NY", ok, detail))
 
     return all(r[1] for r in rows), rows
 

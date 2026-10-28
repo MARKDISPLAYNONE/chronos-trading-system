@@ -16,7 +16,9 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from live.audit_triage import (  # noqa: E402
+    CERTIFIABLE_OUTCOMES,
     LIVE_LEGAL_REASONS,
+    certify,
     main,
     monitor_gaps,
     parse_period,
@@ -277,6 +279,133 @@ class TestMonitorEvidence(unittest.TestCase):
         gaps = monitor_gaps(mon)
         self.assertEqual(len(gaps), 1)
         self.assertAlmostEqual((gaps[0][1] - gaps[0][0]).total_seconds() / 60, 324.0)
+
+
+class TestCertify(unittest.TestCase):
+    """The four-part clean-day rule, as a function rather than a judgement."""
+
+    DAY = dt.date(2026, 10, 28)
+
+    def rows(self, **overrides):
+        from src import time_windows
+
+        out = []
+        for window in time_windows.windows_for_day(self.DAY):
+            row = {
+                "trading_date": self.DAY.isoformat(),
+                "window_label": window.label,
+                "outcome": "NO_SETUP",
+                "reason": "no sweep",
+            }
+            row.update(overrides.get(window.label, {}))
+            out.append(row)
+        return out
+
+    def test_a_clean_day_passes(self):
+        result = certify(self.DAY, self.rows())
+        self.assertTrue(result["passed"], result["failures"])
+        self.assertEqual(result["counts"]["rows"], 21)
+        self.assertEqual(result["counts"]["scheduled"], 21)
+
+    def test_a_missing_window_fails_coverage_and_names_it(self):
+        rows = [r for r in self.rows() if r["window_label"] != "09:45-10:15"]
+        result = certify(self.DAY, rows)
+        self.assertFalse(result["passed"])
+        coverage = [d for c, d in result["failures"] if c == "coverage"]
+        self.assertTrue(any("09:45-10:15" in d for d in coverage), coverage)
+
+    def test_a_duplicate_window_fails_coverage(self):
+        rows = self.rows()
+        rows.append(dict(rows[0]))
+        result = certify(self.DAY, rows)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("duplicated" in d for c, d in result["failures"]
+                            if c == "coverage"))
+
+    def test_an_undecided_outcome_fails(self):
+        rows = self.rows(**{"13:45-14:15": {"outcome": "MISSING_EVALUATION",
+                                            "reason": "data_ends_before_trade_closed"}})
+        result = certify(self.DAY, rows)
+        self.assertFalse(result["passed"])
+        self.assertIn("MISSING_EVALUATION",
+                      " ".join(d for c, d in result["failures"] if c == "outcome"))
+
+    def test_a_blank_reason_fails(self):
+        rows = self.rows(**{"13:45-14:15": {"outcome": "WIN", "reason": ""}})
+        result = certify(self.DAY, rows)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("empty reason" in d for c, d in result["failures"]))
+
+    def test_range_and_stall_rows_fail(self):
+        for reason in ("outside_data_range", "live_feed_stalled"):
+            rows = self.rows(**{"04:45-05:15": {"reason": reason}})
+            result = certify(self.DAY, rows)
+            self.assertFalse(result["passed"], reason)
+            self.assertTrue(any(reason in d for c, d in result["failures"]),
+                            result["failures"])
+
+    def test_gap_rows_fail(self):
+        rows = self.rows(**{"04:45-05:15": {"reason": "dry_run_gap_runner_down"}})
+        result = certify(self.DAY, rows)
+        self.assertFalse(result["passed"])
+        self.assertTrue(any(c == "gaps" for c, _ in result["failures"]))
+
+    def test_every_failing_condition_is_reported_together(self):
+        """One run must list all the reasons, not just the first."""
+        rows = self.rows(**{
+            "04:45-05:15": {"reason": "outside_data_range"},
+            "13:45-14:15": {"reason": "dry_run_gap_runner_down"},
+        })
+        rows = [r for r in rows if r["window_label"] != "09:45-10:15"]
+        result = certify(self.DAY, rows)
+        conditions = {c for c, _ in result["failures"]}
+        self.assertEqual(conditions, {"coverage", "range", "gaps"})
+
+    def test_a_weekend_is_not_applicable(self):
+        result = certify(dt.date(2026, 11, 1), [])
+        self.assertFalse(result["applicable"])
+        self.assertIn("Sunday", result["detail"])
+
+    def test_rows_for_other_dates_are_ignored(self):
+        rows = self.rows()
+        rows.append({"trading_date": "2026-10-27", "window_label": "00:45-01:15",
+                     "outcome": "WIN", "reason": "take profit hit"})
+        self.assertTrue(certify(self.DAY, rows)["passed"])
+
+    def test_missing_evaluation_is_not_certifiable(self):
+        self.assertNotIn("MISSING_EVALUATION", CERTIFIABLE_OUTCOMES)
+
+    def test_cli_prints_pass_and_exit_zero(self):
+        import csv
+        cols = ["trading_date", "window_label", "outcome", "reason"]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp)
+            for name in ("window_evaluations.csv", "window_evaluations_audit.csv"):
+                with (out / name).open("w", newline="", encoding="utf-8") as fh:
+                    w = csv.DictWriter(fh, fieldnames=cols)
+                    w.writeheader()
+                    for r in self.rows():
+                        w.writerow({k: r[k] for k in cols})
+            self.assertEqual(main(["--certify", self.DAY.isoformat(),
+                                   "--out-dir", str(out)]), 0)
+
+    def test_cli_prints_fail_and_exit_one(self):
+        import csv
+        cols = ["trading_date", "window_label", "outcome", "reason"]
+        rows = self.rows(**{"04:45-05:15": {"reason": "live_feed_stalled"}})
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp)
+            for name in ("window_evaluations.csv", "window_evaluations_audit.csv"):
+                with (out / name).open("w", newline="", encoding="utf-8") as fh:
+                    w = csv.DictWriter(fh, fieldnames=cols)
+                    w.writeheader()
+                    for r in rows:
+                        w.writerow({k: r[k] for k in cols})
+            self.assertEqual(main(["--certify", self.DAY.isoformat(),
+                                   "--out-dir", str(out)]), 1)
+
+    def test_cli_rejects_a_bad_date(self):
+        self.assertEqual(main(["--certify", "28-10-2026", "--out-dir", "/tmp"]), 2)
 
 
 class TestKnownBadFile(unittest.TestCase):

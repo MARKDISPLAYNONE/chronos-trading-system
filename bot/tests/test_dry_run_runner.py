@@ -236,6 +236,20 @@ class RunnerHarness(unittest.TestCase):
         runner.start(connect_terminal=False)
         return runner
 
+    def advance_to(self, when, runner, *, step_seconds=120.0):
+        """Move the clock forward the way a running process would.
+
+        Setting `self.clock` straight to the moment under test is no longer a
+        no-op: the runner treats a hole longer than POLL_GAP_SECONDS between polls
+        as "not watching", which is correct, so a 75-minute jump makes the window
+        under test read as unobserved. This walks the clock forward in steps
+        shorter than that threshold, which is what a live process does.
+        """
+        target = when if isinstance(when, (int, float)) else when.timestamp()
+        while self.clock < target:
+            self.clock = min(target, self.clock + step_seconds)
+            runner.step()
+
     def read(self, name):
         path = self.out / name
         if not path.exists():
@@ -346,8 +360,7 @@ class TestQ13RowTiming(RunnerHarness):
     def test_no_setup_row_is_written_at_window_close(self):
         """The quiet window has no setup; it must be final at its close."""
         runner = self.quiet_runner()
-        self.clock = utc_ts(2026, 10, 26, 20, 16)   # just after 20:15 NY
-        runner.step()
+        self.advance_to(utc_ts(2026, 10, 26, 20, 16), runner)   # just after the close
         row = self.window_row(QUIET_LABEL)
         self.assertIsNotNone(row, "NO_SETUP row should exist once the window closed")
         self.assertEqual(row["outcome"], "NO_SETUP")
@@ -356,8 +369,7 @@ class TestQ13RowTiming(RunnerHarness):
         """At the trigger the trade is open; nothing may be appended yet."""
         rows = build_feed(up_to=dt.datetime(2026, 10, 26, 14, 16))
         runner = self.make_runner(rows=rows)
-        self.clock = utc_ts(2026, 10, 26, 14, 16)   # window just closed, trade open
-        runner.step()
+        self.advance_to(utc_ts(2026, 10, 26, 14, 16), runner)  # trade just opened
         self.assertIsNone(
             self.window_row(TRADE_LABEL),
             "an open trade must not be logged as an outcome",
@@ -368,8 +380,7 @@ class TestQ13RowTiming(RunnerHarness):
     def test_traded_row_appears_when_the_trade_resolves(self):
         rows = build_feed(up_to=dt.datetime(2026, 10, 26, 15, 0))   # exit is in here
         runner = self.make_runner(rows=rows)
-        self.clock = utc_ts(2026, 10, 26, 15, 0)
-        runner.step()
+        self.advance_to(utc_ts(2026, 10, 26, 15, 0), runner)
         row = self.window_row(TRADE_LABEL)
         self.assertIsNotNone(row, "the trade resolved, so the row must be written")
         self.assertIn(row["outcome"], ("WIN", "LOSS"))
@@ -380,30 +391,45 @@ class TestQ13RowTiming(RunnerHarness):
         """Same window, feed grows between two polls: emitted on the second."""
         rows = build_feed(up_to=dt.datetime(2026, 10, 26, 14, 16))
         runner = self.make_runner(rows=rows)
-        self.clock = utc_ts(2026, 10, 26, 14, 16)
-        runner.step()
+        self.advance_to(utc_ts(2026, 10, 26, 14, 16), runner)
         self.assertIsNone(self.window_row(TRADE_LABEL))
 
         self.source._rows = build_feed(up_to=dt.datetime(2026, 10, 26, 15, 0))
-        self.clock = utc_ts(2026, 10, 26, 15, 1)
-        runner.step()
+        self.advance_to(utc_ts(2026, 10, 26, 15, 1), runner)
         row = self.window_row(TRADE_LABEL)
         self.assertIsNotNone(row)
         self.assertIn(row["outcome"], ("WIN", "LOSS"))
 
     def test_evaluated_at_is_the_write_time_not_the_window_close(self):
-        runner = self.quiet_runner()
-        self.clock = utc_ts(2026, 10, 26, 20, 30)
-        runner.step()
-        row = self.window_row(QUIET_LABEL)
-        # The row was decided at 20:30, not at the 20:15 window close.
-        self.assertTrue(row["evaluated_at"].startswith("2026-10-26T20:30"),
-                        row["evaluated_at"])
+        """A traded window is stamped when it resolves, not when it closed.
+
+        The trade window closes at 14:15 and its exit lands later, so the row is
+        written at  15:00 — 45 minutes after the close. That gap is the whole
+        point of Q13, and it is why file order is decision order.
+        """
+        # The feed must *grow* with the clock, as a live one does; a static
+        # snapshot up to 15:00 would let the runner score the exit at 14:16.
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 14, 16))
+        runner = self.make_runner(rows=rows)
+        self.advance_to(utc_ts(2026, 10, 26, 14, 16), runner)
+        self.assertIsNone(self.window_row(TRADE_LABEL))
+
+        self.source._rows = build_feed(up_to=dt.datetime(2026, 10, 26, 15, 0))
+        self.advance_to(utc_ts(2026, 10, 26, 15, 0), runner)
+        row = self.window_row(TRADE_LABEL)
+        self.assertEqual(row["window_label"], "13:45-14:15")
+        self.assertIn(row["outcome"], ("WIN", "LOSS"))
+        # The window closed at 14:15; the row carries the time it was *written*.
+        written = dt.datetime.fromisoformat(row["evaluated_at"])
+        self.assertGreater(written.replace(tzinfo=None),
+                           dt.datetime(2026, 10, 26, 14, 15),
+                           "evaluated_at must be the write time, not the close")
 
     def test_append_only_never_duplicates(self):
         runner = self.quiet_runner()
-        self.clock = utc_ts(2026, 10, 26, 20, 16)
-        for _ in range(4):
+        self.advance_to(utc_ts(2026, 10, 26, 20, 16), runner)
+        for _ in range(3):                     # keep polling: nothing may repeat
+            self.clock += 20
             runner.step()
         rows = [r for r in self.read("window_evaluations.csv")
                 if r["window_label"] == QUIET_LABEL and r["trading_date"] == "2026-10-26"]
@@ -411,8 +437,7 @@ class TestQ13RowTiming(RunnerHarness):
 
     def test_ids_match_the_phase1_scheme(self):
         runner = self.quiet_runner()
-        self.clock = utc_ts(2026, 10, 26, 20, 16)
-        runner.step()
+        self.advance_to(utc_ts(2026, 10, 26, 20, 16), runner)
         row = self.window_row(QUIET_LABEL)
         window = time_windows.Window(dt.date(2026, 10, 26), 19)
         expected = outputs.window_id(
@@ -456,8 +481,7 @@ class TestQ14CrashPolicy(RunnerHarness):
         the time we restart, and must still be ignored."""
         rows = build_feed(up_to=dt.datetime(2026, 10, 26, 14, 16))
         runner = self.make_runner(rows=rows)
-        self.clock = utc_ts(2026, 10, 26, 14, 16)
-        runner.step()
+        self.advance_to(utc_ts(2026, 10, 26, 14, 16), runner)
         self.assertIn(window_key(time_windows.Window(dt.date(2026, 10, 26), 13)),
                       runner.state.pending)
         runner.stop()
@@ -720,9 +744,8 @@ class TestTransientDataLag(RunnerHarness):
     def test_a_late_final_bar_does_not_produce_a_row(self):
         """The regression itself: 45s of publication lag, no disconnect."""
         runner = self.lagging_runner(45.0, feed_end=dt.datetime(2026, 10, 26, 15, 30))
-        self.clock = utc_ts(2026, 10, 26, 14, 15, 20) if False else (
-            dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp())
-        runner.step()
+        self.advance_to(dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp(),
+                        runner)
         self.assertIsNone(self.window_row(TRADE_LABEL),
                           "the bar had not arrived yet; nothing may be written")
         self.assertNotIn("outside_data_range", self.all_reasons())
@@ -731,12 +754,12 @@ class TestTransientDataLag(RunnerHarness):
 
     def test_the_row_is_written_once_the_bar_lands(self):
         runner = self.lagging_runner(45.0, feed_end=dt.datetime(2026, 10, 26, 15, 30))
-        self.clock = dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp()
-        runner.step()
+        self.advance_to(dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp(),
+                        runner)
         self.assertIsNone(self.window_row(TRADE_LABEL))
 
-        self.clock = dt.datetime(2026, 10, 26, 14, 16, 30, tzinfo=NY).timestamp()
-        runner.step()
+        self.advance_to(dt.datetime(2026, 10, 26, 14, 16, 30, tzinfo=NY).timestamp(),
+                        runner)
         self.assertIsNone(self.window_row(TRADE_LABEL),
                           "trade is open; the row still waits for simulate()")
         self.assertNotIn(
@@ -763,8 +786,8 @@ class TestTransientDataLag(RunnerHarness):
         from live.csv_emitter import REASON_LIVE_FEED_STALLED
 
         runner = self.lagging_runner(45.0, feed_end=dt.datetime(2026, 10, 26, 15, 30))
-        self.clock = dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp()
-        runner.step()
+        self.advance_to(dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp(),
+                        runner)
         self.assertIsNone(self.window_row(TRADE_LABEL))
 
         # The whole feed stops growing from here: no bar for this window arrives.
@@ -801,8 +824,8 @@ class TestTransientDataLag(RunnerHarness):
 
     def test_deferral_is_persisted_so_a_restart_does_not_lose_the_window(self):
         runner = self.lagging_runner(45.0, feed_end=dt.datetime(2026, 10, 26, 15, 30))
-        self.clock = dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp()
-        runner.step()
+        self.advance_to(dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp(),
+                        runner)
         key = window_key(time_windows.Window(dt.date(2026, 10, 26), 13))
         self.assertIn(key, runner.state.deferred)
 
@@ -888,8 +911,8 @@ class TestDeferredWindowAcrossACrash(RunnerHarness):
     def test_a_deferral_that_survives_a_restart_becomes_a_gap(self):
         rows = build_feed(up_to=dt.datetime(2026, 10, 26, 15, 30))
         runner = self.lagging_runner(rows)
-        self.clock = dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp()
-        runner.step()
+        self.advance_to(dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp(),
+                        runner)
         key = window_key(time_windows.Window(dt.date(2026, 10, 26), 13))
         self.assertIn(key, runner.state.deferred)
 
@@ -913,12 +936,12 @@ class TestDeferredWindowAcrossACrash(RunnerHarness):
         """The contrast that keeps the rule from being over-applied."""
         rows = build_feed(up_to=dt.datetime(2026, 10, 26, 15, 30))
         runner = self.lagging_runner(rows)
-        self.clock = dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp()
-        runner.step()
+        self.advance_to(dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp(),
+                        runner)
         self.assertIsNone(self.window_row(TRADE_LABEL))
 
-        self.clock = dt.datetime(2026, 10, 26, 16, 0, tzinfo=NY).timestamp()
-        runner.step()
+        self.advance_to(dt.datetime(2026, 10, 26, 16, 0, tzinfo=NY).timestamp(),
+                        runner)
         row = self.window_row(TRADE_LABEL)
         self.assertIsNotNone(row)
         self.assertIn(row["outcome"], ("WIN", "LOSS"),
@@ -1082,6 +1105,143 @@ class TestUncleanRestart(RunnerHarness):
         self.assertEqual(self.read("runner_events.csv"), [])
         self.assertEqual((self.out / "runner_state.json").read_text(), before,
                          "a preflight must not touch the state file")
+
+
+# ---------------------------------------------------------------------------
+# The restart gap is the state file's business, not the poll-gap detector's
+# ---------------------------------------------------------------------------
+class TestStartupAfterKill(RunnerHarness):
+    """Observed live on 28 Oct: a `polling_gap` of 231 min at startup.
+
+    The gap rows themselves were correct (the Q14 restart path). The *event* was
+    not: `start()` had not adopted the new start as the heartbeat, so the first
+    poll measured 231 minutes against the previous session's last heartbeat and
+    reported a freeze that had already been reconciled. It also wrote an inverted
+    observation interval (start 12:48 -> end 08:57).
+    """
+
+    def killed_state(self, kill):
+        import json
+        (self.out / "runner_state.json").write_text(json.dumps({
+            "first_start_utc": utc_ts(2026, 10, 25, 22, 32),
+            "last_heartbeat_utc": kill,
+            "observations": [[utc_ts(2026, 10, 25, 22, 32), None]],
+            "pending": {}, "deferred": {}, "clean_stop": False, "saved_utc": "x",
+        }))
+
+    def restart(self, kill, restart_at):
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        self.killed_state(kill)
+        self.clock = restart_at
+        self.source = FakeSource(rows, lambda: self.clock)
+        runner = DryRunRunner(FakeMT5(rows), self.out, source=self.source,
+                              now_fn=lambda: self.clock, log=self.logs.append)
+        runner.start(connect_terminal=False)
+        return runner
+
+    def test_a_restart_does_not_look_like_a_freeze(self):
+        runner = self.restart(utc_ts(2026, 10, 28, 4, 57), utc_ts(2026, 10, 28, 8, 48))
+        runner.step()
+        kinds = [e["kind"] for e in self.read("runner_events.csv")]
+        self.assertNotIn("polling_gap", kinds,
+                         "the restart gap was already reconciled by the state file")
+        self.assertIn("unclean_shutdown_detected", kinds)
+
+    def test_the_ledger_never_contains_an_inverted_interval(self):
+        runner = self.restart(utc_ts(2026, 10, 28, 4, 57), utc_ts(2026, 10, 28, 8, 48))
+        for _ in range(3):
+            self.clock += 20
+            runner.step()
+        for lo, hi in runner.state.observations:
+            if hi is not None:
+                self.assertGreaterEqual(hi, lo, f"inverted interval {lo} -> {hi}")
+
+    def test_the_downtime_windows_are_still_gaps(self):
+        """The restart path itself must keep working — it was never the bug."""
+        runner = self.restart(utc_ts(2026, 10, 28, 4, 57), utc_ts(2026, 10, 28, 8, 48))
+        runner.step()
+        rows = [r for r in self.read("window_evaluations.csv")
+                if r["trading_date"] == "2026-10-28"]
+        self.assertEqual([r["window_label"] for r in rows],
+                         ["04:45-05:15", "05:45-06:15", "06:45-07:15", "07:45-08:15"])
+        self.assertTrue(all(r["reason"] == REASON_RUNNER_DOWN for r in rows))
+
+
+# ---------------------------------------------------------------------------
+# No fixed end date
+# ---------------------------------------------------------------------------
+class TestScheduleHorizon(unittest.TestCase):
+    def _dates(self, day):
+        from live.dry_run_runner import (SCHEDULE_LOOKAHEAD_DAYS,
+                                         SCHEDULE_LOOKBACK_DAYS)
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        runner = DryRunRunner(None, pathlib.Path("/tmp"), source=None,
+                              now_fn=lambda: 0, log=lambda *_: None)
+        now = dt.datetime(day.year, day.month, day.day, 12, 0,
+                          tzinfo=NY).timestamp()
+        got = runner._days_in_planned_range(now)
+        self.assertGreaterEqual(min(got), day - dt.timedelta(days=SCHEDULE_LOOKBACK_DAYS))
+        self.assertLessEqual(max(got), day + dt.timedelta(days=SCHEDULE_LOOKAHEAD_DAYS))
+        return got
+
+    def test_the_range_rolls_past_the_old_phase_two_end_date(self):
+        """3 Nov was a fixed end date; the run now continues until 5 clean days."""
+        late = self._dates(dt.date(2026, 11, 10))
+        self.assertTrue(all(d > dt.date(2026, 11, 3) for d in late),
+                        f"schedule check stalled at the old end date: {late}")
+        self.assertGreater(len(late), 5)
+
+    def test_it_still_validates_months_later(self):
+        far = self._dates(dt.date(2027, 2, 3))
+        self.assertGreater(min(far), dt.date(2026, 11, 3))
+        self.assertIn(dt.date(2027, 2, 3), far)
+
+    def test_every_start_is_dst_safe_whatever_the_date(self):
+        for day in (dt.date(2026, 10, 28), dt.date(2026, 11, 4),
+                    dt.date(2027, 3, 10), dt.date(2027, 11, 2)):
+            checked = assert_schedule_is_dst_safe(self._dates(day))
+            self.assertTrue(checked)
+
+
+# ---------------------------------------------------------------------------
+# Ctrl+C / SIGTERM are a clean stop, not a kill
+# ---------------------------------------------------------------------------
+class TestSignalShutdown(RunnerHarness):
+    def test_sigterm_produces_a_clean_stop(self):
+        import json
+        import os
+        import signal as sig_mod
+        import threading
+
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        runner = self.make_runner(rows=rows)
+        runner.poll_seconds = 1
+        installed = runner.install_signal_handlers()
+        self.assertIn(sig_mod.SIGTERM, installed)
+
+        threading.Timer(0.3, lambda: os.kill(os.getpid(), sig_mod.SIGTERM)).start()
+        runner.run()
+
+        state = json.loads((self.out / "runner_state.json").read_text())
+        self.assertTrue(state["clean_stop"])
+        self.assertIn("stop", [e["kind"] for e in self.read("runner_events.csv")])
+        self.assertIsNotNone(state["observations"][-1][1],
+                             "the interval must be closed, not left dangling")
+
+    def test_a_stop_request_is_honoured_within_a_poll(self):
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        runner = self.make_runner(rows=rows)
+        runner.poll_seconds = 5
+        runner.request_stop()
+        runner.run(install_signals=False)
+        self.assertTrue(runner.state.clean_stop)
+
+    def test_the_clean_stop_confirmation_line_is_printed(self):
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        runner = self.make_runner(rows=rows)
+        runner.request_stop()
+        runner.run(install_signals=False)
+        self.assertTrue(any("CLEAN STOP" in line for line in self.logs), self.logs)
 
 
 if __name__ == "__main__":

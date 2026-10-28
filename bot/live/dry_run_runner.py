@@ -112,6 +112,16 @@ UTC = dt.timezone.utc
 #: to complete the launch day honestly, not to invent a history.
 GAP_LOOKBACK_HOURS = 26
 
+#: How far ahead of "today" the startup schedule check looks, in calendar days.
+#: There is deliberately NO end date for Phase 2: the run continues until five
+#: consecutive clean days are certified, so the schedule window has to roll
+#: forward forever. A fixed end would make the runner refuse to start — or, worse,
+#: silently stop validating — the day after that date.
+SCHEDULE_LOOKAHEAD_DAYS = 10
+#: And how far back, so a restart shortly after midnight still covers yesterday's
+#: windows (a closing window belongs to the previous NY date).
+SCHEDULE_LOOKBACK_DAYS = 3
+
 #: How long a window may sit with an incomplete tail before the runner stops
 #: treating it as "not yet" and calls it a feed stall. This is the ONLY place
 #: that decision is made. It is a policy number, not a measurement: five minutes
@@ -340,6 +350,7 @@ class DryRunRunner:
         self.steps = 0
         self.evaluations_total = 0
         self._warned_empty = False
+        self._stop_requested = False
 
     # -- lifecycle --------------------------------------------------------
     def start(self, *, connect_terminal: bool = True, force: bool = False,
@@ -429,6 +440,13 @@ class DryRunRunner:
         # never saw its data while we were alive, so anything readable now came
         # from broker back-fill. That is a gap, not an evaluation.
         self._reconcile_deferred_after_crash(now)
+        # Adopt this start as the heartbeat. Everything up to here has already
+        # been reconciled against the OLD heartbeat — the gap scan lower bound and
+        # the dangling-interval close both read it above. Leaving it stale would
+        # make the first poll look like a 231-minute freeze and log a second,
+        # wrongly-attributed `polling_gap` for a downtime the state file has
+        # already accounted for.
+        self.state.last_heartbeat_utc = now
         self.state.clean_stop = False
         self.state.save()
         return facts
@@ -545,10 +563,54 @@ class DryRunRunner:
             )
         return result
 
-    def run(self, *, max_seconds: float | None = None) -> int:
+    def request_stop(self, signum: int | None = None) -> None:
+        """Ask the loop to stop at the next safe point. Safe inside a signal handler.
+
+        Deliberately *only* sets a flag. Doing any I/O here would race the main
+        loop, which may be halfway through appending a CSV row or replacing the
+        state file — and the whole point of a clean stop is that it leaves both
+        consistent. The loop notices within one `poll_seconds` (20 s).
+        """
+        self._stop_requested = True
+
+    def install_signal_handlers(self) -> dict[int, str]:
+        """Ctrl+C and SIGTERM become a clean stop instead of a kill.
+
+        Without this, closing a terminal window or pressing Ctrl+C leaves
+        `clean_stop: false` and an open observation interval, and the next launch
+        has to reconstruct what happened from the state file. That self-heal
+        exists and is tested, but it is a fallback, not the intended path: the
+        operator gets a specific confirmation line from a clean stop and none from
+        a kill.
+
+        Returns the signals that were actually installed, for the log — Windows
+        does not deliver SIGTERM the way POSIX does, so this reports rather than
+        assumes.
+        """
+        installed: dict[int, str] = {}
+        for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"):
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            try:
+                signal.signal(signum, self._handle_signal)
+                installed[signum] = name
+            except (ValueError, OSError):        # not in the main thread, or Windows
+                continue
+        return installed
+
+    def _handle_signal(self, signum, _frame) -> None:
+        self._stop_requested = True
+
+    def run(self, *, max_seconds: float | None = None,
+            install_signals: bool = True) -> int:
         started = self._now_fn()
+        installed = self.install_signal_handlers() if install_signals else {}
+        if installed:
+            self._log(f"clean stop: {', '.join(sorted(installed.values()))} "
+                      f"→ graceful shutdown (state flushed, clean_stop=True)")
         try:
-            while True:
+            while not self._stop_requested:
                 try:
                     self.step()
                 except Exception:
@@ -560,9 +622,15 @@ class DryRunRunner:
                     )
                 if max_seconds is not None and self._now_fn() - started >= max_seconds:
                     break
-                time.sleep(self.poll_seconds)
+                # Sleep in short slices so a stop request is honoured promptly
+                # instead of after a full poll interval.
+                slept = 0.0
+                while slept < self.poll_seconds and not self._stop_requested:
+                    time.sleep(min(1.0, self.poll_seconds - slept))
+                    slept += 1.0
         except KeyboardInterrupt:
-            pass
+            # Reached only if the handler could not be installed.
+            self._log("interrupted (KeyboardInterrupt)")
         finally:
             self.stop()
         return 0
@@ -578,7 +646,14 @@ class DryRunRunner:
             f"{self.evaluations_total} evaluations",
             when=broker_now_ny(now),
         )
-        self._log(f"stopped after {self.steps} steps")
+        # The operator needs one unambiguous line to look for. Everything above
+        # it can be noisy; this is the sentence that means "you may close the
+        # window now".
+        self._log(
+            f"CLEAN STOP — state flushed, clean_stop=True after {self.steps} steps "
+            f"and {self.evaluations_total} evaluations. "
+            f"The next start will NOT log this session's downtime as a gap."
+        )
 
     # -- observation ledger ----------------------------------------------
     def _open_observation(self, now: float) -> None:
@@ -587,11 +662,19 @@ class DryRunRunner:
         self.state.observations.append((now, None))  # type: ignore[arg-type]
 
     def _close_observation(self, now: float) -> None:
+        """Close the open interval, never before it opened.
+
+        `now` can legitimately be *earlier* than the interval start — on the first
+        poll after a restart, `now` is the startup time while the value being
+        passed is the previous session's heartbeat. An interval with `hi < lo` is
+        nonsense in the ledger even though `observed()` would never match a
+        window against it, so it is clamped rather than written.
+        """
         if not self.state.observations:
             return
         lo, hi = self.state.observations[-1]
         if hi is None:
-            self.state.observations[-1] = (lo, now)
+            self.state.observations[-1] = (lo, max(lo, now))
 
     def _intervals(self, now: float) -> list[tuple[float, float]]:
         """Closed intervals, with the currently-open one extended to `now`."""
@@ -620,9 +703,18 @@ class DryRunRunner:
 
     # -- window iteration -------------------------------------------------
     def _days_in_planned_range(self, now: float) -> list[dt.date]:
+        """Trading dates the startup DST check must cover, relative to *now*.
+
+        Computed on every start from the current New York date, so it rolls
+        forward indefinitely: on 28 Oct it covers 26 Oct - 6 Nov, on 20 Dec it
+        covers 17 Dec - 30 Dec. There is no fixed end date to outlive.
+
+        The only hard-coded dates in this project are the historical ones used to
+        construct test cases; nothing about the run's own lifetime is pinned.
+        """
         ny_today = dt.datetime.fromtimestamp(now, UTC).astimezone(NY).date()
-        lo = ny_today - dt.timedelta(days=3)
-        hi = ny_today + dt.timedelta(days=10)     # covers the planned 26 Oct-3 Nov window
+        lo = ny_today - dt.timedelta(days=SCHEDULE_LOOKBACK_DAYS)
+        hi = ny_today + dt.timedelta(days=SCHEDULE_LOOKAHEAD_DAYS)
         return time_windows.trading_days(lo, hi)
 
     def _windows_closing_between(self, lo_utc: float, hi_utc: float):
@@ -989,7 +1081,10 @@ def main(argv: list[str] | None = None, mt5_module=None) -> int:
     ap.add_argument("--poll-seconds", type=int, default=20)
     ap.add_argument("--max-runtime-seconds", type=float, default=None)
     ap.add_argument("--check", action="store_true",
-                    help="run the startup guards and exit without looping")
+                    help="run the startup guards and exit without looping "
+                         "(read-only: writes nothing)")
+    ap.add_argument("--force", action="store_true",
+                    help="start even if another runner may be alive")
     args = ap.parse_args(argv)
     out_dir = pathlib.Path(args.out_dir)
 
@@ -1010,7 +1105,7 @@ def main(argv: list[str] | None = None, mt5_module=None) -> int:
     runner = DryRunRunner(mt5, out_dir, poll_seconds=args.poll_seconds,
                           symbol=args.symbol)
     try:
-        facts = runner.start()
+        facts = runner.start(force=args.force)
         if args.check:
             print("\n--- startup checks (read-only: nothing written) ---")
             for k, v in facts.items():

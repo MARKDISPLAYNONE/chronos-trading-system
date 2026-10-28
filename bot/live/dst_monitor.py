@@ -337,6 +337,16 @@ class Monitor:
         s.invariant_failures = "; ".join(failed)
         if not ok:
             self.failures.append(f"session invariants failed: {'; '.join(failed)}")
+        # A check that could not run must not look like one that ran and passed.
+        # The detail text says which boundary the window could not see; put it in
+        # the row so the audit trail records the vacuity rather than hiding it.
+        skipped = [name for name, passed, detail in rows
+                   if passed and detail.startswith("not applicable")]
+        if skipped:
+            notes.append(
+                "weekend invariants not applicable in this window: "
+                + ", ".join(skipped)
+            )
 
         # --- 3. local-hour anomalies + schedule integrity ------------------
         backsteps, gaps, largest = local_time_anomalies(ny)
