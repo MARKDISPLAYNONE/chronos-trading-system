@@ -335,9 +335,17 @@ class TestObservationCoverage(unittest.TestCase):
 # Q13: when a row is written
 # ---------------------------------------------------------------------------
 class TestQ13RowTiming(RunnerHarness):
+    #: The quiet window needs bars all the way to its close. A feed that stops
+    #: hours earlier is a dead feed, not a window with no setup — and the runner
+    #: now holds that row instead of inventing one (see TestTransientDataLag).
+    QUIET_FEED_END = dt.datetime(2026, 10, 26, 20, 16)
+
+    def quiet_runner(self):
+        return self.make_runner(rows=build_feed(up_to=self.QUIET_FEED_END))
+
     def test_no_setup_row_is_written_at_window_close(self):
         """The quiet window has no setup; it must be final at its close."""
-        runner = self.make_runner()
+        runner = self.quiet_runner()
         self.clock = utc_ts(2026, 10, 26, 20, 16)   # just after 20:15 NY
         runner.step()
         row = self.window_row(QUIET_LABEL)
@@ -384,7 +392,7 @@ class TestQ13RowTiming(RunnerHarness):
         self.assertIn(row["outcome"], ("WIN", "LOSS"))
 
     def test_evaluated_at_is_the_write_time_not_the_window_close(self):
-        runner = self.make_runner()
+        runner = self.quiet_runner()
         self.clock = utc_ts(2026, 10, 26, 20, 30)
         runner.step()
         row = self.window_row(QUIET_LABEL)
@@ -393,7 +401,7 @@ class TestQ13RowTiming(RunnerHarness):
                         row["evaluated_at"])
 
     def test_append_only_never_duplicates(self):
-        runner = self.make_runner()
+        runner = self.quiet_runner()
         self.clock = utc_ts(2026, 10, 26, 20, 16)
         for _ in range(4):
             runner.step()
@@ -402,7 +410,7 @@ class TestQ13RowTiming(RunnerHarness):
         self.assertEqual(len(rows), 1)
 
     def test_ids_match_the_phase1_scheme(self):
-        runner = self.make_runner()
+        runner = self.quiet_runner()
         self.clock = utc_ts(2026, 10, 26, 20, 16)
         runner.step()
         row = self.window_row(QUIET_LABEL)
@@ -655,6 +663,146 @@ class TestFullTradingDay(RunnerHarness):
 
 
 # ---------------------------------------------------------------------------
+# Late bars: "not yet" must never be written as "never"
+# ---------------------------------------------------------------------------
+class LaggingSource(FakeSource):
+    """A feed where a bar appears `lag_seconds` after its own minute closes.
+
+    This is the whole of the real defect's trigger. A disconnect is not needed:
+    if the window's final bar is published a few seconds after the window closes,
+    the first poll sees an incomplete Candle B and the evaluator reports
+    `outside_data_range` — a file-end-of-input verdict applied to a live feed.
+    """
+
+    def __init__(self, rows, now_fn, lag_seconds):
+        super().__init__(rows, now_fn)
+        self.lag_seconds = lag_seconds
+
+    @property
+    def series(self):
+        from src.bars import BarSeries, M1Bar
+        from src.m1_csv_source import CONVENTION_BROKER, epoch_to_label, to_ny_wall
+
+        now = self._now()
+        bars = []
+        for t, o, h, l, c, v in self._rows:
+            ny = to_ny_wall(epoch_to_label(int(t)), CONVENTION_BROKER)
+            closed_at = ny.replace(tzinfo=NY) + dt.timedelta(minutes=1)
+            if now >= closed_at.timestamp() + self.lag_seconds:
+                bars.append(M1Bar(ny, o, h, l, c, int(v)))
+        return BarSeries(bars)
+
+
+class TestTransientDataLag(RunnerHarness):
+    def lagging_runner(self, lag_seconds, *, feed_end, start_at=None):
+        rows = build_feed(up_to=feed_end)
+        self.clock = start_at if start_at is not None else self.START_CLOCK
+        self.mt5 = FakeMT5(rows)
+        self.source = LaggingSource(rows, lambda: self.clock, lag_seconds)
+        runner = DryRunRunner(
+            self.mt5, self.out, source=self.source, now_fn=lambda: self.clock,
+            log=self.logs.append,
+        )
+        runner.start(connect_terminal=False)
+        return runner
+
+    def all_reasons(self):
+        return {r["reason"] for r in self.read("window_evaluations.csv")}
+
+    def test_a_late_final_bar_does_not_produce_a_row(self):
+        """The regression itself: 45s of publication lag, no disconnect."""
+        runner = self.lagging_runner(45.0, feed_end=dt.datetime(2026, 10, 26, 15, 30))
+        self.clock = utc_ts(2026, 10, 26, 14, 15, 20) if False else (
+            dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp())
+        runner.step()
+        self.assertIsNone(self.window_row(TRADE_LABEL),
+                          "the bar had not arrived yet; nothing may be written")
+        self.assertNotIn("outside_data_range", self.all_reasons())
+        self.assertIn(window_key(time_windows.Window(dt.date(2026, 10, 26), 13)),
+                      runner.state.deferred)
+
+    def test_the_row_is_written_once_the_bar_lands(self):
+        runner = self.lagging_runner(45.0, feed_end=dt.datetime(2026, 10, 26, 15, 30))
+        self.clock = dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp()
+        runner.step()
+        self.assertIsNone(self.window_row(TRADE_LABEL))
+
+        self.clock = dt.datetime(2026, 10, 26, 14, 16, 30, tzinfo=NY).timestamp()
+        runner.step()
+        self.assertIsNone(self.window_row(TRADE_LABEL),
+                          "trade is open; the row still waits for simulate()")
+        self.assertNotIn(
+            window_key(time_windows.Window(dt.date(2026, 10, 26), 13)),
+            runner.state.deferred, "deferral must clear once the bars arrive",
+        )
+
+    def test_no_row_in_any_live_file_ever_carries_outside_data_range(self):
+        """Sweep of the actual output, not of the code: the reason is live-invalid."""
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 15, 30))
+        runner = self.lagging_runner(45.0, feed_end=dt.datetime(2026, 10, 26, 15, 30))
+        for minute in range(0, 121, 5):     # well past the lag and past the grace
+            self.clock = dt.datetime(2026, 10, 26, 13, 50,
+                                     tzinfo=NY).timestamp() + minute * 60
+            runner.step()
+        runner.stop()
+        for name in ("window_evaluations.csv", "window_evaluations_audit.csv"):
+            for row in self.read(name):
+                self.assertNotEqual(row["reason"], "outside_data_range",
+                                    f"{name}:{row['window_label']}")
+
+    def test_a_feed_that_never_delivers_is_a_stall_not_runner_downtime(self):
+        """Watched, connected, no bars: the reason must name the feed."""
+        from live.csv_emitter import REASON_LIVE_FEED_STALLED
+
+        runner = self.lagging_runner(45.0, feed_end=dt.datetime(2026, 10, 26, 15, 30))
+        self.clock = dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp()
+        runner.step()
+        self.assertIsNone(self.window_row(TRADE_LABEL))
+
+        # The whole feed stops growing from here: no bar for this window arrives.
+        self.source._rows = []
+        self.clock += 400.0           # past DATA_LAG_GRACE_SECONDS
+        runner.step()
+        row = self.window_row(TRADE_LABEL)
+        self.assertIsNotNone(row, "after the grace period the window must be logged")
+        self.assertEqual(row["reason"], REASON_LIVE_FEED_STALLED)
+        self.assertNotEqual(row["reason"], REASON_RUNNER_DOWN)
+        audit = [r for r in self.read("window_evaluations_audit.csv")
+                 if r["window_label"] == TRADE_LABEL][0]
+        self.assertIn("live_feed_stalled", audit["flags"])
+
+    def test_the_guard_refuses_to_write_the_reason_directly(self):
+        """Structural: not a flag, an exception."""
+        from src.context_classifier import Context
+        from src.window_evaluator import (
+            OUTCOME_NO_SETUP,
+            REASON_OUTSIDE_RANGE,
+            WindowEvaluation,
+        )
+
+        runner = self.make_runner()
+        window = time_windows.Window(dt.date(2026, 10, 26), 13)
+        bogus = WindowEvaluation(
+            window=window, context=Context.VOID.value,
+            outcome=OUTCOME_NO_SETUP, reason=REASON_OUTSIDE_RANGE,
+        )
+        with self.assertRaises(AssertionError) as ctx:
+            runner._emit_checked(bogus, self.clock)
+        self.assertIn("outside_data_range", str(ctx.exception))
+        self.assertEqual(self.read("window_evaluations.csv"), [])
+
+    def test_deferral_is_persisted_so_a_restart_does_not_lose_the_window(self):
+        runner = self.lagging_runner(45.0, feed_end=dt.datetime(2026, 10, 26, 15, 30))
+        self.clock = dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp()
+        runner.step()
+        key = window_key(time_windows.Window(dt.date(2026, 10, 26), 13))
+        self.assertIn(key, runner.state.deferred)
+
+        reloaded = RunnerState.load(self.out / "runner_state.json")
+        self.assertIn(key, reloaded.deferred)
+
+
+# ---------------------------------------------------------------------------
 # No-order guarantee, for this file specifically
 # ---------------------------------------------------------------------------
 class TestNoOrderPath(unittest.TestCase):
@@ -704,3 +852,49 @@ class TestNoOrderPath(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeferredWindowAcrossACrash(RunnerHarness):
+    """Deferral is about *data*, not about attention — the two must not conflate.
+
+    A window that was fully watched before the runner stopped stays scoreable
+    even though its bars only landed after the restart: we were looking, the feed
+    was late, and nothing about the window was missed. Q14's gate is about
+    windows the runner did not watch, and it must not be widened to cover this
+    case by accident (that would throw away a real, observed evaluation).
+    """
+
+    def lagging_runner(self, rows):
+        self.clock = self.START_CLOCK
+        self.mt5 = FakeMT5(rows)
+        self.source = LaggingSource(rows, lambda: self.clock, 45.0)
+        runner = DryRunRunner(
+            self.mt5, self.out, source=self.source, now_fn=lambda: self.clock,
+            log=self.logs.append,
+        )
+        runner.start(connect_terminal=False)
+        return runner
+
+    def test_a_fully_watched_window_is_still_scored_across_a_restart(self):
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 15, 30))
+        runner = self.lagging_runner(rows)
+        self.clock = dt.datetime(2026, 10, 26, 14, 15, 20, tzinfo=NY).timestamp()
+        runner.step()
+        key = window_key(time_windows.Window(dt.date(2026, 10, 26), 13))
+        self.assertIn(key, runner.state.deferred)
+
+        runner.stop()
+        revived = DryRunRunner(
+            self.mt5, self.out, source=self.source, now_fn=lambda: self.clock,
+            log=self.logs.append,
+        )
+        self.clock = dt.datetime(2026, 10, 26, 16, 0, tzinfo=NY).timestamp()
+        revived.start(connect_terminal=False)
+        revived.step()
+
+        row = self.window_row(TRADE_LABEL)
+        self.assertIsNotNone(row)
+        self.assertIn(row["outcome"], ("WIN", "LOSS"),
+                      "the window was watched end to end; it is not a gap")
+        self.assertNotEqual(row["reason"], REASON_RUNNER_DOWN)
+        self.assertNotIn(key, revived.state.deferred)

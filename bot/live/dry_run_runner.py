@@ -91,11 +91,18 @@ from src.mt5_live_source import (  # noqa: E402
 from src.window_evaluator import (  # noqa: E402
     OUTCOME_MISSING,
     REASON_DATA_ENDS,
+    REASON_OUTSIDE_RANGE,
     WindowEvaluation,
     evaluate_window,
 )
 
-from live.csv_emitter import CsvEmitter, REASON_RUNNER_DOWN, gap_evaluation  # noqa: E402
+from live.csv_emitter import (  # noqa: E402
+    REASON_LIVE_FEED_STALLED,
+    REASON_RUNNER_DOWN,
+    CsvEmitter,
+    gap_evaluation,
+    stall_evaluation,
+)
 
 NY = ZoneInfo(config.NY_TZ)
 UTC = dt.timezone.utc
@@ -104,6 +111,14 @@ UTC = dt.timezone.utc
 #: from New York midnight of the start date. Deliberately under 24h: the point is
 #: to complete the launch day honestly, not to invent a history.
 GAP_LOOKBACK_HOURS = 26
+
+#: How long a window may sit with an incomplete tail before the runner stops
+#: treating it as "not yet" and calls it a feed stall. This is the ONLY place
+#: that decision is made. It is a policy number, not a measurement: five minutes
+#: is many poll cycles (so ordinary publication lag can never reach it) and far
+#: shorter than any genuine market closure, which is what makes it a safe
+#: boundary between a late bar and a dead feed.
+DATA_LAG_GRACE_SECONDS = 300.0
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +204,10 @@ class RunnerState:
     last_heartbeat_utc: float | None = None
     observations: list[tuple[float, float]] = field(default_factory=list)
     pending: dict[str, dict] = field(default_factory=dict)
+    #: Windows whose tail had not arrived when they closed. Keyed like
+    #: `pending`; the value records when the deferral started, which is what
+    #: DATA_LAG_GRACE_SECONDS is measured against.
+    deferred: dict[str, dict] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: pathlib.Path) -> "RunnerState":
@@ -206,6 +225,7 @@ class RunnerState:
         state.last_heartbeat_utc = raw.get("last_heartbeat_utc")
         state.observations = [tuple(x) for x in raw.get("observations", [])]
         state.pending = raw.get("pending", {})
+        state.deferred = raw.get("deferred", {})
         return state
 
     def save(self) -> None:
@@ -215,6 +235,7 @@ class RunnerState:
             "last_heartbeat_utc": self.last_heartbeat_utc,
             "observations": [list(x) for x in self.observations],
             "pending": self.pending,
+            "deferred": self.deferred,
             "saved_utc": dt.datetime.now(UTC).isoformat(),
         }
         tmp = self.path.with_suffix(".tmp")
@@ -355,11 +376,13 @@ class DryRunRunner:
 
         # 1. windows that closed while we were watching
         result.evaluated, result.emitted = self._evaluate_due(series, now)
-        # 2. windows whose trade may have resolved since the last poll
+        # 2. windows held because their tail bars were late
+        result.emitted += self._retry_deferred(series, now)
+        # 3. windows whose trade may have resolved since the last poll
         resolved, emitted_now = self._advance_pending(series, now)
         result.pending = resolved
         result.emitted += emitted_now
-        # 3. anything still unaccounted for was not observed
+        # 4. anything still unaccounted for was not observed
         result.gaps = self._fill_gaps(now)
 
         self.evaluations_total += result.evaluated
@@ -464,6 +487,113 @@ class DryRunRunner:
                 if lo_utc <= close < hi_utc:
                     yield window, start_utc.timestamp(), close
 
+    # -- emission ---------------------------------------------------------
+    def _guard_live_reason(self, ev: WindowEvaluation) -> None:
+        """`outside_data_range` is a backtest concept and must never be written.
+
+        In a file, "the data stops here" is a fact. In a live feed the series can
+        only grow, so the same comparison means "the bars have not arrived yet",
+        which is a transient condition and not a verdict about the window. If a
+        path ever tries to emit it, that is a bug in the runner, and it fails
+        loudly here rather than being silently recorded as a market fact.
+        """
+        if ev.reason == REASON_OUTSIDE_RANGE:
+            raise AssertionError(
+                f"refusing to emit {REASON_OUTSIDE_RANGE!r} for "
+                f"{ev.trading_date} {ev.window_label}: the live feed is not a file "
+                "and 'no data yet' is not 'no data ever'"
+            )
+
+    def _emit_checked(self, ev: WindowEvaluation, now: float,
+                      note: str = "") -> bool:
+        """The only way a row reaches disk."""
+        self._guard_live_reason(ev)
+        return self.emitter.emit(ev, emit_time=self._ny_now(now), note=note)
+
+    def _defer(self, key: str, ev: WindowEvaluation, now: float) -> None:
+        """Park a window whose own bars had not arrived when it closed.
+
+        Not an outcome, not a gap: the runner was watching, the data is simply
+        late. It is re-examined every poll and only becomes a row once either the
+        bars land (normal evaluation) or DATA_LAG_GRACE_SECONDS passes (a stall).
+        """
+        if key in self.state.deferred:
+            return
+        self.state.deferred[key] = {
+            "first_deferred_utc": now,
+            "bars_b": ev.bars_b,
+            "bars_a": ev.bars_a,
+        }
+        self.emitter.event(
+            "data_late",
+            f"{key} closed before its final bar arrived "
+            f"(bars_a={ev.bars_a}, bars_b={ev.bars_b}); holding the row and "
+            f"re-checking for {DATA_LAG_GRACE_SECONDS:.0f}s",
+            when=self._ny_now(now),
+        )
+        self._log(f"  {key}: tail bars late -> deferred")
+
+    def _retry_deferred(self, series, now: float) -> int:
+        """Re-examine deferred windows. Returns rows actually written."""
+        emitted = 0
+        for key, meta in list(self.state.deferred.items()):
+            day_s, label = key.split("|")
+            window = next((w for w in time_windows.windows_for_day(dt.date.fromisoformat(day_s))
+                           if w.label == label), None)
+            if window is None:                       # pragma: no cover - defensive
+                self.state.deferred.pop(key, None)
+                continue
+            ev = self._evaluate(window)
+            if ev is not None and self.emitter.already_emitted(ev):
+                self.state.deferred.pop(key, None)
+                continue
+            if ev is not None and ev.reason != REASON_OUTSIDE_RANGE:
+                # The bars arrived. Before treating that as an ordinary
+                # evaluation, apply the same observation gate as everywhere
+                # else: if the runner died while the window was open, the data
+                # that eventually arrived is history we did not watch. Q14
+                # applies to a deferred window exactly as to any other.
+                start_utc, close_utc, _ = window_utc_bounds(window)
+                if not observed(self._intervals(now), start_utc.timestamp(),
+                                close_utc.timestamp(), self.grace_seconds):
+                    gap = gap_evaluation(window, detail="not_observed_by_runner",
+                                         source=ev)
+                    if self._emit_checked(gap, now):
+                        emitted += 1
+                    self.state.deferred.pop(key, None)
+                    continue
+                # The bars arrived. This is now an ordinary evaluation.
+                if self._is_pending(ev):
+                    _start, close_utc, _ = window_utc_bounds(window)
+                    self._mark_pending(key, ev, close_utc.timestamp(), now)
+                elif self._emit_checked(ev, now, note="emitted_after_data_lag"):
+                    emitted += 1
+                    self._log_result(window, ev)
+                self.state.deferred.pop(key, None)
+                continue
+            # Still no complete window. `ev is None` means the feed delivered
+            # nothing at all, which is a stall too — the deadline must not depend
+            # on being able to evaluate, or a silent feed would never be logged.
+            age = now - float(meta.get("first_deferred_utc", now))
+            if age < DATA_LAG_GRACE_SECONDS:
+                continue
+            # Watched, connected, and still no bars for a window that is long
+            # since closed: that is a feed fault, and it says so.
+            stalled = stall_evaluation(window, detail="no_bars_after_grace",
+                                       source=ev if ev is not None else None)
+            if self._emit_checked(stalled, now):
+                emitted += 1
+            self.state.deferred.pop(key, None)
+            self.emitter.event(
+                "feed_stalled",
+                f"{key} produced no bars within {DATA_LAG_GRACE_SECONDS:.0f}s of "
+                f"closing; logged as {REASON_LIVE_FEED_STALLED} (feed fault, "
+                f"not runner downtime)",
+                when=self._ny_now(now),
+            )
+            self._log(f"  {key}: no bars after grace -> {REASON_LIVE_FEED_STALLED}")
+        return emitted
+
     # -- evaluation -------------------------------------------------------
     def _evaluate_due(self, series, now: float) -> tuple[int, int]:
         evaluated = emitted = 0
@@ -486,7 +616,14 @@ class DryRunRunner:
             if self._is_pending(ev):
                 self._mark_pending(key, ev, close_utc, now)
                 continue
-            if self.emitter.emit(ev, emit_time=self._ny_now(now)):
+            if ev.reason == REASON_OUTSIDE_RANGE:
+                # The window's own tail has not been published yet. Holding it
+                # is the whole fix: the previous behaviour wrote this row once,
+                # immediately, and never looked again — so a bar that was 20
+                # seconds late became a permanent, wrong "no data" verdict.
+                self._defer(key, ev, now)
+                continue
+            if self._emit_checked(ev, now):
                 emitted += 1
                 self._log_result(window, ev)
         return evaluated, emitted
@@ -517,10 +654,7 @@ class DryRunRunner:
                     continue
                 # The trade has had MAX_BARS_TO_RESOLVE_TRADE of history and
                 # still has no exit. Log it as unresolved rather than hanging.
-                self.emitter.emit(
-                    ev, emit_time=self._ny_now(now),
-                    note="resolution_deadline_passed",
-                )
+                self._emit_checked(ev, now, note="resolution_deadline_passed")
                 self.state.pending.pop(key, None)
                 emitted += 1
                 self._log(f"unresolved past deadline: {key}")
@@ -532,7 +666,7 @@ class DryRunRunner:
             if not self._exit_was_observed(ev, now):
                 gap = gap_evaluation(window, detail="exit_not_observed",
                                      source=ev)
-                self.emitter.emit(gap, emit_time=self._ny_now(now))
+                self._emit_checked(gap, now)
                 self.state.pending.pop(key, None)
                 emitted += 1
                 self.emitter.event(
@@ -542,7 +676,7 @@ class DryRunRunner:
                 )
                 self._log(f"  {key}: exit not observed -> {REASON_RUNNER_DOWN}")
                 continue
-            self.emitter.emit(ev, emit_time=self._ny_now(now))
+            self._emit_checked(ev, now)
             self.state.pending.pop(key, None)
             emitted += 1
             self._log_result(window, ev)
@@ -627,7 +761,7 @@ class DryRunRunner:
                 window, detail="not_observed_by_runner",
                 source=ev if ev.plan is not None else None,
             )
-            if self.emitter.emit(gap, emit_time=self._ny_now(now)):
+            if self._emit_checked(gap, now):
                 filled += 1
                 self.emitter.event(
                     "gap", f"{key} logged as {REASON_RUNNER_DOWN} "
@@ -663,7 +797,7 @@ class DryRunRunner:
                 detail="open_trade_at_shutdown",
                 source=ev if (ev is not None and ev.plan is not None) else None,
             )
-            if self.emitter.emit(gap, emit_time=self._ny_now(now)):
+            if self._emit_checked(gap, now):
                 self.emitter.event(
                     "gap",
                     f"{key} had an open trade when the runner stopped "

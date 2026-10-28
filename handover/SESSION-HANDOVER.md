@@ -178,7 +178,12 @@ part that makes the numbers trustworthy — do the same on any re-run):
    logged as `dry_run_gap_runner_down` and the run resumes forward-only.
    **Next action:** run the live probe (below) and return its output before the
    runner is built against the live API.
-2. ✅ **DONE — Phase 2 build complete.** `mt5_live_source.py` (§15.7),
+2. 🟠 **Phase 2 dry run is running but cannot produce a certifiable day yet.**
+   The `outside_data_range` defect is understood and fixed (§15.11); the running
+   runner still has the old code. Next: run `live/audit_triage.py` against the
+   live log, then restart the runner to pick up the fix — the restart is what
+   starts the clean-day count.
+3. ✅ **DONE — Phase 2 build complete.** `mt5_live_source.py` (§15.7),
    `dry_run_runner.py`, `dst_monitor.py`, `csv_emitter.py` (§15.9). Q13/Q14
    approved and implemented. **Ready to launch** after the §15.10 preflight.
    **Live offset still unconfirmed** — needs a market-open probe run (§15.8).
@@ -403,6 +408,25 @@ monitor and CSV emitter built. **281 tests, all passing.**
 - **Readiness:** ready for a Monday 26 Oct launch after a ~5-minute preflight
   (`pip install tzdata` → probe → `--check`). See §15.10 for the honest residual
   risk and the day-one partial-coverage note.
+
+**Session 14 (defect investigation — this session):** traced `outside_data_range`
+firing on a healthy connection. **Two distinct defects**: a backtest verdict
+applied to a live feed (its trigger is a *late bar*, not a disconnect), and the
+row being written once and never revisited, which made a sub-minute glitch a
+permanent wrong entry. Fixed both (§15.11). **309 tests, all passing.**
+- Reproduced: 0/21 misfires with prompt bars, 21/21 with the closing bar 45s
+  late — same feed, same clock, no disconnect. After the fix: 0/21.
+- `outside_data_range` is now unemittable (raises), genuine stalls are
+  `live_feed_stalled`, late tails are deferred and re-checked.
+- Found that **my own Q13 tests encoded the bug** — they fed a dead feed and
+  asserted a NO_SETUP row for it. Fixtures corrected.
+- `bot/live/audit_triage.py` + `live/known_bad_windows.txt` do the log analysis
+  on the Handler's machine; the audit CSV is not in this workspace, so no counts
+  or row verdicts are claimed here.
+- **No day can be certified clean**; the four-part certification rule is in
+  §15.11 and the clean-day clock restarts at the restart, not at launch.
+- The live runner was **not** restarted or patched (per instruction): the fix is
+  committed and inert until the Handler restarts it.
 
 ---
 
@@ -989,4 +1013,150 @@ Monday, the windows that closed earlier that day are logged as
 record, not a defect — the exit criterion ("21/21 every day") applies to full days
 after launch. Starting at the Sunday 18:00 reopen would avoid it entirely;
 starting Monday morning will not, and the log will say so.
+
+### 15.11 Investigation: `outside_data_range` on a live feed (28 Oct)
+
+Two separate defects, one root cause each. They are **not** the same bug and they
+need separate fixes; conflating them would have left the second one in place.
+
+#### Defect A — the reason string
+
+`outside_data_range` is a **backtest** verdict. In `window_evaluator.py` it means
+exactly one thing: `window.end > series.last_time` — "the input file stops before
+this window". That is a fact about a file. Against a live feed it is never a
+fact, because the series can only grow, so the same comparison reads "the bars
+have not arrived **yet**" and writes it down as "the bars will **never** arrive".
+
+It only reaches the row when the window is *partial*, i.e. through
+`_classify_missing_data`. A complete window never gets there. So the trigger is
+narrow and specific: **the last minute of Candle B had not been published at the
+instant the window was evaluated**, which happens when the terminal publishes the
+bar a few seconds after the minute rolls over.
+
+Reproduced against the real runner, same feed and clock, no disconnect anywhere:
+
+| Feed behaviour | 21 windows of 2026-10-26 |
+|---|---|
+| bar published the instant its minute closes | **0** `outside_data_range` |
+| closing bar occasionally 45s late | **21 of 21** `outside_data_range`, `bars_b=14`, `flags=incomplete_candle` |
+
+That is the answer to "how can this fire with a stable connection": it does not
+need a connection problem at all. It needs a bar to be a few seconds late. Which
+windows misfire is then decided by where the 20-second poll lands relative to
+publication — i.e. by luck. That is why three windows misfired and eighteen did
+not, on a day whose connection was up.
+
+#### Defect B — the row was permanent
+
+Worse than the wrong label: the misfire was **unrecoverable**. The row was
+emitted on the first poll after close, `already_emitted` then blocked any
+correction, and the window left the 120-second gap scan soon after. So a
+transient condition lasting under a minute became a permanent, wrong entry in an
+append-only log — and append-only is precisely what makes it permanent.
+
+**My own Q13 tests encoded this bug.** `test_no_setup_row_is_written_at_window_close`
+fed bars that stopped four hours before the window and asserted a NO_SETUP row
+appeared. On a live feed that fixture is a dead feed, and the assertion was the
+defect written down as a requirement. Those fixtures now end at the window's
+close; the tests were asserting the wrong thing, not just failing.
+
+#### The fix (on this branch, inert until the runner is restarted)
+
+1. **A window whose tail is late is held, not judged.** `_evaluate_due` parks it
+   in `runner_state.json` under `deferred` and re-examines it every poll. When
+   the bars arrive the row is written normally, flagged `emitted_after_data_lag`.
+2. **`outside_data_range` is unemittable, structurally.** `_emit_checked` is now
+   the only path to disk and it raises `AssertionError` on that reason. A test
+   asserts the exception; another sweeps every live CSV and asserts the string
+   never appears. Not a flag, not a default: a crash if anyone reintroduces it.
+3. **A real stall is named as one.** If the bars still have not arrived after
+   `DATA_LAG_GRACE_SECONDS` (300s), the row is written as
+   **`live_feed_stalled`** with flag `live_feed_stalled` — deliberately distinct
+   from `dry_run_gap_runner_down`, because "we were not looking" and "we were
+   looking and nothing came" are different facts and must not be counted
+   together.
+4. **Deferral respects Q14.** A deferred window whose span was not fully observed
+   (the runner died mid-window) becomes a gap, not a score. A deferred window
+   that *was* fully watched is still scored after a restart — deferral is about
+   data, not attention, and conflating the two would discard real observations.
+
+After the fix, the same 45-second-lag arm of the reproduction gives **21 rows, 0
+`outside_data_range`** — the rows are correct, just a few seconds later.
+
+**One number needs the Senior Dev's sign-off:** `DATA_LAG_GRACE_SECONDS = 300`.
+It is a policy choice, not a measurement — how long "not yet" may last before it
+becomes "never". Five minutes is ~15 poll cycles and far shorter than the shortest
+genuine closure (60 minutes), so it cannot misfire on a market break. It is a
+single module constant in `live/dry_run_runner.py`.
+
+#### Tasks that could not be done from here
+
+`window_evaluations_audit.csv`, `runner_events.csv`, `dst_monitor.csv` and the MT5
+Journal all live on the machine that ran the dry run; nothing in this workspace
+has them, and the Phase 1 dataset ends 2026-10-22 19:59 NY, so it cannot stand in
+for 26 Oct either. **No count is claimed below and no row was guessed.**
+
+`bot/live/audit_triage.py` does the analysis on that machine:
+
+```
+python live/audit_triage.py --outside-range --outages 2026-10-26T14:22/2026-10-27T01:48
+python live/audit_triage.py --self-check
+python live/audit_triage.py --show 2026-10-26 04:45-05:15
+python live/audit_triage.py --illegal-reasons
+```
+
+- `--outside-range` classifies every `outside_data_range` row by shape
+  (`no_bars_in_window` vs `short_tail` with `bars_b` < 15) and by whether it falls
+  inside a supplied outage, printing counts of connectivity vs unexplained.
+- `--self-check` re-derives **every** row's context from its own stored
+  `candle_a_low/mid/high` and `candle_b_open`. This settles the 04:45-05:15
+  question without the raw bars: the verdict is a pure function of two numbers
+  already in the file. If those numbers put the open inside the discount zone,
+  `invalid open location` is wrong **for that row**, and it will say so and exit 1.
+  It also covers the rest of the file, which is the real point.
+
+#### `known_bad_windows.txt` — and a correction
+
+Task 1's range ("`14:45-15:15` through `00:45-01:15`") is eight windows, and the
+venue has **no 15:45, 16:45 or 17:45 slot** — it is shut 17:00-18:00 NY. So the
+eight consecutive windows run `14:45-15:15`, then `18:45-19:15` … `23:45-00:15`,
+then `00:45-01:15` on the 27th. Written out in `bot/live/known_bad_windows.txt`
+and asserted against the schedule by a test, so the list cannot drift.
+
+The three transient-lag windows are deliberately **not** in that file: their
+correct classification is not `dry_run_gap_runner_down` (the runner was watching)
+and cannot be decided until the audit rows are read. Annotating them as outages
+would repeat the original error in the opposite direction.
+
+#### Clean days — nothing can be certified
+
+**No day is certifiable, and this is not limited to 26 Oct.** The runner wrote
+these rows on a day with no connection fault, so any day produced by the pre-fix
+code is suspect wherever the reason appears — and 25, 26, 27 and 28 Oct were all
+produced by it.
+
+- **25 Oct** — cannot: the run started 18:13 NY, so earlier windows are gaps.
+- **26 Oct** — cannot, proven: an outage plus at least the three known transient
+  rows.
+- **27 Oct** — cannot: the outage ran to 01:48 NY, so it has gap windows.
+- **28 Oct** — cannot be certified *from here*: the CSVs are not in this
+  workspace. It can be tested, not assumed — see the rule below.
+- **Anything after the fix is deployed** — can, subject to the same rule.
+
+The certification rule, now checkable rather than a matter of judgement. A day is
+clean only if all four hold:
+
+1. 21 rows for the trading date, one per scheduled window, no duplicates;
+2. every row has a valid outcome and a non-empty reason;
+3. **zero** `outside_data_range` rows and zero `live_feed_stalled` rows;
+4. zero `dry_run_gap_runner_down` rows, i.e. the runner observed all 21.
+
+Point 3 is why the defect had to be fixed rather than annotated: with the reason
+gone from the vocabulary, a day that satisfies 1-4 cannot have been affected by
+either defect. Absence of the string is meaningful *because* the misfire always
+manifested as exactly that string.
+
+**The clean-day clock therefore restarts at the restart**, not at launch. Days
+already logged cannot count toward the five consecutive clean days, and the
+Handler's restart to pick up this fix is the event that starts the count.
 

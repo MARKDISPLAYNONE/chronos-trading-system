@@ -58,6 +58,13 @@ from src.window_evaluator import (
 #: Reason string for a window the runner did not observe (Q14, Option A).
 REASON_RUNNER_DOWN = "dry_run_gap_runner_down"
 
+#: Reason string for a window whose own bars never arrived even though the
+#: runner was connected and watching it. Deliberately distinct from
+#: `dry_run_gap_runner_down`: in one case we were blind, in the other we were
+#: looking and the feed did not deliver. Conflating them would misattribute a
+#: feed fault to a crash and hide which of the two actually happened.
+REASON_LIVE_FEED_STALLED = "live_feed_stalled"
+
 EVENT_COLUMNS = [
     "event_utc",
     "ny_wall",
@@ -82,6 +89,8 @@ def gap_evaluation(
     *,
     detail: str = "",
     source: WindowEvaluation | None = None,
+    reason: str = REASON_RUNNER_DOWN,
+    flag: str = "runner_down",
 ) -> WindowEvaluation:
     """A NO_SETUP row for a window the runner did not fully observe.
 
@@ -97,7 +106,7 @@ def gap_evaluation(
     kind and no R. That is the difference between "we do not know" and a
     wrongly-scored WIN or LOSS.
     """
-    flags = ["runner_down"]
+    flags = [flag]
     if detail:
         flags.append(detail)
     if source is None:
@@ -105,14 +114,14 @@ def gap_evaluation(
             window=window,
             context=Context.VOID.value,
             outcome=OUTCOME_NO_SETUP,
-            reason=REASON_RUNNER_DOWN,
+            reason=reason,
             flags=flags,
         )
     return WindowEvaluation(
         window=window,
         context=source.context,
         outcome=OUTCOME_NO_SETUP,
-        reason=REASON_RUNNER_DOWN,
+        reason=reason,
         candle_a=source.candle_a,
         candle_b=source.candle_b,
         sweep=source.sweep,
@@ -122,6 +131,19 @@ def gap_evaluation(
         bars_b=source.bars_b,
         flags=flags,
     )
+
+
+def stall_evaluation(window: Window, *, detail: str = "",
+                     source: WindowEvaluation | None = None) -> WindowEvaluation:
+    """A window the runner watched and the feed still failed to deliver.
+
+    Same shape as `gap_evaluation`, different reason and flag, so the two are
+    never counted together: `runner_down` means "we were not looking",
+    `live_feed_stalled` means "we were looking and nothing arrived".
+    """
+    return gap_evaluation(window, detail=detail, source=source,
+                          reason=REASON_LIVE_FEED_STALLED,
+                          flag="live_feed_stalled")
 
 
 class CsvEmitter:
