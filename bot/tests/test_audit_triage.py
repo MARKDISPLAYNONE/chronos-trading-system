@@ -7,8 +7,13 @@ what a particular audit row looks like and what the tool must conclude. That als
 makes the tests a readable specification of the two defects.
 """
 
+import contextlib
+import csv
 import datetime as dt
+import io
+import json
 import pathlib
+import re
 import sys
 import tempfile
 import unittest
@@ -27,11 +32,13 @@ from live.audit_triage import (  # noqa: E402
     CERTIFY_PASS,
     LIVE_LEGAL_REASONS,
     certify,
+    certify_digest,
     load_certify_state,
     main,
     monitor_gaps,
     parse_period,
     rederive,
+    render_digest,
     self_check,
     show_row,
     stall_intervals,
@@ -39,6 +46,13 @@ from live.audit_triage import (  # noqa: E402
 )
 
 OUTAGE = (dt.datetime(2026, 10, 26, 14, 22), dt.datetime(2026, 10, 27, 1, 48))
+
+
+def time_windows_listing(day):
+    """The scheduled windows of `day`, from the module under test's own source."""
+    from src import time_windows
+
+    return sorted(time_windows.windows_for_day(day), key=lambda w: w.end)
 
 
 def audit_row(day="2026-10-26", label="02:45-03:15", *, reason,
@@ -319,6 +333,14 @@ class TestCertify(unittest.TestCase):
         """09:30 NY: only the windows closing by 09:15 exist."""
         return ny_ts(self.DAY, 9, 30)
 
+    def late_afternoon(self):
+        """17:25 NY - the moment the live report of 2026-10-29 was produced.
+
+        Six scheduled windows are still in the future at this point, and they
+        are consecutive, which is what the live report was blind to.
+        """
+        return ny_ts(self.DAY, 17, 25)
+
     def rows(self, **overrides):
         from src import time_windows
 
@@ -347,6 +369,57 @@ class TestCertify(unittest.TestCase):
                 if w.end <= cutoff]
 
     # --- the happy path ---------------------------------------------------
+    # --- the 2026-10-29 live report: consecutive future windows -----------
+    def test_six_or_more_future_windows_are_never_missing(self):
+        """Mid-afternoon, six scheduled windows remain. None is a defect.
+
+        This is the exact shape of the 2026-10-29 report: 15 rows in, six
+        windows still ahead, and the verdict claimed every one of them was
+        missing from coverage.
+        """
+        closed = self.labels_closed_by(self.late_afternoon())
+        rows = [r for r in self.rows() if r["window_label"] in closed]
+        self.assertEqual(len(rows), 15)
+
+        result = certify(self.DAY, rows, now=self.late_afternoon())
+
+        future = [w.label for w in time_windows_listing(self.DAY)
+                  if w.label not in closed]
+        self.assertGreaterEqual(len(future), 6)
+        self.assertEqual(result["status"], CERTIFY_INCOMPLETE, result["failures"])
+        # And specifically: no coverage failure at all, not just a non-failing one.
+        self.assertEqual([n for n, _d in result["failures"] if n == "coverage"], [])
+        kinds = {p["label"]: p["kind"] for p in result["pending"]}
+        for label in future:
+            self.assertEqual(kinds[label], ABSENT_NOT_DUE,
+                             f"{label} is in the future at 17:25 NY")
+        self.assertNotIn(ABSENT_MISSING, kinds.values())
+
+    def test_the_future_windows_are_not_named_in_any_failure(self):
+        """A failure that *does* exist must not be mixed up with future windows."""
+        closed = self.labels_closed_by(self.late_afternoon())
+        # One real defect (a stall on a closed window) plus six future windows.
+        rows = [dict(r, reason="live_feed_stalled") if r["window_label"] == "09:45-10:15"
+                else dict(r) for r in self.rows() if r["window_label"] in closed]
+        result = certify(self.DAY, rows, now=self.late_afternoon())
+
+        self.assertEqual(result["status"], CERTIFY_FAIL)     # the stall is real
+        text = " ".join(d for _n, d in result["failures"])
+        for window in time_windows_listing(self.DAY):
+            if window.label in closed:
+                continue
+            self.assertNotIn(window.label, text)
+
+    def test_a_late_afternoon_day_does_not_count_in_the_digest_streak(self):
+        """INCOMPLETE is not a clean day: the streak must not advance on it."""
+        closed = self.labels_closed_by(self.late_afternoon())
+        rows = [r for r in self.rows() if r["window_label"] in closed]
+        results = certify_digest(rows, days=1, now=self.late_afternoon(),
+                                 today=self.DAY)
+        self.assertEqual([r["status"] for r in results], [CERTIFY_INCOMPLETE])
+        rendered = render_digest(results, days=1)
+        self.assertIn("consecutive PASS streak: 0", rendered)
+
     def test_a_clean_day_passes(self):
         result = certify(self.DAY, self.rows(), now=self.after_close())
         self.assertEqual(result["status"], CERTIFY_PASS, result["failures"])
@@ -601,20 +674,21 @@ class TestCertifyCli(unittest.TestCase):
         self.write(rows)
         self.assertEqual(self.run_certify("--now", "2026-10-29T01:00"), 1)
 
-    def closed_rows(self, now_iso):
+    def closed_rows(self, now_iso, day=None):
         """Clean rows for exactly the windows that have closed by `now_iso`."""
         from zoneinfo import ZoneInfo
 
         from src import config
         from src import time_windows
 
+        day = day or self.DAY
         stamp = dt.datetime.fromisoformat(now_iso)
         if stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=ZoneInfo(config.NY_TZ))
         cutoff = stamp.replace(tzinfo=None)
-        return [{"trading_date": self.DAY.isoformat(), "window_label": w.label,
+        return [{"trading_date": day.isoformat(), "window_label": w.label,
                  "outcome": "NO_SETUP", "reason": "no sweep"}
-                for w in time_windows.windows_for_day(self.DAY) if w.end <= cutoff]
+                for w in time_windows.windows_for_day(day) if w.end <= cutoff]
 
     def test_incomplete_is_exit_three(self):
         """Distinct from FAIL: the day is not over, nothing is wrong."""
@@ -656,6 +730,51 @@ class TestCertifyCli(unittest.TestCase):
         self.write(self.closed_rows("2026-10-28T09:30"))
         self.assertEqual(self.run_certify("--now", "2026-10-28T13:30+00:00"), 3)
 
+    def test_late_afternoon_is_incomplete_not_fail(self):
+        """The live 2026-10-29 shape, end to end through the CLI."""
+        self.write(self.closed_rows("2026-10-29T17:25", day=dt.date(2026, 10, 29)))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = main(["--certify", "2026-10-29", "--out-dir", str(self.out),
+                       "--now", "2026-10-29T17:25"])
+        text = out.getvalue()
+        self.assertEqual(rc, 3, text)
+        self.assertIn("INCOMPLETE", text)
+        # The exact regression: none of those future windows may appear as a
+        # failure. They *may* appear in the "wait" line - that is where they
+        # belong, named as work still outstanding rather than as a defect.
+        failure_lines = [ln for ln in text.splitlines() if "[FAIL]" in ln]
+        self.assertEqual(failure_lines, [], text)
+        self.assertNotIn("missing", text.lower())
+        self.assertIn("6 window(s) have not closed yet", text)
+
+    def test_a_report_states_which_rule_produced_it(self):
+        """A stale checkout must be visible in its own output (§15.18)."""
+        self.write(self.clean_rows())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.run_certify("--now", "2026-10-29T01:00")
+        self.assertIn("certify v2", out.getvalue())
+
+    def test_fail_reports_the_last_runner_activity(self):
+        """A FAIL prompts 'was it even running?'; answer it unasked."""
+        rows = self.clean_rows()
+        rows[0] = dict(rows[0], reason="live_feed_stalled")
+        self.write(rows)
+        with (self.out / "runner_state.json").open("w") as fh:
+            json.dump({"last_heartbeat_utc":
+                       ny_ts(self.DAY, 12, 3), "clean_stop": False}, fh)
+        with (self.out / "runner_events.csv").open("w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=["event_utc", "ny_wall", "kind", "detail"])
+            w.writeheader()
+            w.writerow({"event_utc": "2026-10-28T16:00:00+00:00",
+                        "ny_wall": "2026-10-28T12:00:00-04:00",
+                        "kind": "start", "detail": "runner up"})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = self.run_certify("--now", "2026-10-29T01:00")
+        text = out.getvalue()
+        self.assertEqual(rc, 1, text)
+        self.assertIn("last runner activity", text)
+        self.assertIn("2026-10-28 12:03 NY", text)   # heartbeat, the later of the two
+
     def test_a_bad_now_is_exit_two(self):
         self.write([])
         self.assertEqual(self.run_certify("--now", "this morning"), 2)
@@ -663,6 +782,105 @@ class TestCertifyCli(unittest.TestCase):
     def test_no_log_files_at_all_is_exit_two(self):
         """A missing log is a usage error; an empty one is a verdict."""
         self.assertEqual(self.run_certify("--now", "2026-10-28T09:30"), 2)
+
+
+class TestDigest(unittest.TestCase):
+    """The streak view: one line per trading day, newest last."""
+
+    MONDAY = dt.date(2026, 10, 26)
+
+    def clean_week(self, *, skip=()):
+        """A row for every window of Mon-Fri, 26-30 Oct 2026."""
+        from src import time_windows
+
+        rows = []
+        for offset in range(5):
+            day = self.MONDAY + dt.timedelta(days=offset)
+            if day in skip:
+                continue
+            for w in time_windows.windows_for_day(day):
+                rows.append({"trading_date": day.isoformat(),
+                             "window_label": w.label,
+                             "outcome": "NO_SETUP", "reason": "no sweep"})
+        return rows
+
+    def after_friday(self):
+        return ny_ts(dt.date(2026, 10, 31), 1, 0)
+
+    def test_five_clean_days_reach_the_phase_exit_criteria(self):
+        rendered = render_digest(
+            certify_digest(self.clean_week(), days=5, now=self.after_friday(),
+                           today=dt.date(2026, 10, 30)),
+            days=5)
+        self.assertEqual(
+            len([ln for ln in rendered.splitlines()
+                 if re.match(r"\s+\d{4}-\d{2}-\d{2}\s+" + CERTIFY_PASS, ln)]), 5)
+        self.assertIn("consecutive PASS streak: 5", rendered)
+        self.assertIn("Phase 2 exit", rendered)
+
+    def test_weekends_do_not_take_a_line(self):
+        """`--digest 5` is five decisions, not five calendar days."""
+        results = certify_digest(self.clean_week(), days=5,
+                                 now=self.after_friday(),
+                                 today=dt.date(2026, 10, 30))
+        self.assertEqual([r["date"] for r in results],
+                         [self.MONDAY + dt.timedelta(days=i) for i in range(5)])
+
+    def test_a_broken_day_resets_the_streak(self):
+        results = certify_digest(self.clean_week(skip=(dt.date(2026, 10, 29),)),
+                                 days=5, now=self.after_friday(),
+                                 today=dt.date(2026, 10, 30))
+        rendered = render_digest(results, days=5)
+        self.assertIn("consecutive PASS streak: 1", rendered)   # Fri only
+        self.assertIn(f"{dt.date(2026, 10, 29)}  FAIL", rendered)
+
+    def test_the_newest_day_may_be_open_without_breaking_the_streak(self):
+        # Friday is half-done at noon: rows for the windows that have closed,
+        # none yet for the rest. That is a day in progress, not a broken day.
+        friday = dt.date(2026, 10, 30)
+        rows = self.clean_week(skip=(friday,))
+        now = ny_ts(friday, 12, 0)
+        rows += [{"trading_date": friday.isoformat(), "window_label": w.label,
+                  "outcome": "NO_SETUP", "reason": "no sweep"}
+                 for w in time_windows_listing(friday)
+                 if w.end <= dt.datetime.combine(friday, dt.time(12, 0))]
+        results = certify_digest(rows, days=5, now=now, today=friday)
+        self.assertEqual(results[-1]["status"], CERTIFY_INCOMPLETE)
+        rendered = render_digest(results, days=5)
+        self.assertIn("today is still open", rendered)
+        self.assertIn("consecutive PASS streak: 4", rendered)
+
+    def test_a_fail_line_names_its_criteria(self):
+        rows = self.clean_week()
+        rows[0] = dict(rows[0], reason="dry_run_gap_runner_down")
+        results = certify_digest(rows, days=1, now=self.after_friday(),
+                                 today=dt.date(2026, 10, 26))
+        rendered = render_digest(results, days=1)
+        self.assertIn("FAIL", rendered)
+        self.assertIn("gaps", rendered)
+
+    def test_the_digest_is_readable_through_the_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp)
+            rows = self.clean_week()
+            cols = ["trading_date", "window_label", "outcome", "reason"]
+            with (out / "window_evaluations.csv").open("w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=cols)
+                w.writeheader()
+                for r in rows:
+                    w.writerow(r)
+            with contextlib.redirect_stdout(io.StringIO()) as buf:
+                rc = main(["--digest", "5", "--out-dir", str(out),
+                           "--now", "2026-10-31T01:00"])
+            self.assertEqual(rc, 0)
+            text = buf.getvalue()
+            self.assertEqual(text.count("  PASS"), 5)
+            self.assertIn("consecutive PASS streak: 5", text)
+
+    def test_a_nonpositive_digest_is_a_usage_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc = main(["--digest", "0", "--out-dir", tmp])
+        self.assertEqual(rc, 2)
 
 
 class TestKnownBadFile(unittest.TestCase):

@@ -487,6 +487,19 @@ the restart. **367 tests pass.**
   restart, so it always carries gap rows. The first certifiable day is 29 Oct;
   the clock still starts at the restart (§15.16, now qualified in §15.17).
 
+**Session 18:** a report that `--certify` had called six future windows missing
+traced to a **stale checkout**, not the logic — `02a2837` reproduces the reported
+output byte for byte; `ab7d8f5` returns INCOMPLETE on the same fixture. **404
+tests pass.**
+- Every verdict now states its rule (`logic: certify v2 (not-due aware)`), so an
+  old binary can no longer masquerade as a verdict. **This is the fix.**
+- Regression tests lock the mid-afternoon shape: six future windows ⇒ INCOMPLETE,
+  never FAIL, never named in a coverage failure; a real stall still fails.
+- `--digest N`: one line per trading day + consecutive-PASS streak.
+- `--certify` FAIL prints last runner activity (heartbeat vs newest event, NY).
+- Startup banner reworded: it is a **capability notice** ("handlers armed for this
+  run"), not a shutdown record; `CLEAN STOP` remains the only stop record.
+
 ---
 
 ## 11. Phase 1 Pre-Flight — Questions and how each was resolved (Q1–Q12)
@@ -1664,4 +1677,82 @@ That is a scheduling fact, not a change to the decision: the restart is still th
 moment the clock starts, and the first eligible day is the first full day after it.
 Five consecutive clean days therefore means 29-30 Oct and 2-4 Nov at the earliest,
 subject to `--certify` saying PASS for each.
+
+### 15.18 The 29 Oct "six missing windows" report: a stale checkout, not a defect
+
+Report at **17:25:41 NY on 2026-10-29**: `FAIL`, coverage missing `23:45-00:15,
+18:45-19:15, 19:45-20:15, 20:45-21:15, 21:45-22:15, 22:45-23:15`. None of those
+windows had opened.
+
+**Those six are exactly the scheduled windows still in the future at 17:25**, and
+the ordering is the tell: the list starts at `23:45-00:15`, which is
+`windows_for_day` order, not chronological order. The v2 logic sorts pending
+windows by close time and sorts `23:45` last.
+
+Reproduced both ways on the same fixture, same clock:
+
+| code | output |
+|---|---|
+| `ab7d8f5` (current) | `INCOMPLETE - too early to certify, this is not a failure`, `wait: 6 window(s) have not closed yet (next: 18:45-19:15…)`, exit **3** |
+| `02a2837` (previous) | `FAIL`, `[FAIL] coverage missing windows: 23:45-00:15, 18:45-19:15, …`, exit **1** |
+
+The second is **character-for-character** the reported output. The live run
+executed code from before the not-due fix — the commit the runner was restarted
+onto. **The v2 logic is not partial: it handles any number of future windows**,
+consecutive or not, because the test is per window (`close + 90 s > now`) rather
+than a single boundary. Sixteen future windows would classify identically.
+
+No production logic was changed to "fix" this, because there was nothing wrong
+with it. What was genuinely missing is **provenance**: a wrong verdict and an old
+binary looked identical, and the person reading the output had no way to tell.
+That is now closed:
+
+* every verdict ends with **`logic: certify v2 (not-due aware)`**. A report
+  without that line, or with `v1`, is not evidence about today.
+* `--digest` lines carry the same marker.
+
+**Handler check:** `--certify` today should print `INCOMPLETE / exit 3` while the
+day is open, and the `logic:` line. If it prints `FAIL` plus a `missing windows`
+list **and no `logic:` line**, the checkout is stale — pull the branch, do not
+investigate the log.
+
+#### Added this session
+
+1. **Regression tests for the exact shape** (they pass on v2, and would fail on
+   v1): 15 rows at 17:25 NY with six future windows ⇒ `INCOMPLETE`, no coverage
+   failure, no future label in any `[FAIL]` line, every future window classified
+   `not_due`, none `missing`. End-to-end through the CLI at exit 3. Plus the
+   inverse: a real stall on a closed window still `FAIL`s, and the future windows
+   are still not named in that failure.
+2. **`--digest N`** — one line per trading day for the last N *trading* days
+   (weekends take no line), newest last, plus the consecutive-PASS streak and
+   what is left to reach five. This is the one-paste view of where the run
+   stands.
+3. **`--certify` on FAIL now prints the last runner activity** — the later of the
+   state-file heartbeat and the newest `runner_events.csv` row, in NY time. A
+   FAIL prompts "was it even running?"; the answer is already on disk.
+4. `--certify`/`--digest` no longer refuse a directory that has only
+   `window_evaluations.csv`; they fall back to it exactly as `certify()` does.
+
+#### The startup banner, clarified (the second open item)
+
+Confirmed: **the second line is a static capability banner, not an event.**
+`run()` prints it once, immediately after installing signal handlers, and lists
+what it managed to install on this platform. It says nothing about any shutdown.
+The event record is the separate `CLEAN STOP — …` line at the end of a run and
+the `stop` row in `runner_events.csv`.
+
+It previously read `clean stop: SIGBREAK, SIGINT, SIGTERM → graceful shutdown
+(state flushed, clean_stop=True)` — past tense, under a line saying the last
+shutdown was *unclean*. It now reads:
+
+```
+signal handlers armed for this run: SIGBREAK, SIGINT, SIGTERM - Ctrl+C / kill
+will stop cleanly (capability notice, not a shutdown record)
+```
+
+So the pair now reads as what it is: *the last stop was unclean* (an event), then
+*handlers are armed for this run* (a property). Two tests pin it: the banner is
+emitted once, contains "capability notice", and contains neither `clean_stop=True`
+nor `clean stop:`; and `CLEAN STOP` appears exactly once, at the stop.
 

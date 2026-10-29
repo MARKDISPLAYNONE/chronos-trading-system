@@ -29,6 +29,7 @@ rewritten. The reconciliation lives beside the log, not on top of it.
 Usage (on the machine that ran the dry run, from `bot/`):
 
     python live/audit_triage.py --certify 2026-10-28
+    python live/audit_triage.py --digest 5
     python live/audit_triage.py --self-check
     python live/audit_triage.py --outside-range --monitor live/output/dst_monitor.csv
     python live/audit_triage.py --show 2026-10-26 04:45-05:15
@@ -49,6 +50,16 @@ over" is not a defect and must not be reported as one:
                     has not closed, or a trade is still open awaiting its exit
                     (Q13). Re-run later; the day is final after its last window
                     closes at 00:15 NY the following morning.
+
+`--digest N` prints one verdict per trading day for the last N trading days,
+newest last, with the current consecutive-PASS streak underneath. It is the
+one-paste answer to "where does the run stand?" and the only view that shows the
+streak the phase is waiting on.
+
+Every verdict ends with the rule that produced it (`logic: certify v2`). That is
+not decoration: a report from a checkout predating the not-due logic once named
+six future windows as missing, and nothing in the output said which code had
+spoken. A verdict now carries its own provenance.
 """
 
 from __future__ import annotations
@@ -550,6 +561,20 @@ ABSENT_MISSING = "missing"                    # nothing explains it: a real defe
 #: than any publication lag, and it only ever delays a verdict, never hides one.
 ROW_GRACE_SECONDS = 90.0
 
+#: Revision of the certification *rule*, printed with every verdict.
+#:
+#: Not decoration: on 2026-10-29 an unsupervised report said "coverage missing
+#: windows: 23:45-00:15, 18:45-19:15, ..." for windows that had not opened yet.
+#: That output came from a checkout predating the not-due logic - the tool cannot
+#: be blamed for code it was not running, and there was no way to tell from the
+#: output. A verdict now carries the rule that produced it, so "this is wrong"
+#: and "this is an old binary" stop looking the same.
+#:
+#: v1  every scheduled window compared against the whole day, no clock
+#: v2  a window not yet closed is never "missing"; unfinished days are INCOMPLETE
+CERTIFY_LOGIC = "v2"
+CERTIFY_LOGIC_DESC = "v2 (not-due aware)"
+
 
 def _window_bounds(window):
     """UTC start/close for a window, via the DST-tested helper.
@@ -580,6 +605,56 @@ def load_certify_state(path: pathlib.Path) -> tuple[set[str], set[str]]:
     except Exception:
         return set(), set()
     return set((raw.get("pending") or {}).keys()), set((raw.get("deferred") or {}).keys())
+
+
+def last_runner_activity(base: pathlib.Path) -> dict:
+    """When the runner was last demonstrably alive, from the logs it left behind.
+
+    A FAIL invites the question "was the runner even running?", and the answer is
+    already on disk twice over: `runner_events.csv` records starts, stops and
+    gaps, and `runner_state.json` carries a heartbeat rewritten on every poll.
+    The heartbeat is far more precise; the event log survives a deleted state
+    file. Report both and let the later one win.
+
+    Deliberately reads the *state file on disk* rather than trusting that a
+    running process exists: a stale heartbeat is exactly the evidence wanted.
+    """
+    import json
+
+    found: dict[str, dt.datetime | None] = {"event": None, "heartbeat": None}
+    for row in read_rows(base / "runner_events.csv"):
+        stamp = (row.get("event_utc") or "").strip()
+        if not stamp:
+            continue
+        try:
+            parsed = dt.datetime.fromisoformat(stamp)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:                # defensive: treat as UTC
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        if found["event"] is None or parsed > found["event"]:
+            found["event"] = parsed
+
+    state = base / "runner_state.json"
+    if state.exists():
+        try:
+            raw = json.loads(state.read_text(encoding="utf-8"))
+        except Exception:
+            raw = {}
+        beat = raw.get("last_heartbeat_utc")
+        if isinstance(beat, (int, float)):
+            found["heartbeat"] = dt.datetime.fromtimestamp(beat, dt.timezone.utc)
+        else:
+            saved = (raw.get("saved_utc") or "").strip()
+            if saved:
+                try:
+                    found["heartbeat"] = dt.datetime.fromisoformat(saved)
+                except ValueError:
+                    pass
+
+    stamps = [v for v in found.values() if v is not None]
+    found["latest"] = max(stamps) if stamps else None
+    return found
 
 
 def classify_absent(day: dt.date, present: set[str], *, now: float,
@@ -774,7 +849,16 @@ def _last_close(day: dt.date):
     return max(w.end for w in time_windows.windows_for_day(day))
 
 
-def render_certification(result: dict) -> str:
+def _fmt_ny(stamp: dt.datetime) -> str:
+    """A UTC instant as New York wall clock - the reader's only useful frame."""
+    from zoneinfo import ZoneInfo
+
+    from src import config
+
+    return f"{stamp.astimezone(ZoneInfo(config.NY_TZ)):%Y-%m-%d %H:%M} NY"
+
+
+def render_certification(result: dict, *, activity: dict | None = None) -> str:
     day = result["date"]
     if result["status"] == CERTIFY_NOT_APPLICABLE:
         return f"{day}: NOT APPLICABLE - {result['detail']}"
@@ -827,6 +911,125 @@ def render_certification(result: dict) -> str:
             lines.append(f"  -> the day is final after {last_close:%Y-%m-%d %H:%M} NY")
     else:
         lines.append("  -> this day does NOT count; the consecutive run restarts here")
+        # A FAIL is almost always a question about the runner as much as the day,
+        # so answer the obvious follow-up before it is asked.
+        if activity is not None:
+            beat, event, latest = (activity.get("heartbeat"),
+                                   activity.get("event"), activity.get("latest"))
+            if latest is None:
+                lines.append("  last runner activity: none on record "
+                             "(no event log, no state heartbeat)")
+            else:
+                detail = []
+                if beat is not None:
+                    detail.append(f"state heartbeat {_fmt_ny(beat)}")
+                if event is not None:
+                    detail.append(f"last event {_fmt_ny(event)}")
+                lines.append(f"  last runner activity: {'; '.join(detail)}")
+    lines.append(f"  logic           : certify {CERTIFY_LOGIC_DESC}")
+    return "\n".join(lines)
+
+
+def certify_digest(rows: list[dict], *, days: int, now: float,
+                   pending: set[str] | None = None,
+                   deferred: set[str] | None = None,
+                   today: dt.date | None = None) -> list[dict]:
+    """One verdict per trading day for the last `days` trading days.
+
+    `days` counts *trading* days, not calendar days, so `--digest 5` is always a
+    week's worth of decisions rather than a week minus a weekend. Weekends are
+    skipped rather than shown as NOT_APPLICABLE: a view whose rows are mostly
+    "nothing to certify" is a view nobody reads.
+
+    Every day is judged at `now`, which is the honest reading of a past day (it
+    is final) and for today is the reason INCOMPLETE exists.
+    """
+    from src import time_windows
+
+    now_dt = dt.datetime.fromtimestamp(now, dt.timezone.utc).astimezone(
+        _ny_zone()).replace(tzinfo=None)
+    cursor = today or now_dt.date()
+    out: list[dict] = []
+    looked = 0
+    while len(out) < days and looked < days * 3 + 14:
+        if time_windows.is_trading_day(cursor):
+            out.append(certify(cursor, rows, now=now, pending=pending,
+                               deferred=deferred))
+        cursor -= dt.timedelta(days=1)
+        looked += 1
+    out.reverse()
+    return out
+
+
+def _ny_zone():
+    from zoneinfo import ZoneInfo
+
+    from src import config
+
+    return ZoneInfo(config.NY_TZ)
+
+
+def _digest_note(result: dict) -> str:
+    """The one-line reason behind a verdict, sized for a table."""
+    c = result["counts"]
+    pending = result["pending"]
+    not_due = [p for p in pending if p["kind"] == ABSENT_NOT_DUE]
+    trades = [p for p in pending if p["kind"] == ABSENT_AWAITING_TRADE]
+    data = [p for p in pending if p["kind"] == ABSENT_AWAITING_DATA]
+    if result["status"] == CERTIFY_FAIL:
+        # Criterion names only: the labels live in the full --certify report.
+        names = []
+        for name, _detail in result["failures"]:
+            if name not in names:
+                names.append(name)
+        return ", ".join(names)
+    if result["status"] == CERTIFY_INCOMPLETE:
+        bits = []
+        if not_due:
+            bits.append(f"{len(not_due)} not closed")
+        if trades:
+            bits.append(f"{len(trades)} trading")
+        if data:
+            bits.append(f"{len(data)} awaiting bars")
+        return "; ".join(bits) or "not finished"
+    return (f"{c['rows']}/{c['scheduled']} rows; "
+            f"{c['win']}W/{c['loss']}L/{c['no_setup']}NS")
+
+
+def render_digest(results: list[dict], *, days: int) -> str:
+    """The streak view: what five consecutive clean days actually looks like."""
+    lines = [f"last {len(results)} trading day(s), newest last "
+             f"(certify {CERTIFY_LOGIC_DESC})", ""]
+    for r in results:
+        note = _digest_note(r)
+        lines.append(f"  {r['date']}  {r['status']:<14} {note}")
+    if not results:
+        return "\n".join(lines)
+    # The streak is what closes Phase 2, so count it explicitly. Today can be
+    # INCOMPLETE without breaking a run that is still in progress, so an
+    # unfinished newest day is not counted against the streak.
+    tail = list(results)
+    if tail[-1]["status"] == CERTIFY_INCOMPLETE:
+        lines.append("")
+        lines.append(f"  today is still open ({tail[-1]['date']}); "
+                     f"streak below counts completed days only")
+        tail = tail[:-1]
+    streak = 0
+    for r in reversed(tail):
+        if r["status"] == CERTIFY_PASS:
+            streak += 1
+        else:
+            break
+    last_pass = next((r["date"] for r in reversed(results)
+                      if r["status"] == CERTIFY_PASS), None)
+    lines.append("")
+    lines.append(f"  consecutive PASS streak: {streak}"
+                 + (f" (last PASS {last_pass})" if last_pass else ""))
+    if streak >= 5:
+        lines.append("  -> five consecutive clean days reached: Phase 2 exit "
+                     "criteria met, pending Handler sign-off")
+    else:
+        lines.append(f"  -> {5 - streak} more clean day(s) needed")
     return "\n".join(lines)
 
 
@@ -934,6 +1137,8 @@ def main(argv: list[str] | None = None,
                          "(YYYY-MM-DD). Prints PASS / FAIL / INCOMPLETE with the "
                          "failing condition(s). INCOMPLETE means the day is not "
                          "over yet, and is not a defect.")
+    ap.add_argument("--digest", type=int, default=None, metavar="N",
+                    help="one verdict per trading day for the last N trading days")
     ap.add_argument("--now", default=None, metavar="ISO",
                     help="treat this as the current NY wall clock (naive = New "
                          "York, or include an offset). Default: the real clock. "
@@ -950,7 +1155,10 @@ def main(argv: list[str] | None = None,
     base = pathlib.Path(args.out_dir)
     audit = read_rows(base / "window_evaluations_audit.csv")
     flat = read_rows(base / "window_evaluations.csv")
-    if not audit and not args.certify:
+    # `--certify` and `--digest` both fall back to the schema-mirror file, so
+    # requiring the audit CSV here made the read-only tools fail on a directory
+    # they could in fact read.
+    if not audit and not flat and not (args.certify or args.digest is not None):
         print(f"no audit rows at {base / 'window_evaluations_audit.csv'}", file=sys.stderr)
         return 2
 
@@ -1022,7 +1230,11 @@ def main(argv: list[str] | None = None,
         # "missing"; without it every unresolved trade would look like a defect.
         pending, deferred = load_certify_state(base / "runner_state.json")
         result = certify(day, source, now=now, pending=pending, deferred=deferred)
-        print(render_certification(result))
+        print(render_certification(
+            result,
+            activity=last_runner_activity(base) if result["status"] == CERTIFY_FAIL
+            else None,
+        ))
         if not result["applicable"]:
             return 2
         if not flat:
@@ -1032,6 +1244,27 @@ def main(argv: list[str] | None = None,
             rc = 1
         elif result["status"] == CERTIFY_INCOMPLETE:
             rc = 3
+
+    if args.digest is not None:
+        if args.digest < 1:
+            print("--digest needs a positive number of trading days",
+                  file=sys.stderr)
+            return 2
+        now = _parse_now(args.now)
+        if now is None:
+            return 2
+        source = flat or audit
+        if not (base / "window_evaluations.csv").exists() and \
+                not (base / "window_evaluations_audit.csv").exists():
+            print(f"no dry-run log at {base} - nothing to summarise",
+                  file=sys.stderr)
+            return 2
+        pending, deferred = load_certify_state(base / "runner_state.json")
+        print(render_digest(
+            certify_digest(source, days=args.digest, now=now,
+                           pending=pending, deferred=deferred),
+            days=args.digest,
+        ))
 
     if args.illegal_reasons:
         # The audit CSV carries the same reason column, so fall back to it: a

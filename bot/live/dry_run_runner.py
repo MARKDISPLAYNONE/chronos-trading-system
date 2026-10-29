@@ -607,8 +607,21 @@ class DryRunRunner:
         started = self._now_fn()
         installed = self.install_signal_handlers() if install_signals else {}
         if installed:
-            self._log(f"clean stop: {', '.join(sorted(installed.values()))} "
-                      f"→ graceful shutdown (state flushed, clean_stop=True)")
+            # A capability notice, not a record of anything that happened. The
+            # old wording - "clean stop: SIGINT, SIGTERM -> graceful shutdown
+            # (state flushed, clean_stop=True)" - sat two lines under "previous
+            # shutdown was unclean" and read as a contradiction: it announced a
+            # clean stop seconds after reporting that the last one was not. It
+            # described handlers being armed, which is a property of this
+            # process, and the past tense made it look like history.
+            #
+            # The actual record of a stop is the CLEAN STOP line at the end of a
+            # run, and the `stop` event in runner_events.csv. Neither is
+            # produced here.
+            self._log(
+                f"signal handlers armed for this run: "
+                f"{', '.join(sorted(installed.values()))} - Ctrl+C / kill will "
+                f"stop cleanly (capability notice, not a shutdown record)")
         try:
             while not self._stop_requested:
                 try:

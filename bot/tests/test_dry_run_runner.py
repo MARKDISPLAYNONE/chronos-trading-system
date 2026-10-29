@@ -1076,6 +1076,40 @@ class TestUncleanRestart(RunnerHarness):
         kinds = [r["kind"] for r in self.read("runner_events.csv")]
         self.assertIn("unclean_shutdown_detected", kinds)
 
+    def test_the_signal_banner_does_not_read_as_a_shutdown_record(self):
+        """The startup banner describes a capability, and must say so.
+
+        It used to print "clean stop: SIGINT, SIGTERM -> graceful shutdown
+        (state flushed, clean_stop=True)" two lines under "previous shutdown was
+        unclean", which read as a contradiction: a clean stop announced seconds
+        after being told the last one was not. Nothing had stopped. The line
+        reports handlers being armed for *this* run.
+        """
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        runner = DryRunRunner(FakeMT5(rows), self.out,
+                              source=FakeSource(rows, lambda: self.clock),
+                              now_fn=lambda: self.clock, log=self.logs.append)
+        runner.start(connect_terminal=False)
+        runner.run(max_seconds=0, install_signals=True)      # emit the real banner
+
+        banner = [ln for ln in self.logs if "signal handlers armed" in ln]
+        self.assertEqual(len(banner), 1, self.logs)
+        self.assertIn("capability notice", banner[0])
+        # The phrase that made it read as an event must be gone from the banner.
+        self.assertNotIn("clean_stop=True", banner[0])
+        self.assertNotIn("clean stop:", banner[0])
+
+    def test_the_real_stop_record_is_a_separate_line(self):
+        """The event record exists exactly once, at the end of a run."""
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        runner = DryRunRunner(FakeMT5(rows), self.out,
+                              source=FakeSource(rows, lambda: self.clock),
+                              now_fn=lambda: self.clock, log=self.logs.append)
+        runner.start(connect_terminal=False)
+        runner.stop()
+        stops = [ln for ln in self.logs if "CLEAN STOP" in ln]
+        self.assertEqual(len(stops), 1, self.logs[-6:])
+
     def test_a_clean_stop_is_not_reported_as_unclean(self):
         rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
         runner = DryRunRunner(FakeMT5(rows), self.out,
