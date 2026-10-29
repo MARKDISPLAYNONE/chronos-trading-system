@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import errno
 import io
 import json
 import os
@@ -179,8 +180,104 @@ def _fsync(fh) -> None:
     os.fsync(fh.fileno())
 
 
-def save_state(path: pathlib.Path, state: dict) -> None:
-    """Atomic save: a crash mid-write cannot leave a half-written offset.
+#: Windows errors that mean "someone else has this file open right now".
+#:
+#: 5   ACCESS_DENIED       - a rename over a file another process holds open
+#: 32  SHARING_VIOLATION   - the destination was opened without FILE_SHARE_DELETE
+#: 33  LOCK_VIOLATION      - a byte-range lock is held across the rename
+#: 117 ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 - the replacement file is busy
+#:
+#: These are *transient*: they mean "not this millisecond", not "not ever". A
+#: sync client (OneDrive, Dropbox), an antivirus scanner or the search indexer
+#: opens a file it has just noticed and closes it milliseconds later, and the
+#: rename that lands inside that window fails.
+TRANSIENT_LOCK_WINERRORS = frozenset({5, 32, 33, 117})
+
+#: The POSIX equivalents, so the same code path and tests work on Linux where
+#: these numbers do not exist.
+TRANSIENT_LOCK_ERRNOS = frozenset(
+    value for value in (
+        getattr(errno, "EACCES", None),
+        getattr(errno, "EPERM", None),
+        getattr(errno, "EBUSY", None),
+        getattr(errno, "EDEADLK", None),
+    ) if value is not None
+)
+
+#: Bounded retries. Short, because the condition lasts milliseconds and a mirror
+#: that stops for seconds is a mirror that falls behind. Five attempts spanning
+#: ~1.5 s: long enough to outlast a scanner, short enough not to stall the run.
+REPLACE_ATTEMPTS = 5
+REPLACE_BACKOFF_SECONDS = (0.05, 0.1, 0.2, 0.4)
+
+
+def _short_reason(exc: BaseException) -> str:
+    """One clause a person can act on, without a traceback."""
+    winerror = getattr(exc, "winerror", None)
+    if winerror in (5, 32, 33, 117):
+        return f"file locked by another process (WinError {winerror})"
+    if isinstance(exc, PermissionError):
+        return "permission denied"
+    text = str(exc) or type(exc).__name__
+    return text if len(text) <= 80 else text[:77] + "..."
+
+
+def sync_client_hint(path: pathlib.Path) -> str | None:
+    """Name the folder-sync client that is probably locking files here, if any.
+
+    A file-sync client watches a folder and opens new and changed files the
+    moment they appear — which is exactly when this module renames its state
+    file. On Windows that produces a transient `Access is denied` on the rename.
+    The Handler's project lives under `Desktop\projects\...`, and on a Windows
+    machine with OneDrive, Desktop is very often inside `OneDrive\`.
+
+    Detected by environment variable first (the client's own root, reliable) and
+    by path if the variables are absent (a path copied from a synced folder).
+    """
+    roots = []
+    for name in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial",
+                 "Dropbox", "MEGASYNC"):
+        value = os.environ.get(name)
+        if value:
+            roots.append((name.split("OneDrive")[0] or name, value))
+    resolved = str(path.resolve()).lower()
+    for label, root in roots:
+        if root and root.lower() in resolved:
+            return f"{label} (${label}, {root})"
+    for label in ("onedrive", "dropbox", "google drive", "icloud"):
+        if label in resolved:
+            return f"{label.title()} (path)"
+    if os.environ.get("OneDrive") or os.environ.get("OneDriveConsumer"):
+        return None            # configured, but this folder is outside it
+    return None
+
+
+def _is_transient_lock_error(exc: BaseException) -> bool:
+    """Is this a "file is briefly busy" error rather than a real fault?
+
+    Read from `winerror` on Windows and `errno` elsewhere, so the same predicate
+    can be exercised by tests on any platform.
+    """
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None and winerror in TRANSIENT_LOCK_WINERRORS:
+        return True
+    return getattr(exc, "errno", None) in TRANSIENT_LOCK_ERRNOS
+
+
+def _write_state_file(path: pathlib.Path, payload: str) -> None:
+    """Write `payload` to `path` atomically: temp file, fsync, then rename."""
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.write(payload)
+        _fsync(fh)
+    # After the close: Windows cannot replace a file that still has an open
+    # handle, and `replace` is what makes the write atomic.
+    tmp.replace(path)
+
+
+def save_state(path: pathlib.Path, state: dict, *,
+               sleep=time.sleep, attempts: int = REPLACE_ATTEMPTS) -> None:
+    """Atomic save, with bounded retries for a transiently locked destination.
 
     The fsync happens on the **write** handle, before it is closed. Writing the
     file, reopening it read-only and fsyncing that handle looks equivalent and is
@@ -188,15 +285,34 @@ def save_state(path: pathlib.Path, state: dict) -> None:
     `os.fsync` there is `_commit()`, which fails with `EBADF` (Errno 9) unless
     the handle was opened for writing. Doing it the read-only way passed every
     test on Linux and crashed on the first real run on the Handler's machine.
+
+    The rename then failed on the same machine with `Access is denied`
+    (WinError 5): the destination was held open at that instant by something
+    else on the machine — not by this process, which holds no handle on either
+    file at this point. See `TRANSIENT_LOCK_WINERRORS`. Those are retried; every
+    other error is raised immediately, because retrying a real fault (a
+    permission that will never be granted, a full disk) only hides it.
+
+    Raises the last error when the retries are exhausted. Callers that must keep
+    running use `Mirror._save`, which turns that into a reported deferral.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        fh.write(json.dumps(state, indent=2, sort_keys=True))
-        _fsync(fh)
-    # After the close: Windows cannot replace a file that still has an open
-    # handle, and `replace` is what makes the write atomic.
-    tmp.replace(path)
+    payload = json.dumps(state, indent=2, sort_keys=True)
+
+    last: OSError | None = None
+    for delay in [*REPLACE_BACKOFF_SECONDS, None][:attempts]:
+        try:
+            _write_state_file(path, payload)
+            return
+        except OSError as exc:
+            if not _is_transient_lock_error(exc):
+                raise
+            last = exc
+            if delay is None:
+                break
+            sleep(delay)
+    assert last is not None
+    raise last
 
 
 def _split_complete_records(blob: bytes) -> tuple[list[tuple[list[str], bytes, int]], int]:
@@ -260,14 +376,42 @@ class Mirror:
     def __init__(self, out_dir: pathlib.Path | str = DEFAULT_OUT_DIR,
                  logs_dir: pathlib.Path | str = DEFAULT_LOGS_DIR,
                  state_path: pathlib.Path | str | None = None,
-                 *, now_fn=None) -> None:
+                 *, now_fn=None, save_sleep=None) -> None:
         self.out_dir = pathlib.Path(out_dir)
         self.logs_dir = pathlib.Path(logs_dir)
         self.state_path = (pathlib.Path(state_path) if state_path
                            else self.logs_dir / ".mirror_state.json")
         self.now_fn = now_fn or time.time
+        #: Injected so tests exercise the retry path without waiting for it.
+        self.save_sleep = save_sleep or time.sleep
         self.state = load_state(self.state_path)
+        #: Rows mirrored per source key in the last pass. A count, never a
+        #: sentinel: a negative number in a count column reads as corrupt data.
         self.stats: dict[str, int] = {}
+        #: Source key -> short reason, for sources that failed this pass.
+        self.errors: dict[str, str] = {}
+        #: Why the state file could not be saved in the last pass, if it could
+        #: not. Non-fatal by design: the offsets stay correct in memory.
+        self.state_error: str | None = None
+        #: Offsets are verified against the day files once, on the first pass.
+        self._bootstrapped = False
+
+    def _save(self) -> bool:
+        """Persist the state, or report why not. Never raises.
+
+        A locked or unwritable state file must not end the pass: the rows are
+        already on the disk, the offsets are still correct in memory, and the
+        process can keep mirroring. What is lost is the *durable* record of the
+        offset — which is exactly what `_resume_from_destination` rebuilds on the
+        next start, so the fallback already exists and is tested.
+        """
+        try:
+            save_state(self.state_path, self.state, sleep=self.save_sleep)
+        except OSError as exc:
+            self.state_error = _short_reason(exc)
+            return False
+        self.state_error = None
+        return True
 
     # -- writing -----------------------------------------------------------
     def _append(self, target: pathlib.Path, header: bytes, raw: bytes) -> None:
@@ -334,6 +478,39 @@ class Mirror:
             offset = end
         return offset, header
 
+    def _bootstrap_offsets(self) -> None:
+        """Check every saved offset against the day files before reading anything.
+
+        The saved offset is what was last *persisted*; the day files are what was
+        last *written*. When a save fails they disagree, and the state is the one
+        that is behind — it says "resume at byte 142" while the destination
+        already contains the row that followed. Trusting it re-copies that row.
+
+        That is not hypothetical. It is what this check was added for: a run
+        whose state save failed, restarted, and duplicated the row it had just
+        written. The failure needed no crash — only a locked state file.
+
+        Taking the later of the two is the safe direction in both cases: a stale
+        state is corrected, and a fresh one is left alone.
+        """
+        for source in SOURCES:
+            path = self.out_dir / source["file"]
+            if not path.exists():
+                continue
+            entry = self.state["sources"].setdefault(source["file"], {})
+            recorded = int(entry.get("offset") or 0)
+            recovered, header = self._resume_from_destination(source, path)
+            if header is not None and "header" not in entry:
+                entry["header"] = header
+            if recovered > recorded:
+                entry["offset"] = recovered
+                why = ("no state was ever saved" if not recorded
+                       else f"the saved state was {recovered - recorded} byte(s) "
+                            f"behind the day files")
+                print(f"{source['file']}: resuming at byte {recovered} "
+                      f"({why}; those rows are already mirrored)", flush=True)
+                self._save()
+
     def _mirror_source(self, source: dict, now: float) -> int:
         path = self.out_dir / source["file"]
         if not path.exists():
@@ -356,7 +533,7 @@ class Mirror:
                 # Persist the conclusion now. It was reached by reading the day
                 # files, which is expensive and, more to the point, is the only
                 # thing standing between a restart and a duplicate.
-                save_state(self.state_path, self.state)
+                self._save()
         offset = int(entry.get("offset") or 0)
 
         with path.open("rb") as fh:
@@ -380,7 +557,7 @@ class Mirror:
                     print(f"{source['file']}: {len(blob)} unparsed byte(s) at "
                           f"offset {offset} after {entry['waiting']} passes - "
                           f"still waiting for a complete record", file=sys.stderr)
-                save_state(self.state_path, self.state)
+                self._save()
             return 0
         entry["waiting"] = 0
 
@@ -397,7 +574,7 @@ class Mirror:
 
         if not entries:
             entry["offset"] = offset + records[-1][2]
-            save_state(self.state_path, self.state)
+            self._save()
             return 0
 
         columns = next(csv.reader(io.StringIO(header_text)), [])
@@ -406,7 +583,7 @@ class Mirror:
             # Advance anyway and say so once; refusing to advance would re-read
             # the same rows forever.
             entry["offset"] = offset + records[-1][2]
-            save_state(self.state_path, self.state)
+            self._save()
             return 0
         column = columns.index(source["date_field"])
         header_bytes = header_text.encode("utf-8")
@@ -423,7 +600,10 @@ class Mirror:
             # rather than after the batch is what keeps a crash from replaying it.
             entry["offset"] = offset + end_offset
             self.state["sources"][key] = entry
-            save_state(self.state_path, self.state)
+            # One save per row, not per batch: the row is already durable, so
+            # the offset may be too. If this cannot be saved, the next row tries
+            # again and the offset stays correct in memory meanwhile.
+            self._save()
         return written
 
     # -- one pass ----------------------------------------------------------
@@ -431,16 +611,43 @@ class Mirror:
         """Copy everything new from every source. Returns per-source row counts."""
         now = self.now_fn() if now is None else now
         self.stats = {}
+        self.errors = {}
+        self.state_error = None
+        if not self._bootstrapped:
+            self._bootstrapped = True
+            try:
+                self._bootstrap_offsets()
+            except OSError as exc:               # an unreadable day file
+                print(f"could not verify saved offsets: {_short_reason(exc)}",
+                      file=sys.stderr)
         for source in SOURCES:
             try:
                 self.stats[source["key"]] = self._mirror_source(source, now)
-            except Exception:
+            except Exception as exc:
                 # One bad source must not stop the other two, and must not stop
                 # the process: a mirror that dies quietly is worse than one that
                 # misses a pass and says so.
-                self.stats[source["key"]] = -1
+                #
+                # The count stays a count. It used to be `-1` here, which
+                # printed as "mirrored: DST -1" and read like corrupt data
+                # rather than a failure. Failures have their own channel.
+                self.stats[source["key"]] = 0
+                self.errors[source["key"]] = _short_reason(exc)
                 print(f"mirror failed for {source['file']}:", file=sys.stderr)
                 traceback.print_exc()
+        if self.state_error:
+            # Said once per pass, not once per row: a locked state file would
+            # otherwise produce a line per row and bury everything else.
+            print(f"state NOT saved: {self.state_error}", file=sys.stderr)
+            print("  offsets are still correct in memory and mirroring continues; "
+                  "the next start rebuilds them from the day files",
+                  file=sys.stderr)
+            hint = sync_client_hint(self.state_path.parent)
+            if hint and "locked" in (self.state_error or ""):
+                print(f"  likely cause: {hint} is syncing this folder. "
+                      f"Move the state file out of it with "
+                      f"--state <path outside the synced folder>.",
+                      file=sys.stderr)
         return self.stats
 
     def run(self, *, interval: float = DEFAULT_INTERVAL, once: bool = False,
@@ -450,9 +657,14 @@ class Mirror:
             while True:
                 stats = self.mirror_once()
                 passes += 1
-                if any(v > 0 for v in stats.values()):
+                moved = {k: v for k, v in stats.items() if v > 0}
+                if moved:
                     print("mirrored: " + ", ".join(
-                        f"{k} {v}" for k, v in stats.items()), flush=True)
+                        f"{k} {v}" for k, v in moved.items()), flush=True)
+                if self.errors:
+                    print("failed: " + ", ".join(
+                        f"{k} ({why})" for k, why in self.errors.items()),
+                        flush=True)
                 if once or (max_passes is not None and passes >= max_passes):
                     return 0
                 time.sleep(interval)

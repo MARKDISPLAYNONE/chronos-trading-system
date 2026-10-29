@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import errno as errno_mod
 import io
+import json
 import os
 import pathlib
 import sys
@@ -58,8 +60,10 @@ class MirrorCase(unittest.TestCase):
 
     def mirror(self, now: str | None = None) -> log_mirror.Mirror:
         """A fresh Mirror — i.e. what a restarted process would build."""
-        mirror = log_mirror.Mirror(self.out, self.logs)
-        return mirror
+        # No real backoff in tests: the retry path is exercised, the waiting is
+        # not. Production uses the real sleep.
+        return log_mirror.Mirror(self.out, self.logs,
+                                 save_sleep=lambda _seconds: None)
 
     def pass_once(self, now: float | None = None) -> dict:
         return self.mirror().mirror_once(now=now)
@@ -472,6 +476,224 @@ class TestPreExistingDestinations(MirrorCase):
 
         for day, rows in before.items():
             self.assertEqual(self.rows_for("DST", day), rows, day)
+
+
+class WindowsLock(PermissionError):
+    """`PermissionError` as Windows raises it, with `winerror` present."""
+
+    def __init__(self, winerror: int = 5) -> None:
+        super().__init__(13, "Access is denied")
+        self.winerror = winerror
+
+
+@contextlib.contextmanager
+def failing_rename(fail_times: int | None = None, winerror: int = 5):
+    """Make the atomic rename fail for the state file, `fail_times` times.
+
+    `None` means "every time". This is what a sync client or a virus scanner
+    holding the destination open looks like from inside the process.
+    """
+    real = pathlib.Path.replace
+    calls = {"n": 0}
+
+    def fake(self, target):
+        if "mirror_state" in str(self) or "mirror_state" in str(target):
+            calls["n"] += 1
+            if fail_times is None or calls["n"] <= fail_times:
+                raise WindowsLock(winerror)
+        return real(self, target)
+
+    pathlib.Path.replace = fake
+    try:
+        yield calls
+    finally:
+        pathlib.Path.replace = real
+
+
+class TestLockedStateFile(MirrorCase):
+    """The rename fails because something else holds the destination open."""
+
+    def test_a_transient_lock_is_retried_and_then_succeeds(self):
+        self.add_monitor_rows("2026-10-29 10:00:00-04:00")
+
+        with failing_rename(fail_times=2) as calls:
+            self.pass_once()
+
+        self.assertGreaterEqual(calls["n"], 3)          # two failures, one success
+        state = log_mirror.load_state(self.logs / ".mirror_state.json")
+        self.assertEqual(state["sources"]["dst_monitor.csv"]["offset"],
+                         (self.out / "dst_monitor.csv").stat().st_size)
+
+    def test_retries_are_bounded(self):
+        self.add_monitor_rows("2026-10-29 10:00:00-04:00")
+        with failing_rename(fail_times=None) as calls:
+            self.pass_once()
+        self.assertEqual(calls["n"], log_mirror.REPLACE_ATTEMPTS)
+
+    def test_a_locked_state_file_does_not_crash_or_stop_the_pass(self):
+        self.add_monitor_rows("2026-10-29 10:00:00-04:00",
+                              "2026-10-29 11:00:00-04:00")
+        mirror = self.mirror()
+        with failing_rename(fail_times=None):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                stats = mirror.mirror_once()
+
+        self.assertEqual(stats, {"DST": 2, "RUNNER": 0, "TRADES": 0})  # rows still copied
+        self.assertIsNotNone(mirror.state_error)
+        self.assertIn("state NOT saved", err.getvalue())
+        self.assertIn("WinError 5", err.getvalue())
+        self.assertEqual(len(self.rows_for("DST", "2026-10-29")), 3)   # header + 2
+
+    def test_the_old_state_survives_a_failed_save(self):
+        """Renaming atomically must not truncate the previous good state."""
+        self.add_monitor_rows("2026-10-29 10:00:00-04:00")
+        self.pass_once()                                # a good state exists
+        before = (self.logs / ".mirror_state.json").read_text(encoding="utf-8")
+
+        self.add_monitor_rows("2026-10-29 11:00:00-04:00")
+        with failing_rename(fail_times=None):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.pass_once()
+
+        after = (self.logs / ".mirror_state.json").read_text(encoding="utf-8")
+        self.assertEqual(after, before)                 # intact, not half-written
+        self.assertIn("dst_monitor.csv", json.loads(after)["sources"])
+
+    def test_a_real_error_is_not_retried(self):
+        """Retrying a fault that will never clear only hides it."""
+        calls = {"n": 0}
+        real = pathlib.Path.replace
+
+        def broken(self, target):
+            if "mirror_state" in str(target):
+                calls["n"] += 1
+                raise OSError(errno_mod.EIO, "Input/output error")
+            return real(self, target)
+
+        pathlib.Path.replace = broken
+        try:
+            with self.assertRaises(OSError):
+                log_mirror.save_state(self.logs / ".mirror_state.json",
+                                      {"sources": {}},
+                                      sleep=lambda _s: None)
+        finally:
+            pathlib.Path.replace = real
+        self.assertEqual(calls["n"], 1)
+
+    def test_several_failed_then_recovered_cycles_lose_and_repeat_nothing(self):
+        """The Handler's real sequence: save fails, then succeeds, then fails.
+
+        Each cycle is a fresh `Mirror`, i.e. a restart, so every one of them has
+        to work out where it is — from the state file when it can, from the day
+        files when it cannot.
+        """
+        stamps = [f"2026-10-29 {hour:02d}:00:00-04:00" for hour in range(10, 16)]
+        for index, stamp in enumerate(stamps):
+            self.add_monitor_rows(stamp)
+            locked = index % 2 == 0            # alternate failure and recovery
+            with failing_rename(fail_times=None if locked else 0):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.pass_once()
+
+        rows = self.rows_for("DST", "2026-10-29")[1:]
+        self.assertEqual([r[1] for r in rows], stamps)   # every row, in order, once
+        self.assertEqual(len(rows), len(set(r[1] for r in rows)))
+
+    def test_no_gaps_when_every_cycle_fails_to_save(self):
+        stamps = [f"2026-10-29 {hour:02d}:30:00-04:00" for hour in range(9, 15)]
+        for stamp in stamps:
+            self.add_monitor_rows(stamp)
+            with failing_rename(fail_times=None):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.pass_once()
+
+        rows = [r[1] for r in self.rows_for("DST", "2026-10-29")[1:]]
+        self.assertEqual(rows, stamps)
+
+    def test_the_state_file_is_never_left_half_written(self):
+        self.add_monitor_rows("2026-10-29 10:00:00-04:00")
+        with failing_rename(fail_times=None):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.pass_once()
+
+        state_path = self.logs / ".mirror_state.json"
+        if state_path.exists():                         # absent is fine
+            json.loads(state_path.read_text(encoding="utf-8"))
+
+
+class TestFailureReporting(MirrorCase):
+    """A failed source is reported, never counted as -1."""
+
+    def test_a_failed_source_does_not_look_like_data(self):
+        self.add_monitor_rows("2026-10-29 10:00:00-04:00")
+        real = log_mirror.Mirror._mirror_source
+
+        def boom(self, source, now):
+            if source["key"] == "DST":
+                raise PermissionError(13, "Permission denied")
+            return real(self, source, now)
+
+        log_mirror.Mirror._mirror_source = boom
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                stats = self.pass_once()
+        finally:
+            log_mirror.Mirror._mirror_source = real
+
+        self.assertEqual(stats["DST"], 0)               # a count, not a sentinel
+        self.assertNotIn(-1, stats.values())
+        self.assertEqual(stats["RUNNER"], 0)
+
+    def test_the_run_prints_failures_as_failures(self):
+        self.add_monitor_rows("2026-10-29 10:00:00-04:00")
+        real = log_mirror.Mirror._mirror_source
+
+        def boom(self, source, now):
+            if source["key"] == "DST":
+                raise PermissionError(13, "Permission denied")
+            return real(self, source, now)
+
+        log_mirror.Mirror._mirror_source = boom
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.mirror().run(interval=0, max_passes=1)
+        finally:
+            log_mirror.Mirror._mirror_source = real
+
+        text = out.getvalue()
+        self.assertIn("failed: DST (permission denied)", text)
+        self.assertNotIn("-1", text)
+
+    def test_a_successful_pass_says_nothing_about_failures(self):
+        self.add_monitor_rows("2026-10-29 10:00:00-04:00")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.mirror().run(interval=0, max_passes=1)
+        self.assertEqual(out.getvalue().strip(), "mirrored: DST 1")
+
+
+class TestSyncClientHint(unittest.TestCase):
+    def test_a_onedrive_environment_variable_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "OneDrive - Contoso"
+            (root / "Desktop" / "projects").mkdir(parents=True)
+            old = os.environ.get("OneDriveCommercial")
+            os.environ["OneDriveCommercial"] = str(root)
+            try:
+                hint = log_mirror.sync_client_hint(root / "Desktop" / "projects")
+            finally:
+                if old is None:
+                    os.environ.pop("OneDriveCommercial", None)
+                else:
+                    os.environ["OneDriveCommercial"] = old
+        self.assertIsNotNone(hint)
+        self.assertIn("OneDrive", hint)
+
+    def test_a_plain_folder_reports_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+                os.environ.pop(name, None)
+            self.assertIsNone(log_mirror.sync_client_hint(pathlib.Path(tmp)))
 
 
 class TestHelpers(unittest.TestCase):

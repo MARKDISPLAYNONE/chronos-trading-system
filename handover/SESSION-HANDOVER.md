@@ -528,6 +528,20 @@ pass.**
   never committed on any branch. They are crash artifacts (verified by replaying
   the shipped code), not seed data.
 
+**Session 21:** the state-file rename failed on Windows (`WinError 5`), and the
+fallback it forced was **duplicating rows**. **460 tests pass.**
+- Rename failure is external and transient (OneDrive/AV holding the destination);
+  proved it is *not* our stale handle by inspecting open descriptors at
+  `replace()` time.
+- `save_state` retries WinError 5/32/33/117 (and POSIX equivalents) five times
+  over ~1.5 s, then abandons the save rather than crashing; other errors are not
+  retried.
+- **Serious:** a stale state file was trusted, so a restart re-read rows already
+  mirrored. `_bootstrap_offsets()` now takes the later of the saved offset and
+  what the day files imply. Found by the multi-cycle test, not by reading.
+- `-1` sentinel removed: counts are counts, failures print on their own line.
+- `sync_client_hint()` names the suspected sync client and points at `--state`.
+
 ---
 
 ## 11. Phase 1 Pre-Flight — Questions and how each was resolved (Q1–Q12)
@@ -1940,4 +1954,89 @@ day each attempt reached first.
 
 The second is tidier, because the files left by the crash contain duplicated
 rows and the rebuild does not.
+
+### 15.21 A locked state file on Windows, and the duplicate it exposed
+
+Two things surfaced on the second live run. The reported one was a rename
+failure; the dangerous one was what it silently caused.
+
+#### The rename failure
+
+    PermissionError: [WinError 5] Access is denied:
+      '.mirror_state.tmp' -> '.mirror_state.json'
+      tmp.replace(path)  <- save_state()
+
+**Not our own stale handle.** Checked directly: at the moment `replace()` runs,
+no descriptor in the process refers to either file — the `with` block that writes
+the temp file has closed, and `load_state` closed the destination long before.
+Verified by listing `/proc/self/fd` from inside `Path.replace`.
+
+**Cause: external, transient.** A Windows rename-over-existing-file
+(`MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`) fails with `ACCESS_DENIED` or
+`SHARING_VIOLATION` while another process holds the destination open. On a
+OneDrive-synced folder that is routine: the client opens a file within
+milliseconds of noticing it changed, and the rename lands inside that window.
+Antivirus and the search indexer do the same.
+
+The Handler's project sits under `Desktop\projects\...`, and on a Windows
+machine with OneDrive, `Desktop` is very often redirected into `OneDrive\` — which
+is exactly `sync_client_hint()`'s check. The tool cannot prove it from this
+side, so it now **names the client when it can**: if a save is deferred and the
+folder looks synced (`$OneDrive`, `$OneDriveCommercial`, `$OneDriveConsumer`, or
+a path containing OneDrive/Dropbox/Google Drive/iCloud) the failure message says
+so and suggests `--state <path outside the synced folder>`. **That flag already
+exists and is the recommended fix if this recurs**: the state file is
+machine-local and gitignored; it does not need to live in a synced, committed
+folder.
+
+**Fix.** `save_state` retries only the errors that mean "busy right now" —
+WinError 5, 32, 33, 117 on Windows, `EACCES`/`EPERM`/`EBUSY`/`EDEADLK`
+elsewhere — five attempts over ~1.5 s. Every other error is raised on the first
+attempt, because retrying a permission that will never be granted or a full disk
+only hides it. When the retries are exhausted the save is abandoned, not crashed:
+`Mirror._save` records the reason, printing it **once per pass** rather than once
+per row, and mirroring continues with correct offsets in memory.
+
+#### The duplicate it exposed (the serious one)
+
+`_resume_from_destination` only ran when there was **no** state file. A state file
+that existed but was *stale* — last saved before the lock arrived — was trusted
+blindly. Sequence, reproduced:
+
+    cycle 0  locked   no state, writes row 10, save fails
+    cycle 1  ok       reconcile from day files, writes row 11, saved
+    cycle 2  locked   loads state (ends at row 11), writes row 12, save FAILS
+    cycle 3  ok       loads the stale state, re-reads from row 12 -> DUPLICATE
+
+Found by the multi-cycle test that was written to check precisely this. It
+duplicated two rows across six cycles.
+
+**Fix.** `_bootstrap_offsets()` runs once per process start and takes the **later**
+of the saved offset and the one the day files imply. A state that is behind is
+corrected; a state that is current is left alone; a state that is *ahead* (day
+files rotated away) is left alone too, which is the non-duplicating direction.
+The saved offset is what was last persisted; the day files are what was last
+written. When a save fails they disagree, and the state is the one that is wrong.
+
+#### Output
+
+`-1` was a failure sentinel in a count column and printed as
+`mirrored: DST -1, RUNNER 39, TRADES 78` — indistinguishable from corrupt data.
+Counts are now counts, and failures have their own line:
+
+    mirrored: RUNNER 39, TRADES 78
+    failed: DST (file locked by another process (WinError 5))
+    state NOT saved: file locked by another process (WinError 5)
+      offsets are still correct in memory and mirroring continues; the next
+      start rebuilds them from the day files
+
+A source that fails reports 0 rows *and* a reason; nothing is ever negative.
+
+#### Verified end to end
+
+Cycles 1-4 with every rename blocked, then lock cleared, then lock back, then
+cleared again. Result: **six DST rows, six unique, in order, no gaps, no
+duplicates**; state durable once a rename succeeded; silent on a pass with
+nothing to do. The regression test fails on the pre-fix code (verified by
+disabling the bootstrap).
 
