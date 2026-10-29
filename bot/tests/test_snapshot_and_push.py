@@ -253,6 +253,109 @@ class TestFailureHandling(GitCase):
         self.assertIn("not a git repository", result.message)
 
 
+class TestGitLockContention(GitCase):
+    """`.git/index.lock` while another git process (or a sync pass) holds it."""
+
+    DAY = dt.date(2026, 10, 29)
+
+    def test_a_held_index_lock_is_retried_and_the_commit_lands(self):
+        import errno as errno_mod
+        import pathlib as _pathlib
+
+        self.write_day_files(self.DAY)
+        real = snap._run
+        calls = {"n": 0}
+
+        def flaky(repo, *args):
+            if args and args[0] in ("add", "commit"):
+                calls["n"] += 1
+                if calls["n"] <= 2:                      # first two attempts blocked
+                    return subprocess.CompletedProcess(
+                        ["git", *args], 128, "",
+                        "fatal: Unable to create "
+                        f"'{self.repo}/.git/index.lock': File exists.")
+            return real(repo, *args)
+
+        original_sleep = snap.time.sleep
+        snap._run = flaky
+        snap.time.sleep = lambda _s: None
+        try:
+            result = self.snapshot(self.DAY)
+        finally:
+            snap._run = real
+            snap.time.sleep = original_sleep
+
+        self.assertTrue(result.ok, result.message)
+        self.assertTrue(result.did_commit)
+        self.assertGreaterEqual(calls["n"], 3)
+        self.assertIn("daily log snapshot 2026-10-29", self.remote_subjects())
+
+    def test_a_permanent_lock_fails_cleanly_and_retries_next_night(self):
+        self.write_day_files(self.DAY)
+        real = snap._run
+
+        def always_locked(repo, *args):
+            if args and args[0] in ("add", "commit"):
+                return subprocess.CompletedProcess(
+                    ["git", *args], 128, "",
+                    "fatal: Unable to create 'index.lock': File exists.")
+            return real(repo, *args)
+
+        original_sleep = snap.time.sleep
+        snap._run = always_locked
+        snap.time.sleep = lambda _s: None
+        try:
+            result = self.snapshot(self.DAY)                 # must not raise
+        finally:
+            snap._run = real
+            snap.time.sleep = original_sleep
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.did_commit)
+        text = (self.logs / snap.LOG_NAME).read_text(encoding="utf-8")
+        self.assertIn("FAILED", text)
+
+    def test_an_authentication_failure_is_not_retried(self):
+        """A credential problem needs a person; retrying it hides the report."""
+        calls = {"n": 0}
+        real = snap._run
+
+        def denied(repo, *args):
+            calls["n"] += 1
+            return subprocess.CompletedProcess(
+                ["git", *args], 128, "", "fatal: Authentication failed for 'x'")
+
+        snap._run = denied
+        try:
+            done, used = snap._run_git(self.repo, "push", "origin", "b",
+                                       sleep=lambda _s: None)
+        finally:
+            snap._run = real
+        self.assertEqual(used, 1)
+        self.assertEqual(calls["n"], 1)
+
+    def test_a_network_drop_is_retried(self):
+        calls = {"n": 0}
+        real = snap._run
+
+        def blink(repo, *args):
+            calls["n"] += 1
+            if calls["n"] <= 1:
+                return subprocess.CompletedProcess(
+                    ["git", *args], 128, "",
+                    "fatal: unable to access 'https://github.com/x': "
+                    "Could not resolve host: github.com")
+            return real(repo, *args)
+
+        snap._run = blink
+        try:
+            done, used = snap._run_git(self.repo, "status", sleep=lambda _s: None)
+        finally:
+            snap._run = real
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(used, 2)
+
+
 class TestCli(unittest.TestCase):
     def test_a_dry_run_changes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:

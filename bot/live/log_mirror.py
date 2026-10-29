@@ -80,7 +80,6 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
-import errno
 import io
 import json
 import os
@@ -180,139 +179,66 @@ def _fsync(fh) -> None:
     os.fsync(fh.fileno())
 
 
-#: Windows errors that mean "someone else has this file open right now".
-#:
-#: 5   ACCESS_DENIED       - a rename over a file another process holds open
-#: 32  SHARING_VIOLATION   - the destination was opened without FILE_SHARE_DELETE
-#: 33  LOCK_VIOLATION      - a byte-range lock is held across the rename
-#: 117 ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 - the replacement file is busy
-#:
-#: These are *transient*: they mean "not this millisecond", not "not ever". A
-#: sync client (OneDrive, Dropbox), an antivirus scanner or the search indexer
-#: opens a file it has just noticed and closes it milliseconds later, and the
-#: rename that lands inside that window fails.
-TRANSIENT_LOCK_WINERRORS = frozenset({5, 32, 33, 117})
-
-#: The POSIX equivalents, so the same code path and tests work on Linux where
-#: these numbers do not exist.
-TRANSIENT_LOCK_ERRNOS = frozenset(
-    value for value in (
-        getattr(errno, "EACCES", None),
-        getattr(errno, "EPERM", None),
-        getattr(errno, "EBUSY", None),
-        getattr(errno, "EDEADLK", None),
-    ) if value is not None
+#: Re-exported from `live.durable`, which owns the rule. Kept as module names
+#: because callers and tests here have always used them.
+from live.durable import (                       # noqa: E402
+    DEFAULT_ATTEMPTS as REPLACE_ATTEMPTS,
+    DEFAULT_BACKOFF_SECONDS as REPLACE_BACKOFF_SECONDS,
+    TRANSIENT_LOCK_ERRNOS,
+    TRANSIENT_LOCK_WINERRORS,
+    atomic_write_text,
+    fsync_handle as _fsync,
+    is_transient_lock_error as _is_transient_lock_error,
+    short_reason as _short_reason,
 )
-
-#: Bounded retries. Short, because the condition lasts milliseconds and a mirror
-#: that stops for seconds is a mirror that falls behind. Five attempts spanning
-#: ~1.5 s: long enough to outlast a scanner, short enough not to stall the run.
-REPLACE_ATTEMPTS = 5
-REPLACE_BACKOFF_SECONDS = (0.05, 0.1, 0.2, 0.4)
-
-
-def _short_reason(exc: BaseException) -> str:
-    """One clause a person can act on, without a traceback."""
-    winerror = getattr(exc, "winerror", None)
-    if winerror in (5, 32, 33, 117):
-        return f"file locked by another process (WinError {winerror})"
-    if isinstance(exc, PermissionError):
-        return "permission denied"
-    text = str(exc) or type(exc).__name__
-    return text if len(text) <= 80 else text[:77] + "..."
 
 
 def sync_client_hint(path: pathlib.Path) -> str | None:
-    """Name the folder-sync client that is probably locking files here, if any.
+    r"""Name the folder-sync client that is probably locking files here, if any.
 
-    A file-sync client watches a folder and opens new and changed files the
-    moment they appear — which is exactly when this module renames its state
-    file. On Windows that produces a transient `Access is denied` on the rename.
+    A sync client watches a folder and opens new and changed files the moment
+    they appear — which is exactly when this module renames its state file. On
+    Windows that produces a transient `Access is denied` on the rename.
+
     The Handler's project lives under `Desktop\projects\...`, and on a Windows
-    machine with OneDrive, Desktop is very often inside `OneDrive\`.
-
+    machine with OneDrive, `Desktop` is very often redirected into `OneDrive\`.
     Detected by environment variable first (the client's own root, reliable) and
     by path if the variables are absent (a path copied from a synced folder).
+
+    The docstring is raw because `Desktop\projects` would otherwise be read as
+    an escape sequence: `\p` is invalid and Python 3.12 raises a SyntaxWarning
+    for it on every import, and will make it an error later.
     """
     roots = []
     for name in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial",
                  "Dropbox", "MEGASYNC"):
         value = os.environ.get(name)
         if value:
-            roots.append((name.split("OneDrive")[0] or name, value))
+            roots.append(("OneDrive" if "OneDrive" in name else name, value))
     resolved = str(path.resolve()).lower()
     for label, root in roots:
         if root and root.lower() in resolved:
-            return f"{label} (${label}, {root})"
+            return f"{label} ({root})"
     for label in ("onedrive", "dropbox", "google drive", "icloud"):
         if label in resolved:
             return f"{label.title()} (path)"
-    if os.environ.get("OneDrive") or os.environ.get("OneDriveConsumer"):
-        return None            # configured, but this folder is outside it
     return None
-
-
-def _is_transient_lock_error(exc: BaseException) -> bool:
-    """Is this a "file is briefly busy" error rather than a real fault?
-
-    Read from `winerror` on Windows and `errno` elsewhere, so the same predicate
-    can be exercised by tests on any platform.
-    """
-    winerror = getattr(exc, "winerror", None)
-    if winerror is not None and winerror in TRANSIENT_LOCK_WINERRORS:
-        return True
-    return getattr(exc, "errno", None) in TRANSIENT_LOCK_ERRNOS
-
-
-def _write_state_file(path: pathlib.Path, payload: str) -> None:
-    """Write `payload` to `path` atomically: temp file, fsync, then rename."""
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        fh.write(payload)
-        _fsync(fh)
-    # After the close: Windows cannot replace a file that still has an open
-    # handle, and `replace` is what makes the write atomic.
-    tmp.replace(path)
 
 
 def save_state(path: pathlib.Path, state: dict, *,
                sleep=time.sleep, attempts: int = REPLACE_ATTEMPTS) -> None:
-    """Atomic save, with bounded retries for a transiently locked destination.
+    """Atomic, fsynced, lock-tolerant state save.
 
-    The fsync happens on the **write** handle, before it is closed. Writing the
-    file, reopening it read-only and fsyncing that handle looks equivalent and is
-    not: POSIX permits fsync on a read-only descriptor, Windows does not —
-    `os.fsync` there is `_commit()`, which fails with `EBADF` (Errno 9) unless
-    the handle was opened for writing. Doing it the read-only way passed every
-    test on Linux and crashed on the first real run on the Handler's machine.
-
-    The rename then failed on the same machine with `Access is denied`
-    (WinError 5): the destination was held open at that instant by something
-    else on the machine — not by this process, which holds no handle on either
-    file at this point. See `TRANSIENT_LOCK_WINERRORS`. Those are retried; every
-    other error is raised immediately, because retrying a real fault (a
-    permission that will never be granted, a full disk) only hides it.
+    The fsync happens on the **write** handle (`live.durable.fsync_handle`),
+    and the rename retries while the destination is briefly held open by a sync
+    client or a scanner. Both of those failures reached a real machine before
+    they were caught here; the reasons are in `live.durable`'s docstring.
 
     Raises the last error when the retries are exhausted. Callers that must keep
     running use `Mirror._save`, which turns that into a reported deferral.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(state, indent=2, sort_keys=True)
-
-    last: OSError | None = None
-    for delay in [*REPLACE_BACKOFF_SECONDS, None][:attempts]:
-        try:
-            _write_state_file(path, payload)
-            return
-        except OSError as exc:
-            if not _is_transient_lock_error(exc):
-                raise
-            last = exc
-            if delay is None:
-                break
-            sleep(delay)
-    assert last is not None
-    raise last
+    atomic_write_text(path, json.dumps(state, indent=2, sort_keys=True),
+                      sleep=sleep, attempts=attempts)
 
 
 def _split_complete_records(blob: bytes) -> tuple[list[tuple[list[str], bytes, int]], int]:
@@ -673,6 +599,52 @@ class Mirror:
             return 0
 
 
+def out_of_sync_state_path() -> pathlib.Path:
+    """A per-machine state location that no sync client watches.
+
+    The state file is machine-local, regenerable and gitignored, so it has no
+    reason to sit inside a synced folder — and sitting there is exactly what
+    made every save a race with the sync client. `%LOCALAPPDATA%` is deliberately
+    excluded from OneDrive's Known Folder Move, which is why it is the choice on
+    Windows rather than Documents or Desktop.
+    """
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        return pathlib.Path(local) / "Chronos" / "mirror-state.json"
+    base = os.environ.get("XDG_STATE_HOME")
+    if base:
+        return pathlib.Path(base) / "chronos" / "mirror-state.json"
+    return pathlib.Path.home() / ".local" / "state" / "chronos" / "mirror-state.json"
+
+
+def resolve_state_path(logs_dir: pathlib.Path, explicit: str | None = None
+                       ) -> tuple[pathlib.Path, str]:
+    """Where the state file should live, and why. `--state` always wins.
+
+    Returns `(path, reason)`. The reason is logged either way: a tool that
+    silently relocates its own state is a tool nobody can find the state of.
+    """
+    legacy = logs_dir / ".mirror_state.json"
+    if explicit:
+        return pathlib.Path(explicit), "given with --state"
+    hint = sync_client_hint(logs_dir)
+    if not hint:
+        return legacy, "next to the day files (no sync client detected)"
+    safe = out_of_sync_state_path()
+    if legacy.exists() and not safe.exists():
+        # Adopt the old file once, rather than starting over and re-reconciling
+        # through the day files. Same offsets, better address.
+        try:
+            safe.parent.mkdir(parents=True, exist_ok=True)
+            safe.write_bytes(legacy.read_bytes())
+            adopted = f" (adopted the existing {legacy.name})"
+        except OSError as exc:
+            adopted = f" (could not adopt the old file: {_short_reason(exc)})"
+    else:
+        adopted = ""
+    return safe, f"moved out of {hint}{adopted}"
+
+
 def describe_state(state_path: pathlib.Path, logs_dir: pathlib.Path) -> str:
     """Human summary of what has been mirrored — read-only."""
     state = load_state(state_path)
@@ -728,11 +700,15 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     logs_dir = pathlib.Path(args.logs_dir)
-    state_path = pathlib.Path(args.state) if args.state else logs_dir / ".mirror_state.json"
+    state_path, why = resolve_state_path(logs_dir, args.state)
     if args.status:
+        print(f"state file: {state_path}\n  {why}")
         print(describe_state(state_path, logs_dir))
         return 0
 
+    # Say it every start, not only on the first: the path is the one fact that
+    # has to be visible when someone goes looking for the state.
+    print(f"state file: {state_path}  ({why})", flush=True)
     mirror = Mirror(args.out_dir, logs_dir, state_path)
     return mirror.run(interval=args.interval, once=args.once)
 

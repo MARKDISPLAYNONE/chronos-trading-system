@@ -696,6 +696,86 @@ class TestSyncClientHint(unittest.TestCase):
             self.assertIsNone(log_mirror.sync_client_hint(pathlib.Path(tmp)))
 
 
+class TestStateRelocation(unittest.TestCase):
+    """A state file inside a synced folder is moved out, automatically."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name)
+        self.synced = self.root / "OneDrive" / "Desktop" / "projects" / "logs"
+        self.synced.mkdir(parents=True)
+        # A path with no sync client in it, for the "leave it alone" case.
+        self.plain = self.root / "scratch" / "chronos" / "logs"
+        self.plain.mkdir(parents=True)
+        self._env = {k: os.environ.get(k) for k in
+                     ("OneDrive", "OneDriveCommercial", "OneDriveConsumer",
+                      "XDG_STATE_HOME", "LOCALAPPDATA")}
+        for key in ("OneDrive", "OneDriveCommercial", "OneDriveConsumer"):
+            os.environ.pop(key, None)
+
+    def tearDown(self) -> None:
+        for key, value in self._env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self._tmp.cleanup()
+
+    def test_without_a_sync_client_the_state_stays_beside_the_logs(self):
+        path, why = log_mirror.resolve_state_path(self.plain)
+        self.assertEqual(path, self.plain / ".mirror_state.json")
+        self.assertIn("no sync client", why)
+
+    def test_with_onedrive_it_moves_out_of_the_synced_folder(self):
+        os.environ["OneDrive"] = str(self.root / "OneDrive")
+        os.environ["XDG_STATE_HOME"] = str(self.root / "statedir")
+        state_dir = self.root / "statedir" / "chronos"
+        old = log_mirror.out_of_sync_state_path
+        log_mirror.out_of_sync_state_path = lambda: state_dir / "mirror-state.json"
+        try:
+            path, why = log_mirror.resolve_state_path(self.synced)
+        finally:
+            log_mirror.out_of_sync_state_path = old
+        self.assertEqual(path, state_dir / "mirror-state.json")
+        self.assertIn("moved out of", why)
+        self.assertNotIn("OneDrive", str(path))
+
+    def test_an_explicit_state_path_always_wins(self):
+        os.environ["OneDrive"] = str(self.root / "OneDrive")
+        chosen = self.root / "elsewhere" / "state.json"
+        path, why = log_mirror.resolve_state_path(self.synced, str(chosen))
+        self.assertEqual(path, chosen)
+        self.assertIn("--state", why)
+
+    def test_an_existing_state_is_adopted_rather_than_abandoned(self):
+        """Moving the file must not throw away the offsets it holds."""
+        os.environ["OneDrive"] = str(self.root / "OneDrive")
+        legacy = self.synced / ".mirror_state.json"
+        legacy.write_text('{"sources": {"dst_monitor.csv": {"offset": 99}}}',
+                          encoding="utf-8")
+        target = self.root / "safe" / "mirror-state.json"
+        old = log_mirror.out_of_sync_state_path
+        log_mirror.out_of_sync_state_path = lambda: target
+        try:
+            path, why = log_mirror.resolve_state_path(self.synced)
+        finally:
+            log_mirror.out_of_sync_state_path = old
+
+        self.assertEqual(path, target)
+        self.assertIn("adopted", why)
+        self.assertEqual(json.loads(target.read_text())["sources"]
+                         ["dst_monitor.csv"]["offset"], 99)
+
+    def test_the_chosen_path_is_printed_by_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = pathlib.Path(tmp) / "logs"
+            logs.mkdir()
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = log_mirror.main(["--logs-dir", str(logs), "--status"])
+        self.assertEqual(rc, 0)
+        self.assertIn("state file:", out.getvalue())
+
+
 class TestHelpers(unittest.TestCase):
     def test_row_date_accepts_every_shape_the_logs_use(self):
         default = __import__("datetime").date(2026, 11, 1)

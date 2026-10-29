@@ -79,6 +79,7 @@ from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+from live.durable import atomic_write_text  # noqa: E402
 from src import config  # noqa: E402
 from src import outputs  # noqa: E402
 from src import time_windows  # noqa: E402
@@ -235,6 +236,9 @@ class RunnerState:
     #: power cut) leaves this False, which is how the next launch knows the
     #: previous session was not closed deliberately.
     clean_stop: bool = False
+    #: Sleep used between retries of the atomic replace. Injectable so tests can
+    #: exercise the retry path without waiting; production uses the real one.
+    save_sleep: object = time.sleep
 
     @classmethod
     def load(cls, path: pathlib.Path) -> "RunnerState":
@@ -283,7 +287,31 @@ class RunnerState:
             self.observations.pop()
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        """Persist the ledger atomically, durably, and through a transient lock.
+
+        This file is not reconstructable: `pending`, `deferred` and the
+        observation intervals exist nowhere else, and Q13/Q14 depend on them.
+        Losing them does not corrupt the CSV — the emitter refuses a window it
+        has already written — but it silently changes what the next start
+        believes about trades that were open and time that was watched.
+
+        Two failures were possible here and are now closed, both measured on a
+        Windows machine whose tree sits inside OneDrive:
+
+        * `replace()` over a destination another process has open raises
+          `ACCESS_DENIED` / `SHARING_VIOLATION`. A sync client opens this file
+          within milliseconds of each write, so this is a live risk, not a
+          theoretical one. Retried, bounded — `live/durable.py`.
+        * the temporary file was never flushed or fsynced, so the rename could
+          land while its contents were still in an OS buffer. A power cut then
+          leaves a valid name over an empty file, and the runner treats that as
+          a first start. Now written and fsynced before the rename, as
+          `log_mirror` already does.
+
+        A failure still propagates. Continuing to run while unable to persist
+        the ledger would be the silent option, and this process's whole crash
+        protocol depends on that file being true.
+        """
         payload = {
             "first_start_utc": self.first_start_utc,
             "last_heartbeat_utc": self.last_heartbeat_utc,
@@ -293,9 +321,9 @@ class RunnerState:
             "clean_stop": self.clean_stop,
             "saved_utc": dt.datetime.now(UTC).isoformat(),
         }
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(self.path)          # atomic: a crash mid-write cannot corrupt
+        atomic_write_text(
+            self.path, json.dumps(payload, indent=2, sort_keys=True),
+            sleep=self.save_sleep)
 
 
 # ---------------------------------------------------------------------------

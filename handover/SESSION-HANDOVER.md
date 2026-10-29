@@ -542,6 +542,22 @@ fallback it forced was **duplicating rows**. **460 tests pass.**
 - `-1` sentinel removed: counts are counts, failures print on their own line.
 - `sync_client_hint()` names the suspected sync client and points at `--state`.
 
+**Session 22:** audited every durable writer against the OneDrive lock class.
+**485 tests pass.**
+- **`dry_run_runner.py` was equally exposed**: `RunnerState.save()` had no retry
+  *and no fsync*, at five sites — startup death, a false unclean-shutdown report,
+  and a lost ledger on power cut. Now uses `live.durable`; still raises on a
+  persistent lock, because the ledger has no second copy.
+- `dst_monitor`/`csv_emitter` were already safe (append-only, no rename).
+- `snapshot_and_push` was safe but lost a night on `.git/index.lock`; now retries
+  lock and network errors, never auth failures.
+- New `live/durable.py` is the single implementation; the mirror and the runner
+  both import it.
+- Mirror state now relocates itself to `%LOCALAPPDATA%\Chronos\` when a synced
+  folder is detected, adopting any existing file; `--state` still wins.
+- `\p` SyntaxWarning fixed (raw docstring), with a test that imports under
+  `-W error::SyntaxWarning`.
+
 ---
 
 ## 11. Phase 1 Pre-Flight — Questions and how each was resolved (Q1–Q12)
@@ -2039,4 +2055,104 @@ cleared again. Result: **six DST rows, six unique, in order, no gaps, no
 duplicates**; state durable once a rename succeeded; silent on a pass with
 nothing to do. The regression test fails on the pre-fix code (verified by
 disabling the bootstrap).
+
+### 15.22 The lock-contention class, audited across every writer (Phase-2 integrity)
+
+The Handler confirmed it: `C:\Users\admin\OneDrive` is the whole project tree,
+so `bot/live/output/` — `runner_state.json` and the live CSVs — sits inside a
+synced folder. The mirror's bug was therefore not a logging nice-to-have. Every
+durable write in the project was audited against the same failure.
+
+#### Verdict per component
+
+| component | file | rename-replace? | fsync? | verdict |
+|---|---|---|---|---|
+| `log_mirror.py` | `logs/.mirror_state.json` | yes | yes | fixed in 15.20/15.21 |
+| **`dry_run_runner.py`** | `live/output/runner_state.json` | **yes** | **none** | **NEEDED THE FIX** |
+| `dst_monitor.py` | none — append-only CSV | no | no | not exposed to this class |
+| `csv_emitter.py` | the CSVs | no, append | no | not exposed to this class |
+| `snapshot_and_push.py` | `.git/index.lock` | git's own | git's own | **NEEDED A RETRY** |
+
+**`dry_run_runner.py` was equally exposed, and worse.** `RunnerState.save()`
+wrote the temporary file with `write_text()` — no flush, no fsync — then
+`replace()`ed with no retry, at five call sites:
+
+1. `start()` — outside the step loop, so a `WinError 5` there **killed the runner
+   at startup**;
+2. `stop()` — inside `finally:`, so a failure **replaced the clean-stop record
+   with a traceback**, and `clean_stop=True` was never persisted, so the next
+   start reported `unclean_shutdown_detected` and wrote gap rows for downtime
+   that was in fact a clean stop;
+3. the normal step, 4. the feed-error path, 5. crash reconciliation.
+
+The missing fsync was a second, independent defect: the rename could land while
+the contents were still in an OS buffer, so a power cut leaves a valid name over
+an empty file, which the runner reads as a first start — losing `pending`
+(open trades, Q14), `deferred`, and the observation intervals. **None of that is
+reconstructable from the CSVs.**
+
+**Why a CSV row cannot be corrupted either way:** `CsvEmitter.emit()` refuses a
+window id already present in `window_evaluations.csv`, and crash reconciliation
+goes through `_emit_checked`. So the damage from a lost ledger is *ledger drift*
+(wrong Q13/Q14 decisions on the next start), not duplicate or fabricated rows.
+That is still disqualifying for Phase 2, but it is not silent row corruption.
+
+**Fix:** `RunnerState.save()` now goes through `live.durable.atomic_write_text`
+— fsync on the write handle, then a bounded retry of the rename. On exhausted
+retries it still **raises**, deliberately: the mirror can fall back to its day
+files, but the runner has no second copy of its ledger, and continuing to run
+while unable to persist it would be the silent option. A crash is visible and
+restartable. Three tests pin this: retried-then-succeeds, fsync-before-rename,
+and a persistent lock still raising.
+
+**`dst_monitor.py` and `csv_emitter.py` were already safe** from this class: both
+only ever append (`open(..., "a")`), never rename over an existing file. They are
+exposed to a *different*, milder risk — a sharing violation on the append while
+something holds the file open. `dst_monitor` catches that per sample and keeps
+running (a lost monitoring sample, not corruption); the emitter would surface it
+as a step failure, which the run loop catches and logs. Neither fabricates or
+duplicates data, so no change was made.
+
+**`snapshot_and_push.py` was safe but lossy.** `git add` and `git commit` die
+with `fatal: Unable to create '.git/index.lock': File exists` (reproduced), which
+cost a whole night: the job reports failure and the next run picks it up. It now
+retries lock contention and transient network errors four times over ~1.8 s, and
+deliberately does **not** retry authentication failures or rejected pushes —
+those need a person, and retrying them only delays the report. `push` is not
+affected by `index.lock`; its retries are for the link blinking.
+
+#### One implementation, not three
+
+`live/durable.py` now owns the rule: the error classification, the read-only
+fsync guard, and the bounded retry. `log_mirror` and `dry_run_runner` both import
+it. Three copies of a subtle platform rule is how this class of bug spread in the
+first place. `WINERROR` decides alone when present — Windows' `errno` is only
+CPython's approximation of it, and falling back to both would retry an unrelated
+`PermissionError` pointlessly.
+
+#### The state file now moves itself out of a synced folder
+
+Not left to the Handler remembering a flag. `resolve_state_path()` detects a sync
+client (environment variables first, then a path containing OneDrive/Dropbox/
+Drive/iCloud) and, when found, puts the mirror's state in
+`%LOCALAPPDATA%\Chronos\mirror-state.json` — deliberately chosen because
+`LOCALAPPDATA` is excluded from OneDrive's Known Folder Move. `--state` still
+wins; the choice and its reason are printed on every start and by `--status`.
+An existing state file at the old location is **adopted**, so the offsets are not
+thrown away. Non-synced machines are unchanged.
+
+#### `SyntaxWarning: invalid escape sequence '\p'`
+
+`Desktop\projects` in a docstring. Docstring is now raw. A test asserts the
+module imports cleanly under `-W error::SyntaxWarning`, so the next one cannot
+land quietly.
+
+#### Not changed, and why
+
+The runner's state file was **not** moved out of the synced tree. Relocating it
+mid-run would orphan the live ledger and manufacture gap rows, and the path is
+part of the Handler's operational picture (`--state`, `inspect_state`). The retry
+addresses the transient case; if the lock ever becomes persistent, the better fix
+is to exclude `bot/live/output/` from OneDrive in the client — a GUI action on
+the Handler's side, and the one I would recommend.
 

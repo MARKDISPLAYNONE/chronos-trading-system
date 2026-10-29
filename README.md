@@ -37,7 +37,7 @@ logs/                       mirrored day files, committed nightly (DST/RUNNER/TR
 snapshot_and_push.bat       Windows Task Scheduler wrapper for the nightly snapshot
 bot/
   src/                      engine: windows, candles, context, sweep, sizing
-  tests/                    460 unit tests (stdlib unittest)
+  tests/                    485 unit tests (stdlib unittest)
   historical_validation/
     validate_against_history.py   Phase 1 driver
     export_history_csv.py         MT5 export (Windows-only, Handler runs it)
@@ -47,6 +47,8 @@ bot/
     dry_run_runner.py           the dry-run loop — places NO orders
     dst_monitor.py              continuous DST invariant monitor (separate process)
     csv_emitter.py              append-only log writer (Phase 1 schema)
+    durable.py                  atomic, fsynced, lock-tolerant file replace
+                                (shared by the runner and the mirror)
     log_mirror.py               read-only tailer: live/output -> logs/<DAY>.csv
                                 (third process; never writes to live/output)
     snapshot_and_push.py        nightly: commit + push the previous day's logs

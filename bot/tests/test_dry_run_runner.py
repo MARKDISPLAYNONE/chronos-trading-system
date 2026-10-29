@@ -14,6 +14,7 @@ import calendar
 import csv
 import datetime as dt
 import json
+import os
 import pathlib
 import sys
 import tempfile
@@ -1075,6 +1076,96 @@ class TestUncleanRestart(RunnerHarness):
         runner.start(connect_terminal=False)
         kinds = [r["kind"] for r in self.read("runner_events.csv")]
         self.assertIn("unclean_shutdown_detected", kinds)
+
+    def test_state_save_survives_a_transiently_locked_state_file(self):
+        """The OneDrive case, on the file the live run cannot lose.
+
+        `runner_state.json` sits inside a synced tree, and a sync pass holds it
+        open exactly when it is being replaced. Before `live.durable`, that was
+        an unretried `replace()`: a crash at startup, or an unsaved ledger.
+        """
+        import errno as errno_mod
+
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        runner = DryRunRunner(FakeMT5(rows), self.out,
+                              source=FakeSource(rows, lambda: self.clock),
+                              now_fn=lambda: self.clock, log=self.logs.append)
+        runner.state.save_sleep = lambda _s: None        # no real waiting
+
+        real = pathlib.Path.replace
+        calls = {"n": 0}
+
+        class WindowsLock(PermissionError):
+            def __init__(self):
+                super().__init__(errno_mod.EACCES, "Access is denied")
+                self.winerror = 5
+
+        def flaky(self_path, target):
+            if "runner_state" in str(target):
+                calls["n"] += 1
+                if calls["n"] <= 2:                      # two failures, then clear
+                    raise WindowsLock()
+            return real(self_path, target)
+
+        pathlib.Path.replace = flaky
+        try:
+            runner.start(connect_terminal=False)
+        finally:
+            pathlib.Path.replace = real
+
+        self.assertGreaterEqual(calls["n"], 3)           # retried, then succeeded
+        state = json.loads((self.out / "runner_state.json").read_text())
+        self.assertIsNotNone(state["last_heartbeat_utc"])
+        self.assertFalse(state["clean_stop"])
+
+    def test_state_save_fsyncs_before_renaming(self):
+        """The rename must never expose a file whose contents are still buffered."""
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        runner = DryRunRunner(FakeMT5(rows), self.out,
+                              source=FakeSource(rows, lambda: self.clock),
+                              now_fn=lambda: self.clock, log=self.logs.append)
+        synced = []
+        real = os.fsync
+
+        def counting(fd):
+            synced.append(fd)
+            return real(fd)
+
+        os.fsync = counting
+        try:
+            runner.start(connect_terminal=False)
+        finally:
+            os.fsync = real
+        self.assertTrue(synced, "the state file was renamed without an fsync")
+
+    def test_a_persistent_lock_still_raises_rather_than_running_blind(self):
+        """The ledger is not reconstructable, so silence here would be worse."""
+        import errno as errno_mod
+
+        rows = build_feed(up_to=dt.datetime(2026, 10, 26, 16, 0))
+        runner = DryRunRunner(FakeMT5(rows), self.out,
+                              source=FakeSource(rows, lambda: self.clock),
+                              now_fn=lambda: self.clock, log=self.logs.append)
+        runner.state.save_sleep = lambda _s: None
+
+        real = pathlib.Path.replace
+
+        class WindowsLock(PermissionError):
+            def __init__(self):
+                super().__init__(errno_mod.EACCES, "Access is denied")
+                self.winerror = 5
+
+        def always_locked(self_path, target):
+            if "runner_state" in str(target):
+                raise WindowsLock()
+            return real(self_path, target)
+
+        pathlib.Path.replace = always_locked
+        try:
+            with self.assertRaises(OSError):
+                runner.start(connect_terminal=False)
+        finally:
+            pathlib.Path.replace = real
 
     def test_the_signal_banner_does_not_read_as_a_shutdown_record(self):
         """The startup banner describes a capability, and must say so.

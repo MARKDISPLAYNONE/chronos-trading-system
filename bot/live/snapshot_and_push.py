@@ -57,6 +57,7 @@ import datetime as dt
 import pathlib
 import subprocess
 import sys
+import time
 
 #: Run from anywhere: `python live/snapshot_and_push.py` puts `live/` on
 #: sys.path, not `bot/`, and this module imports `src` for the NY timezone.
@@ -103,6 +104,81 @@ def _run(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess:
         ["git", *args], cwd=str(repo), capture_output=True, text=True,
         timeout=GIT_TIMEOUT_SECONDS, check=False,
     )
+
+
+#: Git failures that mean "try again in a moment", not "this will never work".
+#:
+#: The first group is lock contention. `.git/index.lock` exists only while
+#: another git process holds the index — and on a OneDrive-synced tree a sync
+#: pass can hold `.git/` itself, which is the same class of problem that broke
+#: the mirror's state save. `git add` and `git commit` both die on it with
+#: "Unable to create ... File exists", and without a retry that costs a whole
+#: night: the job reports failure and the next run picks it up.
+#:
+#: The second group is the transient network. The Handler has occasional drops;
+#: a push that fails because the link blinked is not a push that needs a human.
+TRANSIENT_GIT_MARKERS = (
+    "index.lock",
+    "unable to create",
+    "could not lock",
+    "another git process",
+    "could not resolve host",
+    "failed to connect",
+    "connection timed out",
+    "connection reset",
+    "connection refused",
+    "remote end hung up",
+    "unable to access",
+    "operation timed out",
+    "tls",
+    "network is unreachable",
+)
+
+#: Never retried: these need a person, and retrying only delays the report.
+FATAL_GIT_MARKERS = (
+    "authentication failed",
+    "permission denied",
+    "could not read username",
+    "repository not found",
+    "non-fast-forward",
+    "[rejected]",
+)
+
+#: Four attempts over ~1.8 s of backoff. Git lock contention lasts about as long
+#: as one sync pass; a network blink longer than this is the next run's problem,
+#: which is already handled.
+GIT_RETRY_ATTEMPTS = 4
+GIT_RETRY_BACKOFF = (0.1, 0.4, 1.3)
+
+
+def _is_transient_git_failure(text: str) -> bool:
+    lowered = (text or "").lower()
+    if any(marker in lowered for marker in FATAL_GIT_MARKERS):
+        return False
+    return any(marker in lowered for marker in TRANSIENT_GIT_MARKERS)
+
+
+def _run_git(repo: pathlib.Path, *args: str, sleep=time.sleep,
+             attempts: int = GIT_RETRY_ATTEMPTS) -> tuple[subprocess.CompletedProcess, int]:
+    """Run git, retrying the failures that clear on their own.
+
+    Returns `(completed_process, attempts_used)`. A non-zero exit after the last
+    attempt is returned, not raised: the caller decides what it means.
+    """
+    schedule = [*GIT_RETRY_BACKOFF, None][:attempts]
+    used = 0
+    done = _run(repo, *args)
+    for delay in schedule:
+        used += 1
+        if done.returncode == 0:
+            return done, used
+        if not _is_transient_git_failure(done.stderr + done.stdout):
+            return done, used
+        if delay is None:
+            break
+        sleep(delay)
+        done = _run(repo, *args)
+    return done, used
 
 
 def current_branch(repo: pathlib.Path) -> str | None:
@@ -202,7 +278,8 @@ def snapshot(day: dt.date, *, repo: pathlib.Path = DEFAULT_REPO,
         except ValueError:
             return str(path)
 
-    added = _run(repo, "add", "--", *[_stage_name(path) for path in csvs])
+    added, attempts = _run_git(repo, "add", "--",
+                               *[_stage_name(path) for path in csvs])
     if added.returncode != 0:
         report(f"FAILED to stage {logs_dir}: {added.stderr.strip()}", ok=False)
         result.message = "git add failed"
@@ -210,7 +287,7 @@ def snapshot(day: dt.date, *, repo: pathlib.Path = DEFAULT_REPO,
 
     staged = _run(repo, "diff", "--cached", "--name-only")
     if staged.stdout.strip():
-        commit = _run(repo, "commit", "-m", message)
+        commit, attempts = _run_git(repo, "commit", "-m", message)
         if commit.returncode != 0:
             report(f"FAILED to commit: {(commit.stderr or commit.stdout).strip()}",
                    ok=False)
@@ -230,7 +307,7 @@ def snapshot(day: dt.date, *, repo: pathlib.Path = DEFAULT_REPO,
         result.message = "committed, not pushed"
         return result
 
-    pushed = _run(repo, "push", "origin", branch)
+    pushed, attempts = _run_git(repo, "push", "origin", branch)
     if pushed.returncode != 0:
         # Not an exception, not a crash: the commit is safe locally and tomorrow
         # night's run retries the push. The message says exactly that so nobody
@@ -243,7 +320,8 @@ def snapshot(day: dt.date, *, repo: pathlib.Path = DEFAULT_REPO,
         return result
 
     result.did_push = True
-    report(f"pushed {branch}", ok=True)
+    report(f"pushed {branch}" + (f" (after {attempts} attempts)" if attempts > 1 else ""),
+           ok=True)
     result.message = "pushed"
     return result
 
