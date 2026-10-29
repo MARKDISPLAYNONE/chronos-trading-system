@@ -41,10 +41,20 @@ mirrored record and the source's header line. Restarting resumes from that
 offset, so rows are neither repeated nor skipped. Truncation (a smaller source
 than the recorded offset) resets to zero rather than guessing.
 
-The one window that remains is the same one the runner has: if the process dies
-between fsyncing a target file and saving the state, the next start replays that
-single record. The state is written atomically (`tmp` + `replace`), so it cannot
-be left half-written, and a normal stop or a `kill` loses nothing.
+**The day files are a second record of the same thing**, and the offset is not
+the only way back. A state file that is missing, empty or interrupted means
+"resume from zero" only if the day files are empty too; otherwise the longest
+prefix of source records already present in them is skipped and the offset is
+rebuilt from that. This is not hypothetical — the first live version crashed
+before it ever saved a state, leaving rows on disk and no offset anywhere, so a
+naive restart would have duplicated everything it had already copied.
+
+Matching is on the record's own bytes, counted, and the walk stops at the first
+record that is not already present, so a day file edited or rotated by something
+else cannot cause a row to be skipped out of the middle of the source.
+
+The state is written atomically (`tmp` + `replace`) and fsynced, so it cannot be
+left half-written, and a normal stop or a `kill` loses nothing.
 
 WHICH DATE A ROW BELONGS TO
 ---------------------------
@@ -149,13 +159,43 @@ def load_state(path: pathlib.Path) -> dict:
     return raw
 
 
+def _fsync(fh) -> None:
+    """Force a file's bytes to the disk, on a handle opened for writing.
+
+    Every durable write goes through here so the rule lives in one place: fsync
+    needs a **writable** handle. POSIX allows it on a read-only descriptor,
+    Windows does not (`_commit` fails with `EBADF`), and a bug of exactly that
+    shape reached a real machine because the difference is invisible on Linux.
+
+    The guard makes that mistake fail the same way everywhere, at the moment it
+    is made, instead of on one platform in the field.
+    """
+    mode = getattr(fh, "mode", "")
+    if mode and "r" in mode and "+" not in mode:
+        raise ValueError(
+            f"fsync on a read-only handle (mode={mode!r}): allowed on POSIX, "
+            f"EBADF on Windows. Open the file for writing instead.")
+    fh.flush()
+    os.fsync(fh.fileno())
+
+
 def save_state(path: pathlib.Path, state: dict) -> None:
-    """Atomic save: a crash mid-write cannot leave a half-written offset."""
+    """Atomic save: a crash mid-write cannot leave a half-written offset.
+
+    The fsync happens on the **write** handle, before it is closed. Writing the
+    file, reopening it read-only and fsyncing that handle looks equivalent and is
+    not: POSIX permits fsync on a read-only descriptor, Windows does not —
+    `os.fsync` there is `_commit()`, which fails with `EBADF` (Errno 9) unless
+    the handle was opened for writing. Doing it the read-only way passed every
+    test on Linux and crashed on the first real run on the Handler's machine.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-    with tmp.open("rb") as fh:
-        os.fsync(fh.fileno())          # the state itself must reach the disk
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(state, indent=2, sort_keys=True))
+        _fsync(fh)
+    # After the close: Windows cannot replace a file that still has an open
+    # handle, and `replace` is what makes the write atomic.
     tmp.replace(path)
 
 
@@ -238,10 +278,62 @@ class Mirror:
             if new and header:
                 fh.write(header.rstrip(b"\r\n") + b"\n")
             fh.write(raw.rstrip(b"\r\n") + b"\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+            _fsync(fh)
 
     # -- reading -----------------------------------------------------------
+    def _resume_from_destination(self, source: dict, path: pathlib.Path
+                                 ) -> tuple[int, str | None]:
+        """Rebuild the offset for a source whose state was never persisted.
+
+        This exists because of a real failure. The crash in `save_state` meant
+        every run wrote its rows to the day files and then died *before* saving
+        an offset, so the next start called itself fresh and re-read from zero,
+        rewriting rows that were already on disk. Six part-written files and no
+        state file is exactly what that leaves behind.
+
+        So a fresh start is not "offset zero", it is "offset zero unless the day
+        files already account for a prefix of this source". The longest prefix of
+        source records already present in the day files is skipped; matching is
+        on the record's own bytes, counted, so an identical row that appears
+        twice is only credited twice.
+
+        The walk **stops at the first record that is not already there**. A day
+        file that has been rotated, edited or written by something else
+        therefore cannot cause a row to be skipped out of the middle of the
+        source — at worst the offset lands early and a row is written twice,
+        which is the recoverable direction.
+        """
+        from collections import Counter
+
+        existing: Counter = Counter()
+        for day_file in sorted(self.logs_dir.glob(f"{source['key']}_*.csv")):
+            try:
+                blob = day_file.read_bytes()
+            except OSError:
+                continue
+            records, _consumed = _split_complete_records(blob)
+            for _cells, raw, _end in records[1:]:        # skip the day header
+                existing[raw.rstrip(b"\r\n")] += 1
+        if not existing:
+            return 0, None
+
+        try:
+            records, _consumed = _split_complete_records(path.read_bytes())
+        except OSError:
+            return 0, None
+        if not records:
+            return 0, None
+
+        header = records[0][1].decode("utf-8", errors="replace").strip()
+        offset = 0
+        for _cells, raw, end in records[1:]:
+            normal = raw.rstrip(b"\r\n")
+            if existing.get(normal, 0) <= 0:
+                break
+            existing[normal] -= 1
+            offset = end
+        return offset, header
+
     def _mirror_source(self, source: dict, now: float) -> int:
         path = self.out_dir / source["file"]
         if not path.exists():
@@ -249,6 +341,22 @@ class Mirror:
 
         key = source["file"]
         entry = self.state["sources"].setdefault(key, {})
+        if "offset" not in entry:
+            # No recorded offset: either a first run, or a previous one that
+            # wrote rows and died before saving. Ask the day files which it was
+            # rather than assuming zero and duplicating them.
+            recovered, header = self._resume_from_destination(source, path)
+            entry["offset"] = recovered
+            if header is not None:
+                entry["header"] = header
+            if recovered:
+                print(f"{source['file']}: resuming at byte {recovered} "
+                      f"(day files already hold a prefix of it; no state was "
+                      f"saved by the previous run)", flush=True)
+                # Persist the conclusion now. It was reached by reading the day
+                # files, which is expensive and, more to the point, is the only
+                # thing standing between a restart and a duplicate.
+                save_state(self.state_path, self.state)
         offset = int(entry.get("offset") or 0)
 
         with path.open("rb") as fh:
@@ -368,6 +476,25 @@ def describe_state(state_path: pathlib.Path, logs_dir: pathlib.Path) -> str:
         lines.append("no day files yet")
     for path in files:
         lines.append(f"  {path.name:<28} {path.stat().st_size:>10} bytes")
+
+    # Offsets are *resume points*, not a measure of what has been mirrored: a run
+    # that wrote rows and died before saving its state leaves offsets at 0 and
+    # the day files full. Saying only "offset 0" reads as "nothing was mirrored",
+    # which is how a real incident was misdiagnosed once already.
+    with_rows = [p for p in files if p.stat().st_size > 0]
+    all_zero = all(int((state["sources"].get(key) or {}).get("offset") or 0) == 0
+                   for key in ("dst_monitor.csv", "runner_events.csv",
+                               "window_evaluations_audit.csv"))
+    if with_rows and all_zero:
+        lines.append("")
+        lines.append("WARNING: day files hold rows but no source has a saved "
+                     "offset.")
+        lines.append("  An earlier run wrote rows and did not persist its state "
+                     "(crash, or a kill")
+        lines.append("  before the first save). A fresh start will reconcile "
+                     "against these files and")
+        lines.append("  resume past the rows they already contain, rather than "
+                     "duplicating them.")
     return "\n".join(lines)
 
 

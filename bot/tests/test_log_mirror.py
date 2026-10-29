@@ -9,6 +9,7 @@ fakes for the I/O, because the I/O is the thing under test.
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import io
 import os
@@ -189,16 +190,36 @@ class TestRestart(MirrorCase):
         rows = self.rows_for("DST", "2026-10-29")[1:]
         self.assertIn(["utc-new", "2026-10-29 20:00:00-04:00", "x"], rows)
 
-    def test_a_lost_state_file_re_mirrors_rather_than_stopping(self):
-        self.add_monitor_rows("2026-10-29 10:00:00-04:00")
+    def test_a_lost_state_file_reconciles_instead_of_duplicating(self):
+        """The day files are the second record of what has been mirrored.
+
+        Losing the state used to mean re-reading from zero and writing every row
+        again. That is not academic: the Windows fsync crash left six day files
+        and no state, so the next start would have duplicated all of them.
+        """
+        self.add_monitor_rows("2026-10-29 10:00:00-04:00",
+                              "2026-10-29 11:00:00-04:00")
         self.pass_once()
         (self.logs / ".mirror_state.json").unlink()
-        self.pass_once()                                 # no state: start again
 
-        # Re-reading from zero duplicates what was already copied, which is the
-        # honest outcome of losing the resume point; what must not happen is a
-        # crash or a silently empty file.
-        self.assertGreaterEqual(len(self.rows_for("DST", "2026-10-29")), 2)
+        self.pass_once()                                 # no state: reconcile
+
+        rows = self.rows_for("DST", "2026-10-29")
+        self.assertEqual([r[1] for r in rows[1:]],
+                         ["2026-10-29 10:00:00-04:00",
+                          "2026-10-29 11:00:00-04:00"])   # once each
+
+    def test_reconciliation_only_skips_a_matching_prefix(self):
+        """A day file that does not match cannot cause a row to be skipped."""
+        self.logs.mkdir(parents=True, exist_ok=True)
+        (self.logs / "DST_2026-10-29.csv").write_text(
+            ",".join(DST_COLS) + "\nsomething,else,\n", encoding="utf-8")
+        self.add_monitor_rows("2026-10-29 10:00:00-04:00")
+        self.pass_once()
+
+        rows = self.rows_for("DST", "2026-10-29")
+        self.assertIn(["utc-2026-10-29 10:00:00-04:00",
+                       "2026-10-29 10:00:00-04:00", ""], rows)
 
 
 class TestPartialWrites(MirrorCase):
@@ -273,6 +294,184 @@ class TestDurability(MirrorCase):
         source_bytes = (self.out / "dst_monitor.csv").stat().st_size
         self.assertEqual(state["sources"]["dst_monitor.csv"]["offset"], source_bytes)
         self.assertGreater(mirrored_bytes, 0)
+
+
+class TestTheWindowsFsyncCrash(MirrorCase):
+    """The first live run, reproduced.
+
+    `save_state` wrote the file, reopened it read-only and fsynced that handle.
+    POSIX permits that; Windows returns EBADF, so the process died on its first
+    state save, on every source, having written rows it never recorded. 439
+    tests passed because none of them ran where the difference exists.
+    """
+
+    def test_no_fsync_ever_uses_a_read_only_handle(self):
+        """Platform-independent: catches the bug on Linux, where it is invisible."""
+        seen: list[str] = []
+        real = log_mirror._fsync
+
+        def spy(fh):
+            seen.append(getattr(fh, "mode", "?"))
+            return real(fh)
+
+        log_mirror._fsync = spy
+        try:
+            self.add_monitor_rows("2026-10-29 10:00:00-04:00",
+                                  "2026-10-30 09:00:00-04:00")
+            self.add_event_rows(["2026-10-29T21:00:00+00:00",
+                                 "2026-10-29 17:00:00-04:00", "start", "up"])
+            self.add_audit_rows(["2026-10-29", "09:45-10:15",
+                                 "2026-10-29T10:15:00-04:00", "NO_SETUP"])
+            self.pass_once()
+        finally:
+            log_mirror._fsync = real
+
+        self.assertTrue(seen)
+        for mode in seen:
+            self.assertFalse("r" in mode and "+" not in mode,
+                             f"fsync on a read-only handle (mode={mode!r})")
+
+    def test_the_guard_refuses_a_read_only_handle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "f.txt"
+            path.write_text("x", encoding="utf-8")
+            with path.open("rb") as fh:
+                with self.assertRaises(ValueError) as caught:
+                    log_mirror._fsync(fh)
+        self.assertIn("read-only", str(caught.exception))
+
+    @unittest.skipUnless(sys.platform != "win32",
+                         "the emulation is only needed where fsync is permissive")
+    def test_a_full_run_survives_windows_fsync_semantics(self):
+        """Emulate Windows: fsync raises EBADF unless the handle is writable."""
+        try:
+            import fcntl
+        except ImportError:                              # pragma: no cover
+            self.skipTest("fcntl unavailable")
+
+        def windows_fsync(fd):
+            if fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY:
+                raise OSError(9, "Bad file descriptor")
+            return real_fsync(fd)
+
+        real_fsync = os.fsync
+        self.add_monitor_rows("2026-10-29 10:00:00-04:00")
+        self.add_event_rows(["2026-10-29T21:00:00+00:00",
+                             "2026-10-29 17:00:00-04:00", "start", "up"])
+        self.add_audit_rows(["2026-10-29", "09:45-10:15",
+                             "2026-10-29T10:15:00-04:00", "NO_SETUP"])
+
+        os.fsync = windows_fsync
+        try:
+            stats = self.pass_once()
+        finally:
+            os.fsync = real_fsync
+
+        self.assertEqual(stats, {"DST": 1, "RUNNER": 1, "TRADES": 1})
+        state = log_mirror.load_state(self.logs / ".mirror_state.json")
+        self.assertNotEqual(state["sources"], {})       # the state was saved
+        self.assertEqual(len(self.rows_for("DST", "2026-10-29")), 2)
+
+
+class TestPreExistingDestinations(MirrorCase):
+    """A fresh state over day files that already hold rows.
+
+    This is the state the crashed runs left on the Handler's machine: rows on
+    disk, no offsets recorded. The next start must neither crash nor duplicate.
+    """
+
+    def crashed_run(self) -> None:
+        """One attempt that dies at its first state save, as the real one did.
+
+        The row reaches the day file; the offset never reaches the state. Each
+        such run therefore leaves exactly one unaccounted row per source, which
+        is why several attempts produced several files.
+        """
+        mirror = log_mirror.Mirror(self.out, self.logs)
+        original = log_mirror.save_state
+
+        def boom(*_args, **_kwargs):
+            raise OSError(9, "Bad file descriptor")
+
+        log_mirror.save_state = boom
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                mirror.mirror_once()
+        finally:
+            log_mirror.save_state = original
+
+    def seed_partial(self, *stamps: str) -> list[list[str]]:
+        """Day files holding rows with no state — the Handler's machine.
+
+        Written directly rather than by looping the crashed path, because after
+        the first crash the *next* attempt dies in the reconciliation save as
+        well, so a loop models the bug rather than the state it leaves behind.
+        The bytes are identical either way: header plus one record per attempt.
+        """
+        self.add_monitor_rows(*stamps)                  # the source has them too
+        self.logs.mkdir(parents=True, exist_ok=True)
+        with (self.logs / "DST_2026-10-29.csv").open("a", newline="",
+                                                      encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(DST_COLS)
+            for stamp in stamps:
+                writer.writerow([f"utc-{stamp}", stamp, ""])
+        return self.rows_for("DST", "2026-10-29")
+
+    def test_a_crashed_run_leaves_rows_and_no_state(self):
+        """The incident in one assertion: the row landed, the offset did not."""
+        self.add_monitor_rows("2026-10-29 10:00:00-04:00")
+        self.crashed_run()
+
+        self.assertEqual(len(self.rows_for("DST", "2026-10-29")), 2)   # header+1
+        self.assertFalse((self.logs / ".mirror_state.json").exists())
+
+    def test_a_fresh_start_neither_crashes_nor_duplicates(self):
+        partial = self.seed_partial("2026-10-29 10:00:00-04:00",
+                                    "2026-10-29 11:00:00-04:00")
+
+        self.pass_once()                                 # the restart
+
+        after = self.rows_for("DST", "2026-10-29")
+        self.assertEqual(after, partial)                 # nothing added, nothing lost
+        state = log_mirror.load_state(self.logs / ".mirror_state.json")
+        entry = state["sources"]["dst_monitor.csv"]
+        self.assertEqual(entry["offset"],
+                         (self.out / "dst_monitor.csv").stat().st_size)
+
+    def test_new_rows_are_appended_after_the_resumed_point(self):
+        self.seed_partial("2026-10-29 10:00:00-04:00",
+                          "2026-10-29 11:00:00-04:00")
+        self.add_monitor_rows("2026-10-29 12:00:00-04:00")
+
+        self.pass_once()
+
+        rows = self.rows_for("DST", "2026-10-29")
+        self.assertEqual([r[1] for r in rows[1:]],
+                         ["2026-10-29 10:00:00-04:00",
+                          "2026-10-29 11:00:00-04:00",
+                          "2026-10-29 12:00:00-04:00"])
+
+    def test_several_days_of_partial_files_are_each_reconciled(self):
+        """The Handler's machine had files across several dates, not one."""
+        days = ("2026-10-25", "2026-10-28", "2026-10-29")
+        self.logs.mkdir(parents=True, exist_ok=True)
+        for day in days:
+            with (self.logs / f"DST_{day}.csv").open("a", newline="",
+                                                      encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(DST_COLS)
+                stamp = f"{day} 10:00:00-04:00"
+                writer.writerow([f"utc-{stamp}", stamp, ""])
+            self.add_monitor_rows(f"{day} 10:00:00-04:00")
+
+        before = {day: self.rows_for("DST", day) for day in days}
+        self.assertEqual([len(v) for v in before.values()], [2, 2, 2])
+
+        self.pass_once()
+
+        for day, rows in before.items():
+            self.assertEqual(self.rows_for("DST", day), rows, day)
 
 
 class TestHelpers(unittest.TestCase):

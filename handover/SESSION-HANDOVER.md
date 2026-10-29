@@ -514,6 +514,20 @@ truncates. **439 tests pass.**
   late-resolving trade is not orphaned.
 - The job refuses to run on `main`/`master`.
 
+**Session 20:** `log_mirror.py` crashed on its first live run — fsync on a
+read-only handle, which POSIX allows and Windows rejects (`EBADF`). **447 tests
+pass.**
+- Fixed via a single `_fsync()` helper that fsyncs the open write handle and
+  refuses read-only ones, so the mistake cannot recur on one platform only.
+- The crash left day files written but no state; a fixed restart would have
+  duplicated them. `_resume_from_destination()` rebuilds the offset from the day
+  files, so a lost state is recoverable rather than destructive.
+- `--status` now warns when day files hold rows but no offset is saved — the
+  reading that sent the first diagnosis the wrong way.
+- The `logs/*.csv` files reported as committed are **not in the repository**:
+  never committed on any branch. They are crash artifacts (verified by replaying
+  the shipped code), not seed data.
+
 ---
 
 ## 11. Phase 1 Pre-Flight — Questions and how each was resolved (Q1–Q12)
@@ -1853,4 +1867,77 @@ Three processes now, all independent:
 (default 15 s). If the mirror is not running, nothing breaks — it simply resumes
 from its last offset when it starts, so a forgotten process costs nothing but
 delay.
+
+### 15.20 The mirror's first live run: fsync on a read-only handle (fixed)
+
+The first run of `log_mirror.py` on the Windows machine died immediately on all
+three sources:
+
+    OSError: [Errno 9] Bad file descriptor
+      os.fsync(fh.fileno())   <- save_state()
+      <- _mirror_source() <- mirror_once()
+
+**Cause.** `save_state` wrote the temporary file with `write_text()`, then
+reopened it **read-only** and fsynced that handle:
+
+    tmp.write_text(payload)
+    with tmp.open("rb") as fh:       # read-only handle
+        os.fsync(fh.fileno())        # fine on POSIX, EBADF on Windows
+
+`os.fsync` on POSIX works on any descriptor. On Windows it is `_commit()`, which
+requires a handle opened for writing and returns `EBADF` otherwise. Same class of
+failure as the earlier tzdata miss: a POSIX-permissive assumption that no test on
+Linux could see. All 439 tests passed because fsync-on-read-only succeeds here.
+
+**Fix.** One `_fsync(fh)` helper does every durable write, with the fsync on the
+open **write** handle before it closes, and `replace()` after the close (Windows
+cannot replace a file that still has a handle open). The helper also refuses a
+read-only handle outright, so the same mistake now fails identically on every
+platform instead of only in the field.
+
+**Consequence that had to be fixed with it.** The crash meant every run wrote its
+rows and then died *before* saving an offset. The day files were left non-empty
+with no state, so the "fixed" version would have restarted at offset 0 and
+duplicated every row it had already copied. `_resume_from_destination` now
+rebuilds the offset from the day files: the longest prefix of source records
+already present (matched on raw bytes, counted) is skipped, and the walk stops at
+the first record that is not there. A missing state file is therefore recoverable
+rather than destructive.
+
+**`--status` was misleading during the incident** and is fixed too. It printed
+`offset 0 bytes` for every source, which reads as "nothing was mirrored" while
+six day files held rows. It now warns explicitly when day files hold rows but no
+source has a saved offset — the state an interrupted run leaves.
+
+#### The `logs/*.csv` files in the report
+
+They are **not in this repository**. `git ls-tree -r f21330b` shows eight files
+and none is under `logs/`; `git log --all -- 'logs/*'` returns nothing; no commit
+on any branch has ever contained `logs/`. Nothing was committed and nothing needs
+removing from the repo.
+
+They are **not seed or backfill data** either. They are artifacts of the crashed
+runs, and they match the crash exactly. Replaying the shipped `f21330b` code
+against a realistic source with Windows fsync semantics, three attempts leave:
+
+    DST_2026-10-25.csv      3 rows   (the same row, three times)
+    RUNNER_2026-10-25.csv   3 rows
+    TRADES_2026-10-26.csv   3 rows
+    state file:             NEVER WRITTEN
+
+Each attempt writes its first row per source, dies in `save_state`, and re-reads
+from zero next time. That explains both the files and the `--status` reading of
+"0 bytes": the offsets were never persisted because persisting them was the thing
+that crashed. The exact mix of dates in the Handler's six files reflects which
+day each attempt reached first.
+
+**What to do with them.** Either is safe:
+
+* keep them — the fixed mirror reconciles against them and appends only what is
+  missing (verified end to end: nine files, nine rows, no duplicates);
+* delete `logs/*.csv` for a clean slate — the sources in `live/output/` are
+  append-only and complete, so the mirror rebuilds the day files from offset 0.
+
+The second is tidier, because the files left by the crash contain duplicated
+rows and the rebuild does not.
 
