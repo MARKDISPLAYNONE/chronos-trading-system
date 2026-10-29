@@ -500,6 +500,20 @@ tests pass.**
 - Startup banner reworded: it is a **capability notice** ("handlers armed for this
   run"), not a shutdown record; `CLEAN STOP` remains the only stop record.
 
+**Session 19:** the Handler is away for whole days and terminal scrollback
+truncates. **439 tests pass.**
+- `live/log_mirror.py` — a third, read-only process that copies the three live
+  CSVs into `logs/DST|RUNNER|TRADES_<NY date>.csv`, write-through with
+  `flush()`+`fsync()` per row, resumable from a byte offset, no dupes or gaps
+  across restarts. Never writes to `live/output/`; no verdict depends on it.
+- `live/snapshot_and_push.py` + `snapshot_and_push.bat` — at 00:20 NY, commits
+  and pushes the previous completed day to the feature branch. A failed push is
+  logged, exits non-zero, needs no repair, and is retried the next night.
+- TRADES files are grouped by `trading_date` (not the row clock) so a 23:45
+  window stays with its trading day; the snapshot stages every date so a
+  late-resolving trade is not orphaned.
+- The job refuses to run on `main`/`master`.
+
 ---
 
 ## 11. Phase 1 Pre-Flight — Questions and how each was resolved (Q1–Q12)
@@ -1755,4 +1769,88 @@ So the pair now reads as what it is: *the last stop was unclean* (an event), the
 *handlers are armed for this run* (a property). Two tests pin it: the banner is
 emitted once, contains "capability notice", and contains neither `clean_stop=True`
 nor `clean stop:`; and `CLEAN STOP` appears exactly once, at the stop.
+
+### 15.19 Getting a whole day's logs off the machine (mirror + nightly snapshot)
+
+The problem is not technical: the Handler is away for whole days, terminal
+scrollback truncates, and `live/output/` must not be read while a run is in
+progress. Two new pieces fix it without touching anything certification-critical.
+
+#### `live/log_mirror.py` — a third process, read-only, additive
+
+    live/output/dst_monitor.csv              ->  logs/DST_<NY date>.csv
+    live/output/runner_events.csv            ->  logs/RUNNER_<NY date>.csv
+    live/output/window_evaluations_audit.csv ->  logs/TRADES_<NY date>.csv
+
+It **never writes to `live/output/`**, takes no lock, and no verdict depends on
+it: deleting the process or its state file cannot alter a single row of the run.
+The mirror can only be wrong about its own copies, which is the whole safety
+argument for letting it run beside the runner.
+
+**It is a separate process, not a thread**, deliberately. A thread would put this
+file I/O — and any bug in it — inside the process that produces the evidence.
+
+* **Write-through.** Every row is appended, flushed and `fsync`ed as it arrives,
+  and the offset is saved immediately after. A row sitting in an OS buffer at
+  03:00 is a row lost to a power cut, which defeats the purpose.
+* **Resume.** `logs/.mirror_state.json` holds the byte offset and header per
+  source; a restart continues from there, no dupes, no gaps. Truncation resets to
+  zero rather than guessing.
+* **Byte-faithful.** Records are located by the CSV parser and copied as raw
+  bytes, so a quoted newline (a traceback in an event detail) survives and a
+  non-UTF-8 byte cannot shift every later offset.
+* **Mid-write safe.** A half-written row — including one whose quoted field is
+  still open — is held back until it is complete. This needed
+  `csv.reader(..., strict=True)`: the default silently returns a *truncated*
+  record, which would have been mirrored and then never re-read.
+
+One residual window, the same one the runner has: a crash between fsyncing the
+target and saving the state replays that single record. The state is written
+atomically (`tmp` + `replace`), and a normal stop or a `kill` loses nothing.
+
+**Which date a row belongs to.** `DST` and `RUNNER` use the row's own NY clock.
+`TRADES` is grouped by **`trading_date`**, not its timestamp: the 23:45 window
+ends at 00:15 the next morning, so routing by clock would split one trading day
+across two files. Grouped by trading date, `TRADES_<date>.csv` is exactly the
+rows `--certify <date>` read.
+
+#### `live/snapshot_and_push.py` — nightly commit and push
+
+Runs at **00:20 NY**, picks the **previous completed NY day** (always
+`today - 1`: at 00:20 that is yesterday, and at 23:00 it is *still* yesterday,
+because today is not over), stages `logs/`, commits `daily log snapshot <date>`,
+and pushes to the feature branch.
+
+* **Stages the day CSVs by name, every date** — not the directory. The job's own
+  status log sits beside them, and `git add logs/` would commit the record of the
+  commit into the commit. Every date is included because a trade resolving days
+  later (Q13) appends to an older day's file; staging only today's would leave
+  that row uncommitted for ever.
+* **Pushes never go to `main`/`master`**: a scheduled script is exactly the thing
+  that would eventually do it by accident. It refuses and says so.
+* **A failed push costs one night, not a repair.** Nothing raises; the failure is
+  written to `logs/SNAPSHOT_PUSH.log`, printed, and exits non-zero so Task
+  Scheduler shows a failed run. The commit stays local and the next night pushes
+  both. If the day's commit already exists, it is not repeated — only the push is
+  retried.
+
+Windows wrapper: **`snapshot_and_push.bat`** in the repository root. Register it
+once in Task Scheduler: daily at 00:20, time zone Eastern Time (New York), with
+"run as soon as possible after a missed start" so a sleeping machine still pushes
+the same night. The script picks the day for itself, so a late trigger is safe.
+
+#### Running it
+
+Three processes now, all independent:
+
+    1  python live/dry_run_runner.py      (the run)
+    2  python live/dst_monitor.py         (DST invariants)
+    3  python live/log_mirror.py          (the copy that leaves the machine)
+
+    python live/log_mirror.py --status    # what has been mirrored so far
+
+`--once` exists for a one-pass run; `--interval` controls the follow rate
+(default 15 s). If the mirror is not running, nothing breaks — it simply resumes
+from its last offset when it starts, so a forgotten process costs nothing but
+delay.
 

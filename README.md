@@ -33,9 +33,11 @@ docs/                       the 7-project-document set
 handover/SESSION-HANDOVER.md living project state (the "00" doc)
 introductory/               role prompts for the Handler/Senior Dev/Agent
 data/nas100_m1_history.csv  Phase 1 input: NAS100 M1, Jan-Oct 2026 (~13 MB)
+logs/                       mirrored day files, committed nightly (DST/RUNNER/TRADES_<date>.csv)
+snapshot_and_push.bat       Windows Task Scheduler wrapper for the nightly snapshot
 bot/
   src/                      engine: windows, candles, context, sweep, sizing
-  tests/                    404 unit tests (stdlib unittest)
+  tests/                    439 unit tests (stdlib unittest)
   historical_validation/
     validate_against_history.py   Phase 1 driver
     export_history_csv.py         MT5 export (Windows-only, Handler runs it)
@@ -45,6 +47,9 @@ bot/
     dry_run_runner.py           the dry-run loop — places NO orders
     dst_monitor.py              continuous DST invariant monitor (separate process)
     csv_emitter.py              append-only log writer (Phase 1 schema)
+    log_mirror.py               read-only tailer: live/output -> logs/<DAY>.csv
+                                (third process; never writes to live/output)
+    snapshot_and_push.py        nightly: commit + push the previous day's logs
     audit_triage.py             read-only log analysis: --certify, --digest,
                                 --outside-range, --self-check, --state,
                                 --illegal-reasons (--certify: PASS/FAIL/

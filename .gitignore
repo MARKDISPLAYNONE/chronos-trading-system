@@ -30,6 +30,13 @@ bot/historical_validation/output/*.sqlite
 bot/live/output/
 bot/live/**/__pycache__/
 
+# Phase 2 log mirror (bot/live/log_mirror.py): the mirrored day files under
+# logs/ ARE committed, but the mirror's own resume state and the snapshot job's
+# status log are machine-local, regenerated, and must never be.
+logs/.mirror_state.json
+logs/.mirror_state.tmp
+logs/*.log
+
 # Local virtualenvs / test caches
 .pytest_cache/
 .ruff_cache/
