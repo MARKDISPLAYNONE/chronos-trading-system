@@ -114,13 +114,92 @@ class TestFindingGit(ScheduledEnvCase):
         self.assertIn("PATH", message)                 # says what PATH was
         self.assertIn("CHRONOS_GIT", message)          # says how to fix it
         self.assertIn("--git", message)
-        # Every Windows install location is listed, not just "not found".
-        self.assertIn("Program Files", message)
+        # Whether the Windows locations could be checked is itself reported,
+        # rather than silently omitted on a box without those variables.
+        self.assertIn("Standard install locations", message)
+
+    def test_the_windows_install_locations_are_listed_with_variables_set(self):
+        """On the Handler's machine these are set, so these paths get tried."""
+        env = {"ProgramFiles": r"C:\Program Files",
+               "LOCALAPPDATA": r"C:\Users\admin\AppData\Local",
+               "USERPROFILE": r"C:\Users\admin"}
+        paths = snap.git_candidate_paths(env)
+        # Separator is the running platform's, so compare on the structure.
+        normalised = [p.replace(os.sep, "/") for p in paths]
+
+        # The three binaries a Git for Windows install actually contains.
+        self.assertIn("C:/Program Files/Git/cmd/git.exe", normalised)
+        self.assertIn("C:/Program Files/Git/mingw64/bin/git.exe", normalised)
+        self.assertIn("C:/Program Files/Git/bin/git.exe", normalised)
+        # And the per-user install.
+        self.assertIn(
+            "C:/Users/admin/AppData/Local/Programs/Git/cmd/git.exe", normalised)
+
+    def test_a_path_whose_variable_is_unset_is_skipped_not_guessed(self):
+        paths = snap.git_candidate_paths({"ProgramFiles": r"C:\Program Files"})
+        self.assertTrue(paths)
+        for path in paths:
+            self.assertNotIn("%", path)
 
     def test_an_explicit_path_that_does_not_exist_is_rejected_clearly(self):
         with self.assertRaises(snap.GitUnavailable) as caught:
             snap.find_git(explicit=str(self.root / "no-such-git"))
         self.assertIn("does not exist", str(caught.exception))
+
+
+class TestTheHandlersGitLayout(ScheduledEnvCase):
+    """`which git` reports `/mingw64/bin/git` — Git Bash's own copy.
+
+    Git Bash prepends its own directories, so that binary always wins the lookup
+    there regardless of what the machine PATH contains. A scheduled task has no
+    such prefixing, which is why the same command can work in the terminal and
+    fail on a timer. The fallback must therefore look inside the install layout,
+    not just at the name `git` on PATH.
+    """
+
+    def test_a_mingw64_only_install_is_found_with_an_empty_path(self):
+        root = self.root / "Program Files" / "Git"
+        (root / "mingw64" / "bin").mkdir(parents=True)
+        binary = root / "mingw64" / "bin" / "git.exe"
+        binary.write_text("#!/bin/sh\necho arena/x\n", encoding="utf-8")
+        binary.chmod(0o755)
+        self.assertFalse((root / "cmd").exists())     # as on the Handler's box
+
+        os.environ["ProgramFiles"] = str(self.root / "Program Files")
+        os.environ.pop("CHRONOS_GIT", None)
+        os.environ["PATH"] = ""
+
+        self.assertEqual(snap.find_git(refresh=True), str(binary))
+
+    def test_every_binary_a_git_for_windows_install_contains_is_tried(self):
+        env = {"ProgramFiles": str(self.root / "pf")}
+        paths = snap.git_candidate_paths(env)
+        names = {os.path.basename(os.path.dirname(p)) or p for p in paths}
+        joined = " ".join(paths)
+        self.assertIn("cmd", joined)
+        self.assertIn("mingw64", joined)              # what `which git` reported
+        self.assertIn("usr", joined)
+
+    def test_the_resolved_binary_is_actually_invoked(self):
+        """Resolution is worthless if the wrong thing still runs."""
+        root = self.root / "Program Files" / "Git"
+        (root / "mingw64" / "bin").mkdir(parents=True)
+        record = self.root / "calls.txt"
+        binary = root / "mingw64" / "bin" / "git.exe"
+        binary.write_text(
+            "#!/bin/sh\n"
+            f'echo "$@" >> "{record}"\n'
+            'if [ "$1" = "rev-parse" ]; then echo arena/test; fi\n' 
+            "exit 0\n",
+            encoding="utf-8")
+        binary.chmod(0o755)
+
+        os.environ["ProgramFiles"] = str(self.root / "Program Files")
+        os.environ.pop("CHRONOS_GIT", None)
+        os.environ["PATH"] = ""
+
+        self.assertEqual(snap.current_branch(self.repo), "arena/test")
+        self.assertIn("rev-parse", record.read_text(encoding="utf-8"))
 
 
 class TestFailureDiagnostics(ScheduledEnvCase):

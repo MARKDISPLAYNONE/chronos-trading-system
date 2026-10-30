@@ -574,6 +574,19 @@ fallback it forced was **duplicating rows**. **460 tests pass.**
 - `tests/test_scheduled_environment.py` simulates a stripped PATH — this bug
   class is now testable locally.
 
+**Session 24:** the Handler's `which git` -> `/mingw64/bin/git`, which **was not
+in the fallback list** from 15.23. **506 tests pass.**
+- Git for Windows has three `git.exe`s and Git Bash always resolves
+  `mingw64\bin`; the fallback only searched `cmd\` and `bin\`. Now all of
+  `cmd\`, `mingw64\bin\`, `bin\`, `usr\bin\` plus scoop/chocolatey shims.
+- `%VAR%` expansion used `os.path.expandvars`, which is Windows-only — so the
+  fallback was untestable off Windows. Now expanded explicitly, separators follow
+  the platform, and "PATH empty, only mingw64 present" is a test.
+- `python` resolved under Task Scheduler (the script logged), so only git is in
+  question; `cmd` is absent from the Handler's shell, hence `--doctor`.
+- Python 3.14: no removed/deprecated APIs in use; version now printed by
+  `--doctor`. Suite runs on 3.11 here, so 3.14 behaviour is unverified.
+
 ---
 
 ## 11. Phase 1 Pre-Flight — Questions and how each was resolved (Q1–Q12)
@@ -2289,4 +2302,64 @@ The general lesson, recorded because this is the second instance: **a green suit
 on Linux cannot see a Windows-only environment difference.** Both this and the
 fsync bug were "works here, fails on the Handler's machine". The counters are the
 guards in `live/durable.py` and the stripped-environment harness here.
+
+### 15.24 The Handler's environment, and the gap it exposed in the git fallback
+
+Evidence received from the machine (Git Bash, MINGW64):
+
+    $ which git     ->  /mingw64/bin/git
+    $ which python  ->  /c/Users/admin/AppData/Local/Python/pythoncore-3.14-64/python
+    $ cmd //c "where git"     ->  bash: cmd: command not found
+    $ cmd //c "where python"  ->  bash: cmd: command not found
+
+**Three findings, one of them a defect in 15.23.**
+
+1. **`/mingw64/bin/git` was not in the fallback list.** A Git for Windows install
+   contains three `git.exe` binaries — `cmd\git.exe`, `mingw64\bin\git.exe`,
+   `bin\git.exe` — and Git Bash prepends its own directories, so
+   `mingw64\bin\git.exe` *always* wins the lookup there regardless of what the
+   machine PATH holds. That is the asymmetry in one line: the terminal reports a
+   binary the scheduled task may not be able to reach. 15.23 searched only
+   `cmd\`, `bin\` and the per-user install, so on an install where `cmd\git.exe`
+   is absent it would still have failed. Now searches all three, plus `usr\bin`
+   and the scoop/chocolatey shim directories, across `%ProgramFiles%`,
+   `%ProgramW6432%`, `%ProgramFiles(x86)%`, `%LOCALAPPDATA%` and scoop.
+
+2. **`python` resolved, so the .bat's `python` line is not the problem.** The
+   script ran far enough to write its own log line, which means the interpreter
+   was found under Task Scheduler. Only git is in question.
+
+3. **`cmd` is not on the Handler's Git Bash PATH**, so `where git` is not
+   available to them. That is why `--doctor` matters: it answers the same
+   question from inside the scheduled context, where the answer is authoritative
+   anyway.
+
+**`%VAR%` expansion was also wrong.** `os.path.expandvars` only understands
+`%NAME%` when *running* on Windows, so the candidate list was both Windows-only
+and **untestable everywhere else** — an untestable fallback is precisely how the
+original PATH assumption survived. Now `expand_windows_vars()` expands `%NAME%`
+explicitly against any mapping, and separators follow the running platform, so
+the resolution the Handler's machine performs is the resolution the tests
+exercise. Verified: with `PATH` empty and only `mingw64\bin\git.exe` present,
+`find_git()` resolves it and `current_branch()` actually invokes it.
+
+**Also checked: Python 3.14.** The Handler now runs 3.14, while this sandbox runs
+3.11, so nothing here proves 3.14 behaviour. What can be checked statically was:
+no use of `utcnow`/`utcfromtimestamp`, `distutils`, `imp`, `SafeConfigParser` or
+any other API removed or deprecated since 3.12; `from __future__ import
+annotations` is in every live module, so the 3.10+ union syntax is not a runtime
+concern. The `\p` SyntaxWarning fixed in 15.22 matters more on 3.14 than it did
+on 3.11 — invalid escapes have been warnings since 3.12 and are scheduled to
+become errors. `--doctor` now prints the interpreter version, so a scheduled task
+using a different Python than the Handler's terminal is visible rather than
+guessed at.
+
+**What the Handler should run next**, as the scheduled task's argument:
+
+    --doctor
+
+It prints the interpreter and its version, the working directory, the repository,
+whether git is on PATH, where it resolved and by which rule, every install path
+searched with found/absent against each, the PATH entries, and the branch. Exit 0
+if git was found, 1 if not, so the task's own status shows the answer.
 

@@ -56,6 +56,7 @@ import argparse
 import datetime as dt
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -109,18 +110,92 @@ class GitUnavailable(RuntimeError):
     """
 
 
-#: Where Git for Windows puts `git.exe` when it was installed with "Use Git from
-#: Git Bash only" — the option that leaves it OFF the system PATH. In that
-#: configuration `git` works in an interactive Git Bash session (whose start-up
-#: prepends Git's own directories) and fails under Task Scheduler, which inherits
-#: only the machine PATH. That asymmetry is the single most common reason a
-#: scheduled git job works by hand and not on a timer.
-GIT_FALLBACK_CANDIDATES = (
-    r"C:\Program Files\Git\cmd\git.exe",
-    r"C:\Program Files (x86)\Git\cmd\git.exe",
-    r"C:\Program Files\Git\bin\git.exe",
-    r"%LOCALAPPDATA%\Programs\Git\cmd\git.exe",
+#: Where git.exe actually lives on Windows, per install flavour.
+#:
+#: The layout matters more than it looks. A Git for Windows install has **three**
+#: git.exe binaries, and which one resolves depends entirely on who is asking:
+#:
+#:   cmd\git.exe           what the installer puts on the system PATH
+#:   mingw64\bin\git.exe   what Git Bash resolves first (it prepends this dir)
+#:   bin\git.exe           the wrapper in the old layout
+#:
+#: An interactive Git Bash session always finds `mingw64\bin\git.exe` because it
+#: prepends its own directories — so `which git` there reports a path the machine
+#: PATH may never have contained. That is precisely the asymmetry that makes a
+#: scheduled job fail while the same command works in the terminal, and it is why
+#: the fallback searches the install layout rather than trusting one file name.
+GIT_INSTALL_ROOTS = (
+    r"%ProgramFiles%\Git",
+    r"%ProgramW6432%\Git",
+    r"%ProgramFiles(x86)%\Git",
+    r"%LOCALAPPDATA%\Programs\Git",
+    r"%USERPROFILE%\scoop\apps\git\current",
 )
+
+GIT_RELATIVE_BINARIES = (
+    r"cmd\git.exe",
+    r"mingw64\bin\git.exe",
+    r"bin\git.exe",
+    r"usr\bin\git.exe",
+)
+
+#: Package-manager shim directories, which contain a `git.exe` or a shim for one.
+GIT_SHIM_DIRECTORIES = (
+    r"%ProgramData%\chocolatey\bin",
+    r"%USERPROFILE%\scoop\shims",
+)
+
+
+def expand_windows_vars(raw: str, env: dict | None = None) -> str:
+    r"""Expand `%NAME%` against `env`, on any platform.
+
+    `os.path.expandvars` only understands `%NAME%` when *running* on Windows, so
+    relying on it makes this resolution both Windows-only and untestable
+    elsewhere — and an untestable fallback is how the original PATH assumption
+    shipped. Expanding explicitly means the behaviour that runs on the Handler's
+    machine is the behaviour the tests exercise.
+    """
+    lookup = os.environ if env is None else env
+
+    def substitute(match):
+        name = match.group(1)
+        return lookup.get(name, match.group(0))
+
+    return re.sub(r"%([^%]+)%", substitute, raw)
+
+
+def git_candidate_paths(env: dict | None = None) -> list[str]:
+    """Every absolute path worth trying, in order, with variables expanded."""
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        expanded = expand_windows_vars(raw, env)
+        if "%" in expanded:                   # variable was not set on this box
+            return
+        if os.sep != chr(92):                 # POSIX: our templates use backslashes
+            expanded = expanded.replace(chr(92), os.sep)
+        key = expanded.lower()
+        if key not in seen:
+            seen.add(key)
+            found.append(expanded)
+
+    # Joined with the running platform's separator. On Windows that is a
+    # backslash, which is what these paths are; on any other platform it makes
+    # the resolution testable with a fake install tree rather than leaving the
+    # fallback exercised only on the machine that has the problem.
+    sep = os.sep
+
+    def join(root: str, relative: str) -> str:
+        return f"{root.rstrip(chr(92)).rstrip('/')}{sep}{relative.replace(chr(92), sep)}"
+
+    for root in GIT_INSTALL_ROOTS:
+        for relative in GIT_RELATIVE_BINARIES:
+            add(join(root, relative))
+    for shim in GIT_SHIM_DIRECTORIES:
+        add(join(shim, "git.exe"))
+    return found
+
 
 #: Set this to point the job at a specific binary, for a machine with an unusual
 #: install. `--git` overrides it.
@@ -128,13 +203,6 @@ GIT_ENV_VAR = "CHRONOS_GIT"
 
 _GIT_BINARY: str | None = None
 _GIT_SEARCHED: list[str] = []
-
-
-def _candidate_paths() -> list[str]:
-    expanded = []
-    for raw in GIT_FALLBACK_CANDIDATES:
-        expanded.append(os.path.expandvars(raw))
-    return expanded
 
 
 def find_git(explicit: str | None = None, *, refresh: bool = False) -> str:
@@ -167,19 +235,26 @@ def find_git(explicit: str | None = None, *, refresh: bool = False) -> str:
         _GIT_BINARY, _GIT_SEARCHED = on_path, searched
         return on_path
 
-    for candidate in _candidate_paths():
+    for candidate in git_candidate_paths():
         searched.append(candidate)
         if pathlib.Path(candidate).exists():
             _GIT_BINARY, _GIT_SEARCHED = candidate, searched
             return candidate
 
     _GIT_SEARCHED = searched
-    raise GitUnavailable(
-        "could not find git. Looked in:\n"
-        + "\n".join(f"    {entry}" for entry in searched)
-        + f"\n  PATH was: {os.environ.get('PATH') or '(empty)'}"
-        + f"\n  Fix: pass --git <path to git.exe>, or set {GIT_ENV_VAR}."
-        + "\n  (A scheduled task gets the machine PATH, not Git Bash's.)")
+    windows_paths = git_candidate_paths()
+    lines = ["could not find git. Looked in:"]
+    lines += [f"    {entry}" for entry in searched]
+    if windows_paths:
+        lines += ["  Standard install locations:",
+                  *(f"    {entry}" for entry in windows_paths)]
+    else:
+        lines.append("  Standard install locations: not checked - no Windows "
+                     "install variable (ProgramFiles, LOCALAPPDATA, ...) is set")
+    lines.append(f"  PATH was: {os.environ.get('PATH') or '(empty)'}")
+    lines.append(f"  Fix: pass --git <path to git.exe>, or set {GIT_ENV_VAR}.")
+    lines.append("  (A scheduled task gets the machine PATH, not Git Bash's.)")
+    raise GitUnavailable("\n".join(lines))
 
 
 def set_git_binary(path: str | None) -> None:
@@ -473,6 +548,7 @@ def doctor(repo: pathlib.Path, logs_dir: pathlib.Path) -> int:
     """
     print("chronos snapshot doctor")
     print(f"  python        : {sys.executable}")
+    print(f"  python version: {sys.version.split()[0]}")
     print(f"  platform      : {sys.platform}")
     print(f"  working dir   : {os.getcwd()}")
     print(f"  repository    : {repo}" + ("" if repo.is_dir() else "  <-- MISSING"))
@@ -494,11 +570,22 @@ def doctor(repo: pathlib.Path, logs_dir: pathlib.Path) -> int:
         ok = False
 
     path = os.environ.get("PATH") or ""
-    print(f"  PATH entries  : {len(path.split(os.pathsep)) if path else 0}")
-    for entry in (path.split(os.pathsep)[:6] if path else []):
+    entries = path.split(os.pathsep) if path else []
+    print(f"  PATH entries  : {len(entries)}")
+    for entry in entries[:8]:
         print(f"      {entry}")
     if not path:
         print("      <-- PATH is empty")
+    elif len(entries) > 8:
+        print(f"      ... {len(entries) - 8} more")
+
+    # Every install location searched, with whether it is actually there. This
+    # is the line that turns "it failed" into "git is at X, add it to PATH" or
+    # "git is in none of these places, install it or pass --git".
+    print("  install paths :")
+    for candidate in git_candidate_paths():
+        mark = "found" if pathlib.Path(candidate).exists() else "     "
+        print(f"      [{mark}] {candidate}")
     if os.environ.get(GIT_ENV_VAR):
         print(f"  {GIT_ENV_VAR}   : {os.environ[GIT_ENV_VAR]}")
 
