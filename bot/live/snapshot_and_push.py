@@ -54,7 +54,9 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import time
@@ -98,12 +100,146 @@ def previous_completed_day(now: dt.datetime | None = None) -> dt.date:
     return ny_now(now).date() - dt.timedelta(days=1)
 
 
+class GitUnavailable(RuntimeError):
+    """`git` could not be executed at all — a fault, not a failed command.
+
+    Distinct from a git command that ran and exited non-zero: that is a result
+    the job already handles (retry, log, next night). This is the case where
+    there is no git to talk to, which no amount of retrying fixes.
+    """
+
+
+#: Where Git for Windows puts `git.exe` when it was installed with "Use Git from
+#: Git Bash only" — the option that leaves it OFF the system PATH. In that
+#: configuration `git` works in an interactive Git Bash session (whose start-up
+#: prepends Git's own directories) and fails under Task Scheduler, which inherits
+#: only the machine PATH. That asymmetry is the single most common reason a
+#: scheduled git job works by hand and not on a timer.
+GIT_FALLBACK_CANDIDATES = (
+    r"C:\Program Files\Git\cmd\git.exe",
+    r"C:\Program Files (x86)\Git\cmd\git.exe",
+    r"C:\Program Files\Git\bin\git.exe",
+    r"%LOCALAPPDATA%\Programs\Git\cmd\git.exe",
+)
+
+#: Set this to point the job at a specific binary, for a machine with an unusual
+#: install. `--git` overrides it.
+GIT_ENV_VAR = "CHRONOS_GIT"
+
+_GIT_BINARY: str | None = None
+_GIT_SEARCHED: list[str] = []
+
+
+def _candidate_paths() -> list[str]:
+    expanded = []
+    for raw in GIT_FALLBACK_CANDIDATES:
+        expanded.append(os.path.expandvars(raw))
+    return expanded
+
+
+def find_git(explicit: str | None = None, *, refresh: bool = False) -> str:
+    """Locate `git`, or fail with a message that names every place we looked.
+
+    Resolution order: explicit argument, then `$CHRONOS_GIT`, then PATH, then the
+    standard install locations. The last step is what makes this work under Task
+    Scheduler on a machine where git was never added to the system PATH.
+    """
+    global _GIT_BINARY, _GIT_SEARCHED
+    if explicit:
+        if not pathlib.Path(explicit).exists():
+            raise GitUnavailable(
+                f"{explicit!r} was given but does not exist")
+        return explicit
+    if _GIT_BINARY and not refresh:
+        return _GIT_BINARY
+
+    searched: list[str] = []
+    from_env = os.environ.get(GIT_ENV_VAR)
+    if from_env:
+        searched.append(f"${GIT_ENV_VAR}={from_env}")
+        if pathlib.Path(from_env).exists():
+            _GIT_BINARY, _GIT_SEARCHED = from_env, searched
+            return from_env
+
+    on_path = shutil.which("git")
+    searched.append(f"PATH -> {on_path or 'not found'}")
+    if on_path:
+        _GIT_BINARY, _GIT_SEARCHED = on_path, searched
+        return on_path
+
+    for candidate in _candidate_paths():
+        searched.append(candidate)
+        if pathlib.Path(candidate).exists():
+            _GIT_BINARY, _GIT_SEARCHED = candidate, searched
+            return candidate
+
+    _GIT_SEARCHED = searched
+    raise GitUnavailable(
+        "could not find git. Looked in:\n"
+        + "\n".join(f"    {entry}" for entry in searched)
+        + f"\n  PATH was: {os.environ.get('PATH') or '(empty)'}"
+        + f"\n  Fix: pass --git <path to git.exe>, or set {GIT_ENV_VAR}."
+        + "\n  (A scheduled task gets the machine PATH, not Git Bash's.)")
+
+
+def set_git_binary(path: str | None) -> None:
+    """Pin the binary for tests and for `--git`. `None` re-detects."""
+    global _GIT_BINARY, _GIT_SEARCHED
+    _GIT_BINARY = path
+    _GIT_SEARCHED = []
+
+
+def describe_failure(exc: BaseException, *, operation: str,
+                     repo: pathlib.Path) -> str:
+    """Everything needed to diagnose this without a traceback.
+
+    A scheduled task has no one watching a console, so the log line has to carry
+    the context a traceback would: what was attempted, on what, from where, and
+    with what environment. `FileNotFoundError: [WinError 2]` on its own is the
+    single least useful message this job can produce — it cannot distinguish a
+    missing executable from a missing working directory, because on Windows both
+    say exactly that.
+    """
+    lines = [f"{operation}: {type(exc).__name__}: {exc}"]
+    filename = getattr(exc, "filename", None)
+    winerror = getattr(exc, "winerror", None)
+    if filename:
+        lines.append(f"  involved path : {filename}")
+    if winerror is not None:
+        lines.append(f"  winerror      : {winerror}")
+    lines.append(f"  repository    : {repo}"
+                 + ("" if repo.is_dir() else "   (does not exist)"))
+    binary = _GIT_BINARY or "(none resolved)"
+    lines.append(f"  git binary    : {binary}"
+                 + ("" if pathlib.Path(binary).exists() or binary == "(none resolved)"
+                    else "   (does not exist)"))
+    if _GIT_SEARCHED:
+        lines.append(f"  searched      : {'; '.join(_GIT_SEARCHED)}")
+    return "\n".join(lines)
+
+
 def _run(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess:
     """Run one git command. Never raises for a non-zero exit — the caller reads it."""
-    return subprocess.run(
-        ["git", *args], cwd=str(repo), capture_output=True, text=True,
-        timeout=GIT_TIMEOUT_SECONDS, check=False,
-    )
+    global _GIT_SEARCHED
+    operation = f"git {' '.join(args)}"
+    # Check the working directory first: it is a local, unambiguous fault, and
+    # reporting "could not find git" when the real problem is a bad repo path
+    # would send someone looking in the wrong place.
+    if not repo.is_dir():
+        raise GitUnavailable(describe_failure(
+            FileNotFoundError(2, "the repository directory does not exist"),
+            operation=operation, repo=repo))
+    binary = find_git()
+    try:
+        return subprocess.run(
+            [binary, *args], cwd=str(repo), capture_output=True, text=True,
+            timeout=GIT_TIMEOUT_SECONDS, check=False,
+        )
+    except OSError as exc:
+        # Includes the FileNotFoundError that started this: whatever its cause,
+        # the log now names the binary, the working directory and the search.
+        raise GitUnavailable(
+            describe_failure(exc, operation=operation, repo=repo)) from exc
 
 
 #: Git failures that mean "try again in a moment", not "this will never work".
@@ -326,6 +462,54 @@ def snapshot(day: dt.date, *, repo: pathlib.Path = DEFAULT_REPO,
     return result
 
 
+def doctor(repo: pathlib.Path, logs_dir: pathlib.Path) -> int:
+    """Print what this job can and cannot see, from the environment it is in.
+
+    Written for one specific question: *why does this work when I run it and not
+    from Task Scheduler?* Running the task with `--doctor` answers it in the
+    scheduled context itself, which is the only context that matters — a
+    scheduled task inherits the machine PATH, not the one a Git Bash session
+    builds for itself, and nothing on the interactive side can reveal that.
+    """
+    print("chronos snapshot doctor")
+    print(f"  python        : {sys.executable}")
+    print(f"  platform      : {sys.platform}")
+    print(f"  working dir   : {os.getcwd()}")
+    print(f"  repository    : {repo}" + ("" if repo.is_dir() else "  <-- MISSING"))
+    print(f"  logs dir      : {logs_dir}"
+          + ("" if logs_dir.is_dir() else "  <-- MISSING (no day files yet?)"))
+
+    on_path = shutil.which("git")
+    print(f"  git on PATH   : {on_path or '<-- NOT FOUND'}")
+    try:
+        # `--git` pins a binary; re-detecting would ignore the answer the
+        # operator just gave.
+        binary = find_git() if _GIT_BINARY else find_git(refresh=True)
+        print(f"  git resolved  : {binary}")
+        if _GIT_SEARCHED:
+            print(f"  via           : {'; '.join(_GIT_SEARCHED)}")
+        ok = True
+    except GitUnavailable as exc:
+        print(f"  git resolved  : NO -- {exc}")
+        ok = False
+
+    path = os.environ.get("PATH") or ""
+    print(f"  PATH entries  : {len(path.split(os.pathsep)) if path else 0}")
+    for entry in (path.split(os.pathsep)[:6] if path else []):
+        print(f"      {entry}")
+    if not path:
+        print("      <-- PATH is empty")
+    if os.environ.get(GIT_ENV_VAR):
+        print(f"  {GIT_ENV_VAR}   : {os.environ[GIT_ENV_VAR]}")
+
+    if ok and repo.is_dir():
+        branch = current_branch(repo)
+        print(f"  branch        : {branch}")
+        if branch in FORBIDDEN_BRANCHES:
+            print("      <-- the job will refuse to push from this branch")
+    return 0 if ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Commit and push the previous completed NY day's mirrored logs.")
@@ -338,7 +522,19 @@ def main(argv: list[str] | None = None) -> int:
                     help="report what would happen and change nothing")
     ap.add_argument("--now", default=None, metavar="ISO",
                     help="override the clock (naive = NY wall clock)")
+    ap.add_argument("--git", default=None, metavar="PATH",
+                    help="path to git.exe, for a machine where git is not on PATH")
+    ap.add_argument("--doctor", action="store_true",
+                    help="print what this job can see (git, PATH, repo) and exit; "
+                         "run it as the scheduled task to diagnose PATH problems")
     args = ap.parse_args(argv)
+
+    if args.git:
+        set_git_binary(args.git)
+    repo = pathlib.Path(args.repo)
+    logs_dir = pathlib.Path(args.logs_dir) if args.logs_dir else repo / "logs"
+    if args.doctor:
+        return doctor(repo, logs_dir)
 
     if args.date:
         try:
@@ -357,14 +553,18 @@ def main(argv: list[str] | None = None) -> int:
         day = previous_completed_day(stamp)
 
     try:
-        result = snapshot(day, repo=pathlib.Path(args.repo),
-                          logs_dir=pathlib.Path(args.logs_dir) if args.logs_dir else None,
+        result = snapshot(day, repo=repo, logs_dir=logs_dir,
                           push=not args.no_push, dry_run=args.dry_run)
-    except Exception as exc:                          # never escape a scheduled job
-        message = f"FAILED with an unexpected error: {type(exc).__name__}: {exc}"
+    except GitUnavailable as exc:                     # a fault, with context
+        message = f"FAILED: {exc}"
         print(message, file=sys.stderr)
-        log_line(pathlib.Path(args.logs_dir) if args.logs_dir
-                 else pathlib.Path(args.repo) / "logs", message)
+        log_line(logs_dir, message)
+        return 1
+    except Exception as exc:                          # never escape a scheduled job
+        message = describe_failure(exc, operation="the snapshot run",
+                                   repo=repo)
+        print(message, file=sys.stderr)
+        log_line(logs_dir, message)
         return 1
     return 0 if result.ok else 1
 

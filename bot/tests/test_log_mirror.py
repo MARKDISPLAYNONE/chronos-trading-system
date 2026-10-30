@@ -766,6 +766,65 @@ class TestStateRelocation(unittest.TestCase):
         self.assertEqual(json.loads(target.read_text())["sources"]
                          ["dst_monitor.csv"]["offset"], 99)
 
+    def test_the_handlers_observed_shape_is_detected(self):
+        """The exact report: OneDrive set, the other two unset, no "OneDrive"
+        anywhere in the path.
+
+        This is what made the first version say "no sync client detected" while
+        `$OneDrive` was plainly set. The environment read was never wrong — the
+        predicate required the root to be a string prefix of the path, and
+        required the literal substring as a backstop. Both miss this shape, and
+        the miss is silent, which is why it survived to a live machine.
+        """
+        os.environ["OneDrive"] = r"C:\Users\admin\OneDrive"
+        for key in ("OneDriveConsumer", "OneDriveCommercial"):
+            os.environ.pop(key, None)
+        project = (self.root / "Desktop" / "projects" / "PENDING PROJECTS"
+                   / "Project Chronos" / "logs")
+        project.mkdir(parents=True)
+
+        found = log_mirror.detect_sync_client(project)
+
+        self.assertIsNotNone(found, "a configured OneDrive must be detected")
+        self.assertEqual(found.label, "OneDrive")
+        self.assertEqual(found.how, log_mirror.SYNC_CONFIGURED)
+        self.assertNotIn("onedrive", str(project.resolve()).lower())   # the shape
+
+        path, why = log_mirror.resolve_state_path(project)
+        self.assertNotEqual(path, project / ".mirror_state.json")
+        self.assertNotIn("PENDING PROJECTS", str(path))
+        self.assertIn("not provably outside", why)
+
+    def test_a_near_miss_directory_name_does_not_count_as_containment(self):
+        """`OneDriveBackup` must not be mistaken for `OneDrive`."""
+        os.environ["OneDrive"] = str(self.root / "OneDrive")
+        sibling = self.root / "OneDriveBackup" / "logs"
+        sibling.mkdir(parents=True)
+        found = log_mirror.detect_sync_client(sibling)
+        # Not "contained": the component-wise test is what says so. (The path
+        # marker still catches the word, which is the right answer for a
+        # different reason — either way it is not provably outside.)
+        self.assertIsNotNone(found)
+        self.assertNotEqual(found.how, log_mirror.SYNC_CONTAINED)
+
+    def test_a_path_genuinely_inside_the_root_is_reported_as_contained(self):
+        os.environ["OneDrive"] = str(self.root / "OneDrive")
+        inside = self.root / "OneDrive" / "Desktop" / "work" / "logs"
+        inside.mkdir(parents=True)
+        found = log_mirror.detect_sync_client(inside)
+        self.assertEqual(found.how, log_mirror.SYNC_CONTAINED)
+        self.assertIn("contains", found.detail)
+
+    def test_status_says_what_the_detection_compared(self):
+        """The Handler could not tell why detection had failed; it can now."""
+        os.environ["OneDrive"] = r"C:\Users\admin\OneDrive"
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            log_mirror.main(["--logs-dir", str(self.plain), "--status"])
+        text = out.getvalue()
+        self.assertIn("sync client:", text)
+        self.assertIn("OneDrive", text)
+        self.assertIn(log_mirror.SYNC_CONFIGURED, text)
+
     def test_the_chosen_path_is_printed_by_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             logs = pathlib.Path(tmp) / "logs"

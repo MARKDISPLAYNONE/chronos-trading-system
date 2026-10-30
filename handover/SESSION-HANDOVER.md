@@ -558,6 +558,22 @@ fallback it forced was **duplicating rows**. **460 tests pass.**
 - `\p` SyntaxWarning fixed (raw docstring), with a test that imports under
   `-W error::SyntaxWarning`.
 
+**Session 23:** two Windows-environment failures. **501 tests pass.**
+- `--status` said "no sync client detected" with `$OneDrive` set: the env read
+  was fine, the *predicate* required the root to be a string prefix of the path.
+  Now three outcomes (contained / by path / configured), component-wise
+  comparison on `realpath`, and relocation in all three — the state file is
+  disposable, the crash is not. `--status` shows what was compared.
+- `FileNotFoundError: [WinError 2]` on the first scheduled run: could **not**
+  confirm the PATH hypothesis (Windows gives the same text for a missing
+  executable and a missing cwd, with no filename). Both causes now covered:
+  `find_git()` searches PATH then the standard Git install locations, cwd is
+  checked and named, and every failure prints the operation, binary, cwd, PATH.
+- `--doctor` diagnoses it from the scheduled context; `.bat` passes arguments
+  through.
+- `tests/test_scheduled_environment.py` simulates a stripped PATH — this bug
+  class is now testable locally.
+
 ---
 
 ## 11. Phase 1 Pre-Flight — Questions and how each was resolved (Q1–Q12)
@@ -2155,4 +2171,122 @@ part of the Handler's operational picture (`--state`, `inspect_state`). The retr
 addresses the transient case; if the lock ever becomes persistent, the better fix
 is to exclude `bot/live/output/` from OneDrive in the client — a GUI action on
 the Handler's side, and the one I would recommend.
+
+### 15.23 Two Windows-environment failures: sync detection, and git under Task Scheduler
+
+#### 1. "no sync client detected" with `$OneDrive` plainly set
+
+**The environment read was never wrong.** `os.environ["OneDrive"]` returns
+`C:\Users\admin\OneDrive` correctly, and on Windows `os.environ` is already
+case-insensitive. The bug was in the *predicate*, which required one of:
+
+    OneDrive root is a string prefix of the resolved path      -> no
+    the literal text "OneDrive" appears in the path            -> no
+
+The project is at `C:\Users\admin\Desktop\projects\...` and the OneDrive
+root is `C:\Users\admin\OneDrive`; neither test can hold. Reproduced here:
+
+    env OneDrive : C:\Users\admin\OneDrive
+    hint         : None
+    resolve      : (...\logs\.mirror_state.json, 'next to the day files
+                   (no sync client detected)')
+
+The conflation is the defect: *a client is installed on this machine* and *this
+folder is provably inside it* are different facts, and the code reported the
+absence of proof as the absence of a client — silently. That silence is why it
+survived to a live machine.
+
+**Fixed by splitting the answer into three, and saying which you got:**
+
+| `how` | meaning |
+|---|---|
+| `contained` | the resolved path is provably inside the client's root |
+| `by path` | no variable says so, but the path names a known client |
+| `configured` | the client exists; this folder cannot be shown to be inside it |
+
+Comparison is now **component-wise** via `os.path.commonpath` on `realpath`, so
+`OneDrive` no longer matches `OneDriveBackup`, and a Desktop redirected by Known
+Folder Move is seen where it actually lives rather than where its name suggests.
+
+**Relocation happens in all three cases, deliberately.** The trade is asymmetric:
+the mirror's state file is machine-local, regenerable and gitignored, so parking
+it in `%LOCALAPPDATA%` costs nothing; leaving it in a synced tree costs the crash
+this project has hit twice. `--state` still overrides. The reason is printed on
+every start, and `--status` now shows what was compared:
+
+    sync client: OneDrive [configured] - OneDrive is configured
+      (C:\Users\admin\OneDrive) but <path> is not inside it
+
+**For the Handler:** this shape is evidence the project folder may *not* be
+inside `C:\Users\admin\OneDrive` at all — two different roots. `--status`
+will now say definitively. Either way the tool is correct: if the folder is
+genuinely outside OneDrive, the state file is relocated slightly unnecessarily,
+which is harmless.
+
+#### 2. `FileNotFoundError: [WinError 2]` from the first scheduled run
+
+**I could not confirm the PATH hypothesis from the message, and did not assume
+it.** On Windows a missing *executable* and a missing *working directory* both
+produce exactly `[WinError 2] The system cannot find the file specified`, with no
+filename attached — unlike POSIX, where both carry it. So the log line is
+genuinely ambiguous between two causes.
+
+What is certain: `snapshot_and_push.py` invoked `git` as a bare subprocess name
+and let `OSError` escape into the catch-all, which logged only the exception
+type. That is consistent with both causes and diagnostic of neither.
+
+**Both causes are now covered:**
+
+* `find_git()` resolves in order: `--git`, `$CHRONOS_GIT`, PATH, then the standard
+  Git for Windows locations (`C:\Program Files\Git\cmd\git.exe`, …). That last
+  step fixes the failure whether or not the hypothesis is right — "Use Git from
+  Git Bash only" leaves `git.exe` off the machine PATH, and a scheduled task sees
+  only the machine PATH, which is exactly the asymmetry reported.
+* the working directory is checked *before* git is looked for, and named if it is
+  missing.
+* any `OSError` becomes a `GitUnavailable` carrying the operation, the binary,
+  the cwd and its existence, `winerror`, the search list and the PATH.
+
+Before:
+
+    FAILED with an unexpected error: FileNotFoundError: [WinError 2] The system cannot find the file specified
+
+After:
+
+    FAILED: git rev-parse --abbrev-ref HEAD: FileNotFoundError: [Errno 2] the repository directory does not exist
+      repository    : /tmp/nonexistent-repo-test   (does not exist)
+      git binary    : (none resolved)
+
+#### 3. `--doctor`: diagnose it from the scheduled context
+
+    python live/snapshot_and_push.py --doctor
+    snapshot_and_push.bat --doctor          (arguments are passed through)
+
+Prints the interpreter, working directory, repository, logs directory, whether
+git is on PATH, where it resolved, how, the PATH entries, and the branch. Run as
+**the scheduled task** — that context is the only one that can answer "why does
+this work by hand and not on a timer". On a machine with git off the PATH:
+
+    git on PATH   : <-- NOT FOUND
+    git resolved  : NO -- could not find git. Looked in:
+      PATH -> not found
+      C:\Program Files\Git\cmd\git.exe
+      ...
+    PATH was: (empty)
+    Fix: pass --git <path to git.exe>, or set CHRONOS_GIT.
+
+Exit 0 when git is found, 1 when it is not, so a temporary task set to
+`--doctor` shows the answer as a pass/fail in Task Scheduler itself.
+
+#### 4. Testing this class without a scheduled run
+
+`tests/test_scheduled_environment.py` builds the hostile environment on purpose:
+`PATH` set but empty, no override, and a fake `git` at an absolute path. It runs
+the real `main()`, not a helper, because the entry point is what a schedule
+calls. Twelve tests; seven of the new ones fail against the pre-fix code.
+
+The general lesson, recorded because this is the second instance: **a green suite
+on Linux cannot see a Windows-only environment difference.** Both this and the
+fsync bug were "works here, fails on the Handler's machine". The counters are the
+guards in `live/durable.py` and the stripped-environment harness here.
 

@@ -37,7 +37,7 @@ logs/                       mirrored day files, committed nightly (DST/RUNNER/TR
 snapshot_and_push.bat       Windows Task Scheduler wrapper for the nightly snapshot
 bot/
   src/                      engine: windows, candles, context, sweep, sizing
-  tests/                    485 unit tests (stdlib unittest)
+  tests/                    501 unit tests (stdlib unittest)
   historical_validation/
     validate_against_history.py   Phase 1 driver
     export_history_csv.py         MT5 export (Windows-only, Handler runs it)
@@ -52,6 +52,7 @@ bot/
     log_mirror.py               read-only tailer: live/output -> logs/<DAY>.csv
                                 (third process; never writes to live/output)
     snapshot_and_push.py        nightly: commit + push the previous day's logs
+                                (--doctor reports what a scheduled task can see)
     audit_triage.py             read-only log analysis: --certify, --digest,
                                 --outside-range, --self-check, --state,
                                 --illegal-reasons (--certify: PASS/FAIL/

@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+from dataclasses import dataclass
 import io
 import json
 import os
@@ -193,36 +194,119 @@ from live.durable import (                       # noqa: E402
 )
 
 
-def sync_client_hint(path: pathlib.Path) -> str | None:
-    r"""Name the folder-sync client that is probably locking files here, if any.
+#: Environment variables a folder-sync client publishes for its own root.
+#:
+#: Several names map to one client because OneDrive sets different ones for a
+#: personal, work and "the" account, and which are present varies by install.
+SYNC_CLIENT_ENV = {
+    "OneDrive": "OneDrive",
+    "OneDriveConsumer": "OneDrive",
+    "OneDriveCommercial": "OneDrive",
+    "Dropbox": "Dropbox",
+    "MEGASYNC": "MEGA",
+}
 
-    A sync client watches a folder and opens new and changed files the moment
-    they appear — which is exactly when this module renames its state file. On
-    Windows that produces a transient `Access is denied` on the rename.
+#: Substrings that betray a synced path when no variable says so.
+SYNC_PATH_MARKERS = ("onedrive", "dropbox", "googledrive", "google drive", "icloud")
 
-    The Handler's project lives under `Desktop\projects\...`, and on a Windows
-    machine with OneDrive, `Desktop` is very often redirected into `OneDrive\`.
-    Detected by environment variable first (the client's own root, reliable) and
-    by path if the variables are absent (a path copied from a synced folder).
+#: How strongly a folder was tied to a sync client.
+SYNC_CONTAINED = "contained"      # resolved path is provably inside the root
+SYNC_BY_PATH = "by path"          # the path itself names a known client
+SYNC_CONFIGURED = "configured"    # the client exists, containment unprovable
 
-    The docstring is raw because `Desktop\projects` would otherwise be read as
-    an escape sequence: `\p` is invalid and Python 3.12 raises a SyntaxWarning
-    for it on every import, and will make it an error later.
+
+def _resolve_through_links(path: pathlib.Path) -> pathlib.Path:
+    """`realpath`, so a redirected Desktop is seen where it actually lives.
+
+    Known Folder Move can leave `C:\\Users\\<user>\\Desktop` as a junction into
+    `OneDrive\\Desktop`. Comparisons on the literal path would then miss a folder
+    that is plainly synced, so resolve first — `realpath` follows junctions on
+    Windows from Python 3.8.
     """
-    roots = []
-    for name in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial",
-                 "Dropbox", "MEGASYNC"):
-        value = os.environ.get(name)
-        if value:
-            roots.append(("OneDrive" if "OneDrive" in name else name, value))
-    resolved = str(path.resolve()).lower()
-    for label, root in roots:
-        if root and root.lower() in resolved:
-            return f"{label} ({root})"
-    for label in ("onedrive", "dropbox", "google drive", "icloud"):
-        if label in resolved:
-            return f"{label.title()} (path)"
+    try:
+        return pathlib.Path(os.path.realpath(path))
+    except OSError:                                     # pragma: no cover
+        return path
+
+
+def _is_within(path: pathlib.Path, root: pathlib.Path) -> bool:
+    """True when `path` is `root` or below it, compared component-wise.
+
+    Component-wise, not by string prefix: `C:\\Users\\admin\\OneDrive` must not
+    match `C:\\Users\\admin\\OneDriveBackup`, which a `startswith` would.
+    """
+    try:
+        left = os.path.normcase(os.path.abspath(str(path)))
+        right = os.path.normcase(os.path.abspath(str(root)))
+        if not right.strip(os.sep):
+            return False
+        return os.path.commonpath([left, right]) == right
+    except (ValueError, OSError):        # different drives, or a bogus root
+        return False
+
+
+@dataclass
+class SyncClient:
+    """What was detected, and how confident the detection is."""
+
+    label: str
+    root: str | None
+    how: str
+    detail: str
+
+
+def detect_sync_client(path: pathlib.Path) -> SyncClient | None:
+    """Identify the folder-sync client that may be racing this path, if any.
+
+    **Why this is not a one-line containment test.** The first version checked
+    whether the client's root was a string prefix of the resolved path, and fell
+    back to looking for the literal text "OneDrive" in the path. On the Handler's
+    machine `OneDrive` is set to `C:\\Users\\admin\\OneDrive` while the project
+    sits under `C:\\Users\\admin\\Desktop\\...`, so both tests failed and the
+    tool reported "no sync client detected" with the variable plainly present.
+    The environment read was never the problem — the predicate was: it conflated
+    *a client is installed on this machine* with *this folder is provably inside
+    it*, and reported the absence of proof as the absence of a client.
+
+    So there are three answers, not two, and the caller is told which it got.
+    Relocation happens for all three, deliberately — see `resolve_state_path`.
+    """
+    resolved = _resolve_through_links(path)
+    configured: tuple[str, str] | None = None
+
+    for name, label in SYNC_CLIENT_ENV.items():
+        root = os.environ.get(name)
+        if not root:
+            continue
+        root_path = _resolve_through_links(pathlib.Path(root))
+        if _is_within(resolved, root_path):
+            return SyncClient(
+                label, root, SYNC_CONTAINED,
+                f"{name}={root} contains {resolved}")
+        if configured is None:
+            configured = (label, root)
+
+    lowered = str(resolved).lower()
+    for marker in SYNC_PATH_MARKERS:
+        if marker in lowered:
+            return SyncClient(
+                marker.title(), None, SYNC_BY_PATH,
+                f"the path itself contains {marker!r}")
+
+    if configured is not None:
+        label, root = configured
+        return SyncClient(
+            label, root, SYNC_CONFIGURED,
+            f"{label} is configured ({root}) but {resolved} is not inside it")
     return None
+
+
+def sync_client_hint(path: pathlib.Path) -> str | None:
+    """One line naming the suspect client, or None. Thin wrapper for callers."""
+    found = detect_sync_client(path)
+    if found is None:
+        return None
+    return f"{found.label} ({found.root})" if found.root else f"{found.label} (path)"
 
 
 def save_state(path: pathlib.Path, state: dict, *,
@@ -621,28 +705,51 @@ def resolve_state_path(logs_dir: pathlib.Path, explicit: str | None = None
                        ) -> tuple[pathlib.Path, str]:
     """Where the state file should live, and why. `--state` always wins.
 
-    Returns `(path, reason)`. The reason is logged either way: a tool that
-    silently relocates its own state is a tool nobody can find the state of.
+    Returns `(path, reason)`. The reason is printed on every start and by
+    `--status`: a tool that silently relocates its own state is a tool nobody can
+    find the state of.
+
+    **Relocation happens whenever a sync client is present at all**, including
+    when containment cannot be proven. That is the deliberately conservative
+    direction, and it is a cost trade, not a guess:
+
+    * the state file is machine-local, regenerable and gitignored, so having it
+      in `%LOCALAPPDATA%` instead of `logs/` costs nothing;
+    * having it inside a synced tree costs the crash this project has already
+      hit twice — a rename over a file the sync client has open.
+
+    The alternative — insisting on proof — is what produced "no sync client
+    detected" on a machine whose `OneDrive` variable was set.
     """
     legacy = logs_dir / ".mirror_state.json"
     if explicit:
         return pathlib.Path(explicit), "given with --state"
-    hint = sync_client_hint(logs_dir)
-    if not hint:
-        return legacy, "next to the day files (no sync client detected)"
+
+    found = detect_sync_client(logs_dir)
+    if found is None:
+        return legacy, "next to the day files (no sync client configured)"
+
     safe = out_of_sync_state_path()
+    adopted = ""
     if legacy.exists() and not safe.exists():
         # Adopt the old file once, rather than starting over and re-reconciling
         # through the day files. Same offsets, better address.
         try:
             safe.parent.mkdir(parents=True, exist_ok=True)
             safe.write_bytes(legacy.read_bytes())
-            adopted = f" (adopted the existing {legacy.name})"
+            adopted = f"; adopted the existing {legacy.name}"
         except OSError as exc:
-            adopted = f" (could not adopt the old file: {_short_reason(exc)})"
+            adopted = f"; could not adopt the old file ({_short_reason(exc)})"
+
+    if found.how == SYNC_CONTAINED:
+        why = f"moved out of {found.label} ({found.root})"
+    elif found.how == SYNC_BY_PATH:
+        why = f"moved out of a path that names {found.label}"
     else:
-        adopted = ""
-    return safe, f"moved out of {hint}{adopted}"
+        why = (f"moved out of a possible {found.label} sync folder "
+               f"({found.root} is configured but this folder is not provably "
+               f"outside it)")
+    return safe, why + adopted
 
 
 def describe_state(state_path: pathlib.Path, logs_dir: pathlib.Path) -> str:
@@ -703,6 +810,12 @@ def main(argv: list[str] | None = None) -> int:
     state_path, why = resolve_state_path(logs_dir, args.state)
     if args.status:
         print(f"state file: {state_path}\n  {why}")
+        found = detect_sync_client(logs_dir)
+        if found is None:
+            print("sync client: none configured (no client environment "
+                  "variable set, and the path names no known client)")
+        else:
+            print(f"sync client: {found.label} [{found.how}] - {found.detail}")
         print(describe_state(state_path, logs_dir))
         return 0
 
