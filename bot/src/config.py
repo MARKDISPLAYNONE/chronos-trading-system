@@ -90,10 +90,34 @@ SPOT_CHECK_TARGET = 24
 # ---------------------------------------------------------------------------
 # Phase 2 — live feed (docs/07-PHASE-PLAN.md Phase 2)
 # ---------------------------------------------------------------------------
-#: How much M1 history to request from the terminal per poll. Must comfortably
-#: cover the longest single window evaluation (30 minutes of A+B) plus the bars
-#: needed to resolve an open trade, so 3,000 minutes (~2 days) is generous.
-LIVE_HISTORY_BARS = 3000
+#: How much M1 history to request from the terminal per poll.
+#:
+#: Two different requirements, and the larger one wins:
+#:
+#: 1. **Evaluation.** The longest single window is 30 minutes of A+B, plus the
+#:    bars needed to resolve an open trade. A couple of thousand minutes is ample.
+#: 2. **The startup invariant gate.** Two of its four checks are about the weekly
+#:    boundaries — "the week ends at 16:59 Friday" and "it starts at 18:00
+#:    Sunday" — and they can only be judged if the sample contains the most recent
+#:    such boundary. The worst case is a restart late on a Friday, which needs the
+#:    *previous* Friday's close: 6 days 23 hours back, and across a session that
+#:    never trades at weekends that is
+#:
+#:        Fri 00:00-16:00   17 h      Sun 18:00-24:00    6 h
+#:        Thu               23 h      Sat                0 h
+#:        Wed               23 h      Fri 00:00-16:59   17 h
+#:        Tue               23 h      ------------------------
+#:        Mon               23 h      total            132 h = 7,920 bars
+#:
+#:    9,000 gives that ~14% headroom. 3,000 — the previous value — reached back
+#:    roughly two trading days, so on every weekday except Friday **no Friday was
+#:    in the window at all** and the check silently skipped itself. It looked like
+#:    a pass on every restart that did not happen to be on a Friday.
+#:
+#: The gate no longer crashes when it cannot judge a boundary (it reports
+#: `not_evaluable`), so this value is not load-bearing for correctness — it is
+#: what makes the check actually run rather than report that it could not.
+LIVE_HISTORY_BARS = 9000
 
 #: Safety margin before a bar counts as closed. A bar stamped T covers
 #: [T, T+60s); we only accept it once `T + 60 + margin <= now`. The margin

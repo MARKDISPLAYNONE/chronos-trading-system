@@ -108,6 +108,43 @@ def windows_for_day(day: dt.date) -> list[Window]:
     return [Window(day, h) for h in WINDOW_HOURS]
 
 
+#: When the week stops and starts, in New York wall clock. These are the two
+#: instants the boundary invariants are about, and they are defined here rather
+#: than inline so a caller can reason about *when a boundary was due* without
+#: re-deriving the session.
+FRIDAY_CLOSE = dt.time(16, 59)
+SUNDAY_OPEN = dt.time(18, 0)
+
+
+def most_recent_friday_close(now: dt.datetime) -> dt.datetime:
+    """The latest Friday 16:59 that has already happened, at or before `now`.
+
+    `now` is naive New York wall clock, matching the rest of this module.
+
+    A Friday still in progress does **not** count: at 06:00 on a Friday the most
+    recent completed close is the *previous* Friday, six days earlier. That is
+    exactly the distinction the live gate needs and did not have — it treated the
+    presence of any Friday bar as proof that a closed Friday was in view.
+    """
+    day = now.date()
+    # `weekday()`: Monday is 0, Friday is 4.
+    delta = (day.weekday() - 4) % 7
+    candidate = dt.datetime.combine(day - dt.timedelta(days=delta), FRIDAY_CLOSE)
+    if candidate > now:                      # today is Friday, not yet closed
+        candidate -= dt.timedelta(days=7)
+    return candidate
+
+
+def most_recent_sunday_open(now: dt.datetime) -> dt.datetime:
+    """The latest Sunday 18:00 that has already happened, at or before `now`."""
+    day = now.date()
+    delta = (day.weekday() - 6) % 7          # Sunday is 6
+    candidate = dt.datetime.combine(day - dt.timedelta(days=delta), SUNDAY_OPEN)
+    if candidate > now:                      # today is Sunday, before the open
+        candidate -= dt.timedelta(days=7)
+    return candidate
+
+
 def localize(naive_local: dt.datetime) -> tuple[dt.datetime, bool]:
     """Attach `America/New_York` to a naive New York wall clock.
 

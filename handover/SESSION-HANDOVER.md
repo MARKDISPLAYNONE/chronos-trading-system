@@ -574,6 +574,15 @@ fallback it forced was **duplicating rows**. **460 tests pass.**
 - `tests/test_scheduled_environment.py` simulates a stripped PATH — this bug
   class is now testable locally.
 
+**Session 25:** the invariant gate refused to start on a Friday morning and called
+it a fault in the feed; it was grading the edge of its own window. **527 tests
+pass.** The shallow-window hypothesis was confirmed, but was one half of the bug:
+deepening alone turns a silent skip into a crash every Friday. Verdict is now
+three-valued (`passed` / `not_evaluable` / `failed`), thresholds unchanged, real
+faults still stop the run. See §15.25 — including the answer on `--force` and the
+self-audit of the 28/29 Oct restarts (both boundary checks were skipped, not
+passed).
+
 **Session 24:** the Handler's `which git` -> `/mingw64/bin/git`, which **was not
 in the fallback list** from 15.23. **506 tests pass.**
 - Git for Windows has three `git.exe`s and Git Bash always resolves
@@ -2362,4 +2371,95 @@ It prints the interpreter and its version, the working directory, the repository
 whether git is on PATH, where it resolved and by which rule, every install path
 searched with found/absent against each, the PATH entries, and the branch. Exit 0
 if git was found, 1 if not, so the task's own status shows the answer.
+
+### 15.25 The invariant gate graded the window's edge instead of the venue
+
+**Reported:** `dry_run_runner.py` refused to start on Friday 2026-10-30 at 06:00
+NY with `LiveFeedError ... {'friday_close_1659_ny': {'passed': False, 'detail':
+'0/1 Fridays close 16:59, 0 bars after 16:59'}}`. The Handler's hypothesis was a
+`history_bars` window that is too shallow. **Confirmed, but it was not the whole
+defect, and on its own it makes the failure worse rather than better.**
+
+**Root cause, in two halves.**
+
+1. `LIVE_HISTORY_BARS = 3000` reached back about two trading days, so on any
+   weekday restart the sample held **no Friday at all** — and the gate treated
+   "no Friday in the sample" as "the Friday check does not apply". It therefore
+   *skipped* the check on Monday–Thursday and reported a pass on three checks.
+   The `0/1` in the literal error message is the tell: one Friday was present,
+   and it was the wrong one.
+2. Even with a window deep enough to contain a Friday, the **Friday in progress
+   was scored as a Friday that failed to close at 16:59**. At 06:00 the last
+   Friday bar is 05:59, so the day had not finished and could not have closed
+   early. Deepening the window alone converts a silent skip into a hard crash
+   every Friday until 17:00.
+
+A third, latent form of the same mistake was found while writing the tests: a
+window whose **head lands part-way into a Sunday** holds that Sunday's 18:00 open
+outside the sample, so the first bar it sees is whatever minute the cut fell on,
+and the check read that as "this Sunday opened late". Reachable at particular
+`history_bars` values and restart times; it never fired on the three restarts so
+far, purely by arithmetic luck. Same class, opposite end of the sample.
+
+**Fix — three-valued verdict, thresholds untouched.**
+
+`check_session_invariants()` takes an optional `now_ny`, and when given it (the
+live path only) excludes the day in progress from the two weekly statistics and
+adds an `evaluable` flag to the two boundary checks. A day is counted only if the
+sample actually contains the boundary being judged. `_gate_on_invariants()`
+reports `gate_verdict` as `passed` / `not_evaluable` / `failed`, with a human
+sentence per unevaluable check in `gate_warnings`:
+
+- `failed` → raises `LiveFeedError` exactly as before, same message shape;
+- `not_evaluable` → does **not** raise, is logged as
+  `invariant gate: <check>: not evaluable — ...` and emitted as an
+  `invariant_not_evaluable` event so a skipped check is on the record;
+- `passed` → logged as `invariant gate: passed (all four session checks judged)`.
+
+The 80% / 95% ratios and the zero-bars-after-16:59 rule are unchanged. A backtest
+passes no `now_ny` and behaves exactly as it did. `LIVE_HISTORY_BARS` is 9,000
+(7,920 is the worst case: a restart late on a Friday needs the *previous*
+Friday's close), so the checks normally run rather than merely refrain from
+crashing.
+
+**Verified.**
+
+- 336 restart instants (every hour of two consecutive weeks) at 9,000 bars: 336
+  `passed`, none `not_evaluable`, no exception.
+- Real faults still stop the run: a Friday closing 15:00, a Friday trading past
+  16:59, a Sunday opening 19:00 — all raise `LiveFeedError`, including when the
+  fault is seen from a Friday morning and from midweek.
+- `tests/test_invariant_gate_restart.py` — 21 tests. They fail on `01e1f10`
+  (3 failures, 22 errors).
+
+**Self-audit of the two earlier restarts, answered from the code, not from hope.**
+With 3,000 bars the sample at Wed 2026-10-28 08:47 NY began Mon 26 Oct 04:47 NY,
+and at Thu 2026-10-29 19:38 NY began Tue 27 Oct 14:38 NY. Neither window contained
+a Friday, **or a Sunday**. So both boundary checks were *not evaluated* on either
+restart — reported as a pass on the other two — and **no false PASS was issued by
+the comparison itself**: the ratios were never computed. It was a silent skip,
+not luck, and it means the weekly boundaries had never been verified in Phase 2
+before this fix.
+
+**`--force`, answered from the code.** `--force` is read at exactly one place,
+the double-runner guard in `start()`: it permits a start when the state file shows
+a heartbeat newer than the guard interval without a clean stop, i.e. when another
+runner may still be alive. It is not passed to `LiveBarSource`, and `start()` does
+not catch `LiveFeedError`, so **`--force` cannot bypass or influence the invariant
+gate** in either direction.
+
+**Tradeoff, stated plainly.** `not_evaluable` means a start can now proceed with a
+weekly boundary unverified. That is a real reduction in what a restart proves, and
+it is the honest option: the alternative is either a false FAIL every Friday
+morning (unusable) or a false PASS by silence (untrustworthy). Which checks were
+not judged is logged, emitted, and printed by the gate, and the default depth
+means it should not happen in practice — only a deliberately shallow
+`--history-bars` can produce it.
+
+**What the Handler should do:** restart the runner. It should print
+`invariant gate: passed (all four session checks judged)`. If it prints `not
+evaluable` instead, the message names the check and the boundary it would have
+needed, and the answer is to leave `history_bars` at its default.
+
+**527 tests pass.**
 

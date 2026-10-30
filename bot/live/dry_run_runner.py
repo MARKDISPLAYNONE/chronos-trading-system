@@ -417,6 +417,17 @@ class DryRunRunner:
                 self._mt5, self.symbol, history_bars=self.history_bars,
                 now_fn=self._now_fn,
             )
+            # The gate has three outcomes, not two. `failed` never returns here
+            # (it raises); `not_evaluable` means the fetched window was too
+            # shallow to judge a weekly boundary, and saying so is the difference
+            # between a check that passed and a check that did not run.
+            verdict = getattr(self.source, "gate_verdict", None)
+            for warning in getattr(self.source, "gate_warnings", []):
+                self._log(f"invariant gate: {warning}")
+                self.emitter.event("invariant_not_evaluable", warning,
+                                   when=broker_now_ny(self._now_fn()))
+            if verdict == "passed":
+                self._log("invariant gate: passed (all four session checks judged)")
 
         # --- guards: DST-safe schedule + trading-day coverage ---------------
         days = self._days_in_planned_range(now)

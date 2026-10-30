@@ -74,6 +74,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable
 
 from . import config
+from . import time_windows
 from .bars import BarSeries, M1Bar
 from .m1_csv_source import (
     CONVENTION_BROKER,
@@ -350,6 +351,13 @@ class LiveBarSource:
         self._bars: dict[dt.datetime, M1Bar] = {}
         self._symbol_info: dict = {}
         self._session_checks: dict[str, dict] = {}
+        #: "passed" | "not_evaluable" | "failed" (failed never returns).
+        self.gate_verdict: str = "unknown"
+        #: The per-check detail behind `gate_verdict`, for logging and tests.
+        self.session_checks: dict[str, dict] = self._session_checks
+        #: Boundary checks the fetched window was too shallow to judge.
+        self._session_not_evaluable: dict[str, dict] = {}
+        self.gate_warnings: list[str] = []
         self.first_raw: dt.datetime | None = None
         self.last_raw: dt.datetime | None = None
         self.reports: list[RefreshReport] = []
@@ -497,6 +505,13 @@ class LiveBarSource:
             int((b - a).total_seconds() // 60) for a, b in zip(times, times[1:])
         )
 
+    def _now_ny(self) -> dt.datetime:
+        """Current New York wall clock, naive — the frame the checks are in."""
+        from zoneinfo import ZoneInfo
+
+        instant = dt.datetime.fromtimestamp(self._now_fn(), dt.timezone.utc)
+        return instant.astimezone(ZoneInfo(config.NY_TZ)).replace(tzinfo=None)
+
     def _gate_on_invariants(self) -> None:
         """Refuse to run if the live clock cannot be trusted.
 
@@ -511,25 +526,79 @@ class LiveBarSource:
         sample actually contains such a day. The other two are always enforced.
         """
         series = BarSeries(sorted(self._bars.values(), key=lambda b: b.time))
-        checks = check_session_invariants(series)
+        now_ny = self._now_ny()
+        checks = check_session_invariants(series, now_ny=now_ny)
         self._session_checks = checks
+        self.session_checks = checks        # public alias, same dict
 
-        times = series.times
-        boundary_not_applicable = {
-            "friday_close_1659_ny": not any(t.weekday() == 4 for t in times),
-            "sunday_open_1800_ny": not any(t.weekday() == 6 for t in times),
+        # The two boundary checks can only be judged if the sample actually
+        # contains the boundary. Deciding that on "is there any Friday bar" was
+        # wrong in both directions, and this gate has already failed live because
+        # of it:
+        #
+        #   * early on a Friday, the only Friday present is the one still in
+        #     progress. Its last bar is 05:59, not 16:59, so a completed Friday
+        #     that has not happened yet was reported as a Friday that closed
+        #     early — a hard crash on a healthy feed.
+        #   * on any other weekday a 3000-bar window reaches back about two
+        #     trading days, so no Friday was present at all and the check was
+        #     skipped in silence. That is the worse failure: it looked like a
+        #     pass.
+        #
+        # So each boundary check is now judged against the instant it was *due*,
+        # and a check whose boundary has not been fetched is reported as
+        # `not_evaluable` — never as a pass, and never as a crash. A check whose
+        # boundary *is* in the sample is judged exactly as before; a real
+        # violation still stops the run.
+        oldest = series.times[0] if series.times else None
+        boundaries = {
+            "friday_close_1659_ny": time_windows.most_recent_friday_close(now_ny),
+            "sunday_open_1800_ny": time_windows.most_recent_sunday_open(now_ny),
         }
-        failed = {
-            name: detail
-            for name, detail in checks.items()
-            if not detail["passed"] and not boundary_not_applicable.get(name, False)
-        }
+
+        failed: dict[str, dict] = {}
+        not_evaluable: dict[str, dict] = {}
+        for name, detail in checks.items():
+            if detail["passed"]:
+                continue
+            if detail.get("evaluable", True) is False:
+                # The sample contains no completed instance of the boundary this
+                # check is about — no closed Friday, no Sunday session. It cannot
+                # speak to it either way, and saying "failed" would be inventing
+                # a verdict from missing evidence.
+                due = boundaries.get(name)
+                not_evaluable[name] = {
+                    **detail,
+                    "status": "not_evaluable",
+                    "due_ny": due.isoformat(sep=" ") if due else None,
+                    "oldest_bar_ny": oldest.isoformat(sep=" ") if oldest else None,
+                }
+            else:
+                failed[name] = detail
+
+        self.gate_verdict = (
+            "failed" if failed else ("not_evaluable" if not_evaluable else "passed")
+        )
+        self._session_not_evaluable = not_evaluable
         if failed:
             raise LiveFeedError(
                 "live session invariants FAILED — refusing to evaluate windows "
                 f"against a feed whose clock cannot be trusted: {failed}. "
                 "See docs/02-TRD.md §4.1.1; do not patch the offset to make this pass."
             )
+        if not_evaluable:
+            # Deliberately not fatal, and deliberately not silent: the window is
+            # too shallow to judge this boundary, and the fix is more history,
+            # not a different verdict.
+            self.gate_warnings = []
+            for name in not_evaluable:
+                due = boundaries[name]
+                self.gate_warnings.append(
+                    f"{name}: not evaluable — the fetched window starts at "
+                    f"{oldest:%Y-%m-%d %H:%M} NY, after the "
+                    f"{due:%Y-%m-%d %H:%M} NY boundary it would have to judge "
+                    f"({not_evaluable[name]['detail']}). Deepen history_bars for "
+                    f"this check to run.")
 
     # -- integration with the rest of the engine --------------------------
     def load_report(self) -> LoadReport:

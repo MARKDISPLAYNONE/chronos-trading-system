@@ -60,6 +60,7 @@ from zoneinfo import ZoneInfo
 
 from . import config
 from .bars import BarSeries, M1Bar
+from .time_windows import FRIDAY_CLOSE, SUNDAY_OPEN
 from .pricing import is_on_tick_grid
 
 UTC = ZoneInfo(config.UTC_TZ)
@@ -160,12 +161,33 @@ def to_ny_wall(naive_utc_from_label: dt.datetime, convention: str) -> dt.datetim
 # ---------------------------------------------------------------------------
 # Session invariants — the proof, and the runtime gate
 # ---------------------------------------------------------------------------
-def check_session_invariants(series: BarSeries) -> dict[str, dict]:
+def check_session_invariants(series: BarSeries,
+                             now_ny: dt.datetime | None = None) -> dict[str, dict]:
     """Verify that NY wall-clock times show a physically sensible session.
 
     These are the checks that a wrong timestamp convention fails. Every
     threshold allows for legitimate exceptions (exchange half-days, the first
     partial session of the export) without allowing a systemic shift.
+
+    `now_ny` (naive New York wall clock) marks the caller as a **live** feed, and
+    changes one thing only: the trading day currently in progress is excluded
+    from the two weekly-boundary statistics, and each boundary check reports
+    whether it was `evaluable` at all.
+
+    Each day is also only counted when the sample actually contains the boundary
+    it is judged by: a Friday whose 16:59 is beyond the sample's tail (the day in
+    progress), or a Sunday whose 18:00 is behind the sample's head (a window that
+    starts mid-session), is left out rather than graded.
+
+    That is not a relaxation of the comparison — it is a statement about what the
+    comparison can mean. A Friday that has not reached 16:59 yet cannot be a
+    Friday that closed early, so counting it as one made a healthy feed look
+    broken every Friday morning; and a window that contains no completed Friday
+    at all could not judge the check, which previously read as a pass. Both
+    failures were live. The ratio for *completed* days is untouched.
+
+    A backtest passes no `now_ny`, because its data is complete by definition, and
+    every check behaves exactly as before.
     """
     checks: dict[str, dict] = {}
 
@@ -188,14 +210,23 @@ def check_session_invariants(series: BarSeries) -> dict[str, dict]:
     }
 
     # 3. Friday sessions end at 16:59 NY (half-days may end earlier, never later).
-    fri_after_close = sum(1 for t in series.times if t.weekday() == 4 and t.time() > dt.time(16, 59))
     fri_last = {}
     for d, times in by_date.items():
-        if d.weekday() == 4:
-            fri_last[d] = times[-1].time()
-    fri_at_close = sum(1 for v in fri_last.values() if v == dt.time(16, 59))
+        if d.weekday() != 4:
+            continue
+        if now_ny is not None and d == now_ny.date() and now_ny.time() <= FRIDAY_CLOSE:
+            continue            # today's Friday is still trading; not judgeable yet
+        fri_last[d] = times[-1].time()
+    fri_after_close = sum(1 for t in series.times
+                          if t.weekday() == 4 and t.time() > FRIDAY_CLOSE
+                          and not (now_ny is not None and t.date() == now_ny.date()
+                                   and now_ny.time() <= FRIDAY_CLOSE))
+    fri_at_close = sum(1 for v in fri_last.values() if v == FRIDAY_CLOSE)
+    fri_evaluable = bool(fri_last) if now_ny is not None else True
     checks["friday_close_1659_ny"] = {
-        "passed": fri_after_close == 0 and fri_last and fri_at_close / len(fri_last) >= 0.8,
+        "passed": (fri_after_close == 0 and bool(fri_last)
+                   and fri_at_close / len(fri_last) >= 0.8),
+        "evaluable": fri_evaluable,
         "detail": (
             f"{fri_at_close}/{len(fri_last)} Fridays close 16:59, "
             f"{fri_after_close} bars after 16:59"
@@ -203,13 +234,23 @@ def check_session_invariants(series: BarSeries) -> dict[str, dict]:
     }
 
     # 4. Sunday session opens at 18:00 NY.
+    oldest_bar = series.times[0] if series.times else None
     sun_first = {}
     for d, times in by_date.items():
-        if d.weekday() == 6:
-            sun_first[d] = times[0].time()
-    sun_at_open = sum(1 for v in sun_first.values() if v == dt.time(18, 0))
-    sun_before_open = sum(1 for t in series.times if t.weekday() == 6 and t.time() < dt.time(18, 0))
+        if d.weekday() != 6:
+            continue
+        if (now_ny is not None and oldest_bar is not None
+                and oldest_bar > dt.datetime.combine(d, SUNDAY_OPEN)):
+            # The sample starts part-way into this Sunday, so the first bar it
+            # holds is whatever minute we cut at, not the session open. Judging
+            # it would grade the window's edge instead of the venue.
+            continue
+        sun_first[d] = times[0].time()
+    sun_at_open = sum(1 for v in sun_first.values() if v == SUNDAY_OPEN)
+    sun_before_open = sum(1 for t in series.times
+                          if t.weekday() == 6 and t.time() < SUNDAY_OPEN)
     checks["sunday_open_1800_ny"] = {
+        "evaluable": bool(sun_first) if now_ny is not None else True,
         "passed": (
             bool(sun_first)
             and sun_at_open / len(sun_first) >= 0.95
