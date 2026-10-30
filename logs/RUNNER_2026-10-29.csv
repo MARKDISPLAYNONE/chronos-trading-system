@@ -1,0 +1,14 @@
+event_utc,ny_wall,kind,detail
+2026-10-29T04:15:03.965641+00:00,2026-10-29T00:15:03.965641-04:00,data_late,"2026-10-28|23:45-00:15 closed before its final bar arrived (bars_a=15, bars_b=12); holding the row and re-checking for 300s"
+2026-10-29T04:20:05.383854+00:00,2026-10-29T00:20:05.383854-04:00,feed_stalled,"2026-10-28|23:45-00:15 produced no bars within 300s of closing; logged as live_feed_stalled (feed fault, not runner downtime)"
+2026-10-29T06:15:13.402377+00:00,2026-10-29T02:15:13.402377-04:00,data_late,"2026-10-29|01:45-02:15 closed before its final bar arrived (bars_a=0, bars_b=0); holding the row and re-checking for 300s"
+2026-10-29T06:20:14.578367+00:00,2026-10-29T02:20:14.578367-04:00,feed_stalled,"2026-10-29|01:45-02:15 produced no bars within 300s of closing; logged as live_feed_stalled (feed fault, not runner downtime)"
+2026-10-29T07:15:07.256911+00:00,2026-10-29T03:15:07.256911-04:00,data_late,"2026-10-29|02:45-03:15 closed before its final bar arrived (bars_a=0, bars_b=0); holding the row and re-checking for 300s"
+2026-10-29T07:20:08.526320+00:00,2026-10-29T03:20:08.526320-04:00,feed_stalled,"2026-10-29|02:45-03:15 produced no bars within 300s of closing; logged as live_feed_stalled (feed fault, not runner downtime)"
+2026-10-29T08:15:01.017790+00:00,2026-10-29T04:15:01.017790-04:00,data_late,"2026-10-29|03:45-04:15 closed before its final bar arrived (bars_a=0, bars_b=0); holding the row and re-checking for 300s"
+2026-10-29T11:15:09.429175+00:00,2026-10-29T07:15:09.429175-04:00,data_late,"2026-10-29|06:45-07:15 closed before its final bar arrived (bars_a=15, bars_b=1); holding the row and re-checking for 300s"
+2026-10-29T15:15:03.340799+00:00,2026-10-29T11:15:03.340799-04:00,data_late,"2026-10-29|10:45-11:15 closed before its final bar arrived (bars_a=15, bars_b=14); holding the row and re-checking for 300s"
+2026-10-29T16:15:01.483790+00:00,2026-10-29T12:15:01.483790-04:00,data_late,"2026-10-29|11:45-12:15 closed before its final bar arrived (bars_a=15, bars_b=14); holding the row and re-checking for 300s"
+2026-10-29T23:40:31.267761+00:00,2026-10-29T19:40:31.267761-04:00,start,runner up; 10 schedule dates verified DST-safe; poll 20s; symbol NAS100; bars 2999
+2026-10-29T23:40:31.267761+00:00,2026-10-29T19:40:31.267761-04:00,unclean_shutdown_detected,"previous session did not log a clean stop; last heartbeat 91s before this start. Any window after that heartbeat is a gap, not an evaluation."
+2026-10-30T00:15:01.659539+00:00,2026-10-29T20:15:01.659539-04:00,data_late,"2026-10-29|19:45-20:15 closed before its final bar arrived (bars_a=15, bars_b=14); holding the row and re-checking for 300s"

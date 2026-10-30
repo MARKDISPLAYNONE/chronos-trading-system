@@ -1,0 +1,24 @@
+event_utc,ny_wall,kind,detail
+2026-10-28T12:44:45.695813+00:00,2026-10-28T08:44:45.695813-04:00,start,runner up; 10 schedule dates verified DST-safe; poll 20s; symbol NAS100; bars 2999
+2026-10-28T12:44:45.695813+00:00,2026-10-28T08:44:45.695813-04:00,unclean_shutdown_detected,"previous session did not log a clean stop; last heartbeat 13609s before this start. Any window after that heartbeat is a gap, not an evaluation."
+2026-10-28T12:48:37.116994+00:00,2026-10-28T08:48:37.116994-04:00,start,runner up; 10 schedule dates verified DST-safe; poll 20s; symbol NAS100; bars 2999
+2026-10-28T12:48:37.116994+00:00,2026-10-28T08:48:37.116994-04:00,unclean_shutdown_detected,"previous session did not log a clean stop; last heartbeat 13841s before this start. Any window after that heartbeat is a gap, not an evaluation."
+2026-10-28T12:48:37.248294+00:00,2026-10-28T08:48:37.248294-04:00,polling_gap,"231 min between polls (machine asleep or an MT5 call blocked). The interval is split, so windows closing in that hole are gaps, not evaluations."
+2026-10-28T12:48:37.248294+00:00,2026-10-28T08:48:37.248294-04:00,gap,2026-10-28|04:45-05:15 logged as dry_run_gap_runner_down (window not fully observed)
+2026-10-28T12:48:37.248294+00:00,2026-10-28T08:48:37.248294-04:00,gap,2026-10-28|05:45-06:15 logged as dry_run_gap_runner_down (window not fully observed)
+2026-10-28T12:48:37.248294+00:00,2026-10-28T08:48:37.248294-04:00,gap,2026-10-28|06:45-07:15 logged as dry_run_gap_runner_down (window not fully observed)
+2026-10-28T12:48:37.248294+00:00,2026-10-28T08:48:37.248294-04:00,gap,2026-10-28|07:45-08:15 logged as dry_run_gap_runner_down (window not fully observed)
+2026-10-28T13:15:02.459802+00:00,2026-10-28T09:15:02.459802-04:00,gap,2026-10-28|08:45-09:15 logged as dry_run_gap_runner_down (window not fully observed)
+2026-10-28T13:28:49.293171+00:00,2026-10-28T09:28:49.293171-04:00,stop,"clean shutdown after 121 steps, 0 evaluations"
+2026-10-28T13:29:25.115682+00:00,2026-10-28T09:29:25.115682-04:00,start,runner up; 10 schedule dates verified DST-safe; poll 20s; symbol NAS100; bars 2999
+2026-10-28T13:31:13.370267+00:00,2026-10-28T09:31:13.370267-04:00,start,runner up; 10 schedule dates verified DST-safe; poll 20s; symbol NAS100; bars 2999
+2026-10-28T13:31:13.370267+00:00,2026-10-28T09:31:13.370267-04:00,unclean_shutdown_detected,"previous session did not log a clean stop; last heartbeat 108s before this start. Any window after that heartbeat is a gap, not an evaluation."
+2026-10-28T14:15:02.774247+00:00,2026-10-28T10:15:02.774247-04:00,data_late,"2026-10-28|09:45-10:15 closed before its final bar arrived (bars_a=15, bars_b=14); holding the row and re-checking for 300s"
+2026-10-29T00:15:00.106294+00:00,2026-10-28T20:15:00.106294-04:00,data_late,"2026-10-28|19:45-20:15 closed before its final bar arrived (bars_a=15, bars_b=13); holding the row and re-checking for 300s"
+2026-10-29T00:20:01.493072+00:00,2026-10-28T20:20:01.493072-04:00,feed_stalled,"2026-10-28|19:45-20:15 produced no bars within 300s of closing; logged as live_feed_stalled (feed fault, not runner downtime)"
+2026-10-29T01:15:16.040292+00:00,2026-10-28T21:15:16.040292-04:00,data_late,"2026-10-28|20:45-21:15 closed before its final bar arrived (bars_a=0, bars_b=0); holding the row and re-checking for 300s"
+2026-10-29T01:20:17.509938+00:00,2026-10-28T21:20:17.509938-04:00,feed_stalled,"2026-10-28|20:45-21:15 produced no bars within 300s of closing; logged as live_feed_stalled (feed fault, not runner downtime)"
+2026-10-29T02:15:11.918240+00:00,2026-10-28T22:15:11.918240-04:00,data_late,"2026-10-28|21:45-22:15 closed before its final bar arrived (bars_a=0, bars_b=0); holding the row and re-checking for 300s"
+2026-10-29T02:20:13.301528+00:00,2026-10-28T22:20:13.301528-04:00,feed_stalled,"2026-10-28|21:45-22:15 produced no bars within 300s of closing; logged as live_feed_stalled (feed fault, not runner downtime)"
+2026-10-29T03:15:08.004881+00:00,2026-10-28T23:15:08.004881-04:00,data_late,"2026-10-28|22:45-23:15 closed before its final bar arrived (bars_a=0, bars_b=0); holding the row and re-checking for 300s"
+2026-10-29T03:20:09.419417+00:00,2026-10-28T23:20:09.419417-04:00,feed_stalled,"2026-10-28|22:45-23:15 produced no bars within 300s of closing; logged as live_feed_stalled (feed fault, not runner downtime)"
